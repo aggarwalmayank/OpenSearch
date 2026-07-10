@@ -9,6 +9,7 @@
 package org.opensearch.dsl.executor;
 
 import org.apache.calcite.rel.RelNode;
+import org.opensearch.dsl.aggregation.AggregationMetadata;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -35,16 +36,24 @@ public final class QueryPlans {
      */
     // TODO: Nested aggregations may require multiple RelNodes per aggregation.
     // Support linking child query plans for recursive nesting (e.g. nested sub-aggregations).
-    public record QueryPlan(Type type, RelNode relNode) {
+    public record QueryPlan(Type type, RelNode relNode, AggregationMetadata aggregationMetadata) {
         /**
          * Creates a query plan.
          *
          * @param type what part of the response this plan produces
          * @param relNode the Calcite logical plan to execute
+         * @param aggregationMetadata the aggregation metadata for AGGREGATION plans, null for HITS
          */
         public QueryPlan {
             Objects.requireNonNull(type, "type must not be null");
             Objects.requireNonNull(relNode, "relNode must not be null");
+        }
+
+        /**
+         * Convenience constructor for plans without aggregation metadata (e.g., HITS).
+         */
+        public QueryPlan(Type type, RelNode relNode) {
+            this(type, relNode, null);
         }
 
         /** Returns what part of the response this plan produces. */
@@ -57,6 +66,12 @@ public final class QueryPlans {
         @Override
         public RelNode relNode() {
             return relNode;
+        }
+
+        /** Returns the aggregation metadata, or null for HITS plans. */
+        @Override
+        public AggregationMetadata aggregationMetadata() {
+            return aggregationMetadata;
         }
     }
 

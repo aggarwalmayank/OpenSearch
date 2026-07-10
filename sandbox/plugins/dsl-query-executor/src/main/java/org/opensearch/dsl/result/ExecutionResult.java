@@ -8,6 +8,7 @@
 
 package org.opensearch.dsl.result;
 
+import org.opensearch.dsl.aggregation.AggregationMetadata;
 import org.opensearch.dsl.executor.QueryPlans;
 
 import java.util.List;
@@ -51,5 +52,10 @@ public final class ExecutionResult {
     /** Column names derived from the plan's RelNode row type. */
     public List<String> getFieldNames() {
         return plan.relNode().getRowType().getFieldNames();
+    }
+
+    /** Returns the aggregation metadata, or null for HITS results. */
+    public AggregationMetadata getAggregationMetadata() {
+        return plan.aggregationMetadata();
     }
 }

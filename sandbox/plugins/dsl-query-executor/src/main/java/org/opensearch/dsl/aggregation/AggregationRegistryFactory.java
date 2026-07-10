@@ -8,8 +8,10 @@
 
 package org.opensearch.dsl.aggregation;
 
+import org.opensearch.dsl.aggregation.bucket.MultiTermsBucketTranslator;
 import org.opensearch.dsl.aggregation.bucket.TermsBucketTranslator;
 import org.opensearch.dsl.aggregation.metric.AvgMetricTranslator;
+import org.opensearch.dsl.aggregation.metric.CardinalityMetricTranslator;
 import org.opensearch.dsl.aggregation.metric.MaxMetricTranslator;
 import org.opensearch.dsl.aggregation.metric.MinMetricTranslator;
 import org.opensearch.dsl.aggregation.metric.SumMetricTranslator;
@@ -28,8 +30,9 @@ public class AggregationRegistryFactory {
         registry.register(new SumMetricTranslator());
         registry.register(new MinMetricTranslator());
         registry.register(new MaxMetricTranslator());
+        registry.register(new CardinalityMetricTranslator());
         registry.register(new TermsBucketTranslator());
-        // TODO: add other aggregation translators
+        registry.register(new MultiTermsBucketTranslator());
         return registry;
     }
 }

@@ -11,35 +11,62 @@ package org.opensearch.dsl.result;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.dsl.aggregation.AggregationRegistry;
+import org.opensearch.dsl.aggregation.AggregationRegistryFactory;
+import org.opensearch.dsl.executor.QueryPlans;
 import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.util.List;
 
 /**
  * Builds a {@link SearchResponse} from execution results.
+ *
+ * Merges HITS and multiple AGGREGATION execution results (one per granularity)
+ * into a single SearchResponse by walking the original aggregation tree.
  */
-public class SearchResponseBuilder {
+public final class SearchResponseBuilder {
 
     private SearchResponseBuilder() {}
 
     /**
-     * Builds a SearchResponse from the given results and timing.
+     * Builds a SearchResponse from the given results, original search source, and timing.
      *
-     * @param results execution results from the plan executor
+     * @param results          execution results from the plan executor
+     * @param searchSource     the original SearchSourceBuilder (needed for aggregation tree structure)
      * @param convertTimeNanos time spent in DSL-to-RelNode conversion, in nanoseconds
      * @return a SearchResponse
      */
-    // TODO: Analytics plugin should return execution metadata alongside Iterable<Object[]> rows:
-    // - executionTimeNanos: query execution time
-    // - totalDocCount: total matching documents for hits.total
-    // - terminatedEarly: whether execution was terminated early
-    // - timedOut: whether execution timed out
-    // - shardInfo: total/successful/skipped/failed shard counts
-    public static SearchResponse build(List<ExecutionResult> results, long convertTimeNanos) {
-        // TODO: populate HITS and AGGREGATION plan types from results
+    public static SearchResponse build(List<ExecutionResult> results, SearchSourceBuilder searchSource,
+                                       long convertTimeNanos) {
         long tookInMillis = convertTimeNanos / 1_000_000;
-        SearchHits hits = SearchHits.empty(true);
-        SearchResponseSections sections = new SearchResponseSections(hits, null, null, false, null, null, 0);
-        return new SearchResponse(sections, null, 0, 0, 0, tookInMillis, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
+
+        SearchHits hits = buildHits(results);
+        InternalAggregations aggs = buildAggregations(results, searchSource);
+
+        SearchResponseSections sections = new SearchResponseSections(hits, aggs, null, false, null, null, 1);
+        return new SearchResponse(sections, null, 1, 1, 0, tookInMillis,
+            ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
+    }
+
+    private static SearchHits buildHits(List<ExecutionResult> results) {
+        return results.stream()
+            .filter(r -> r.getType() == QueryPlans.Type.HITS)
+            .findFirst()
+            .map(HitsResponseBuilder::build)
+            .orElse(SearchHits.empty(true));
+    }
+
+    private static InternalAggregations buildAggregations(List<ExecutionResult> results,
+                                                          SearchSourceBuilder searchSource) {
+        boolean hasAggs = results.stream().anyMatch(r -> r.getType() == QueryPlans.Type.AGGREGATION);
+        if (!hasAggs || searchSource == null || searchSource.aggregations() == null) {
+            return null;
+        }
+
+        AggregationRegistry registry = AggregationRegistryFactory.create();
+        AggregationResponseBuilder builder = new AggregationResponseBuilder(registry, results);
+        return builder.build(searchSource.aggregations().getAggregatorFactories());
     }
 }

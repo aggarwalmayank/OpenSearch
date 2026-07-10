@@ -261,6 +261,13 @@ public class MultiTermsAggregationBuilder extends AbstractAggregationBuilder<Mul
     }
 
     /**
+     * Returns the configured term sources.
+     */
+    public List<MultiTermsValuesSourceConfig> termsConfig() {
+        return terms;
+    }
+
+    /**
      * Set the terms.
      */
     public MultiTermsAggregationBuilder terms(List<MultiTermsValuesSourceConfig> terms) {
