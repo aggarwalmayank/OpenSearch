@@ -27,7 +27,10 @@ import java.util.List;
  */
 public class DslClickBenchIT extends AnalyticsRestTestCase {
 
-    private static final List<Integer> QUERY_NUMBERS = List.of();
+    // null → auto-discover all queries in datasets/clickbench/dsl/ (q1..q43).
+    // Temporarily overriding the CI-green empty list to inventory which DSL queries
+    // convert to RelNodes / execute vs. fail on the Calcite route.
+    private static final List<Integer> QUERY_NUMBERS = null;
 
     private static boolean dataProvisioned = false;
 
@@ -42,7 +45,7 @@ public class DslClickBenchIT extends AnalyticsRestTestCase {
     public void testClickBenchDslQueries() throws Exception {
 
         List<Integer> queryNumbers = QUERY_NUMBERS;
-        logger.info("Running {} DSL queries: {}", queryNumbers.size(), queryNumbers);
+        logger.info("Running DSL queries: {}", queryNumbers == null ? "auto-discover" : queryNumbers);
 
         List<String> failures = DatasetQueryRunner.runQueries(
             client(),
@@ -60,7 +63,7 @@ public class DslClickBenchIT extends AnalyticsRestTestCase {
         );
 
         if (failures.isEmpty() == false) {
-            fail("DSL query failures (" + failures.size() + " of " + queryNumbers.size() + "):\n" + String.join("\n", failures));
+            fail("DSL query failures (" + failures.size() + "):\n" + String.join("\n", failures));
         }
     }
 }

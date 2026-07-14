@@ -77,6 +77,7 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
 
     @Override
     protected void doExecute(Task task, SearchRequest request, ActionListener<SearchResponse> listener) {
+        logger.warn("[MUSTANG-DSL-EXECUTE] handing off to Calcite pipeline, indices={}", java.util.Arrays.toString(request.indices()));
         threadPool.executor(ThreadPool.Names.SEARCH).execute(() -> {
             final QueryPlans plans;
             final long convertTime;

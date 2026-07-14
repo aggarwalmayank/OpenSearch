@@ -8,6 +8,8 @@
 
 package org.opensearch.dsl.action;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchAction;
 import org.opensearch.action.search.SearchRequest;
@@ -20,11 +22,15 @@ import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.client.node.NodeClient;
 
+import java.util.Arrays;
+
 /**
  * Intercepts all {@code _search} requests and dispatches them to {@link DslExecuteAction}
  * for execution through the Calcite pipeline. Non-search actions pass through unchanged.
  */
 public class SearchActionFilter implements ActionFilter {
+
+    private static final Logger LOGGER = LogManager.getLogger(SearchActionFilter.class);
 
     /** Runs after the Security plugin's authorization filter (order 0). */
     static final int FILTER_ORDER = 1;
@@ -59,6 +65,9 @@ public class SearchActionFilter implements ActionFilter {
         // Consider two categories: APIs that execute search vs APIs that only explain/validate.
         if (SearchAction.NAME.equals(action)) {
             SearchRequest searchRequest = (SearchRequest) request;
+            LOGGER.warn("[MUSTANG-DSL-ROUTE] intercepted _search indices={} source={}",
+                Arrays.toString(searchRequest.indices()),
+                searchRequest.source() == null ? "<null>" : searchRequest.source().toString().replaceAll("\\s+"," "));
             client.execute(DslExecuteAction.INSTANCE, searchRequest, (ActionListener<SearchResponse>) listener);
         } else {
             chain.proceed(task, action, request, listener);

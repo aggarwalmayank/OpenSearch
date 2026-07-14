@@ -1,0 +1,126 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.internal-cluster-test'
+
+java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
+
+// These are copied test sources from server — suppress -Werror for raw types/unchecked warnings
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs -= '-Werror'
+}
+
+// Calcite transitively brings Guava onto the test compile classpath; OpenSearch's
+// forbidden-dependencies check rejects Guava on compileClasspath. Allow it here.
+configurations {
+    compileClasspath { exclude group: 'com.google.guava' }
+    testCompileClasspath { exclude group: 'com.google.guava' }
+}
+
+dependencies {
+    // Core server + test framework
+    internalClusterTestImplementation project(':test:framework')
+
+    // Server test helpers (AggregationTestScriptsPlugin, PitTestsUtil, DateScriptMocksPlugin, etc.)
+    // Only compileOnly to avoid JarHell duplicate-class errors — server:test classes are
+    // already loaded via the same classloader that loads server itself in-process test nodes.
+    internalClusterTestImplementation project(':server').sourceSets.test.output
+
+    // Sandbox plugins — loaded via nodePlugins() in DslCompatTestCase
+    internalClusterTestImplementation project(':sandbox:plugins:dsl-query-executor')
+    internalClusterTestImplementation project(':sandbox:plugins:analytics-engine')
+    internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+    internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-lucene')
+    internalClusterTestImplementation project(':sandbox:plugins:composite-engine')
+    internalClusterTestImplementation project(':sandbox:plugins:parquet-data-format')
+    internalClusterTestImplementation project(':sandbox:libs:analytics-framework')
+    internalClusterTestImplementation project(':sandbox:libs:analytics-api')
+    internalClusterTestImplementation project(':sandbox:libs:dataformat-native')
+    internalClusterTestImplementation project(':plugins:arrow-base')
+    internalClusterTestImplementation project(':plugins:arrow-flight-rpc')
+    internalClusterTestImplementation project(':sandbox:plugins:test-ppl-frontend')
+
+    // Guava must be on the runtime classpath (Calcite's SqlKind clinit pulls it)
+    internalClusterTestCompileOnly "com.google.guava:guava:33.3.1-jre"
+    internalClusterTestRuntimeOnly "com.google.guava:guava:33.3.1-jre"
+    internalClusterTestRuntimeOnly "com.google.guava:failureaccess:1.0.1"
+}
+
+// Guava detached configuration to bypass inherited excludes (same pattern as coordinator module)
+def guavaRuntimeJars = configurations.detachedConfiguration(
+    dependencies.create('com.google.guava:guava:33.3.1-jre') { transitive = false },
+    dependencies.create('com.google.guava:failureaccess:1.0.1') { transitive = false },
+    dependencies.create("org.slf4j:slf4j-api:${versions.slf4j}") { transitive = false },
+    dependencies.create("commons-codec:commons-codec:${versions.commonscodec}") { transitive = false },
+    dependencies.create("com.fasterxml.jackson.core:jackson-core:${versions.jackson}") { transitive = false },
+    dependencies.create("com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}") { transitive = false },
+    dependencies.create("com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}") { transitive = false }
+)
+sourceSets.internalClusterTest.runtimeClasspath += guavaRuntimeJars
+sourceSets.internalClusterTest.compileClasspath += guavaRuntimeJars
+
+configurations.all {
+    exclude group: 'com.github.babbel', module: 'okhttp-aws-signer'
+
+    resolutionStrategy {
+        force 'com.google.guava:guava:33.3.1-jre'
+        force 'com.google.guava:failureaccess:1.0.1'
+        force 'com.google.errorprone:error_prone_annotations:2.36.0'
+        force 'org.checkerframework:checker-qual:3.43.0'
+        force "com.fasterxml.jackson:jackson-bom:${versions.jackson}"
+        force "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
+        force "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+        force "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+        force "com.fasterxml.jackson.datatype:jackson-datatype-jsr310:${versions.jackson}"
+        force "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:${versions.jackson}"
+        force "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:${versions.jackson}"
+        force "org.slf4j:slf4j-api:${versions.slf4j}"
+        force "com.google.flatbuffers:flatbuffers-java:${versions.flatbuffers}"
+        force "org.locationtech.jts:jts-core:${versions.jts}"
+        force "commons-codec:commons-codec:${versions.commonscodec}"
+        force "joda-time:joda-time:2.12.7"
+        force "org.yaml:snakeyaml:2.4"
+        force "org.codehaus.janino:janino:3.1.12"
+        force "org.codehaus.janino:commons-compiler:3.1.12"
+        force "commons-io:commons-io:${versions.commonsio}"
+        force "org.apache.commons:commons-lang3:3.18.0"
+        force "org.apache.commons:commons-text:1.11.0"
+        force "commons-logging:commons-logging:1.3.5"
+        force "net.minidev:json-smart:2.5.2"
+        force "org.apache.httpcomponents.client5:httpclient5:5.6"
+        force "org.apache.httpcomponents.core5:httpcore5:5.4"
+        force "com.squareup.okhttp3:okhttp:4.12.0"
+        force "org.jetbrains.kotlin:kotlin-stdlib:1.8.21"
+        force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.21"
+        force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.21"
+        force "org.jetbrains.kotlin:kotlin-stdlib-common:1.9.10"
+        force "org.apache.logging.log4j:log4j-api:${versions.log4j}"
+        force "org.apache.logging.log4j:log4j-core:${versions.log4j}"
+        force "com.google.protobuf:protobuf-java:3.25.9"
+    }
+}
+
+// Arrow/Flight/DataFusion JVM flags (same as coordinator module)
+internalClusterTest {
+    // Fork a fresh JVM per test class so a crashing/leaking class cannot corrupt
+    // subsequent classes with "Suite seed was not initialized" cascades.
+    forkEvery = 1
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
+    jvmArgs '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'io.netty.allocator.numDirectArenas', '1'
+    systemProperty 'io.netty.noUnsafe', 'false'
+    systemProperty 'io.netty.tryUnsafe', 'true'
+    systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
+    systemProperty 'native.lib.path', project(':sandbox:libs:dataformat-native').ext.nativeLibPath.absolutePath
+    systemProperty 'opensearch.experimental.feature.pluggable.dataformat.enabled', 'true'
+    systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
+    dependsOn ':sandbox:libs:dataformat-native:buildRustLibrary'
+}
