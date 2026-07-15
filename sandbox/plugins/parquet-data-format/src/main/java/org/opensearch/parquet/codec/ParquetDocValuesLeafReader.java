@@ -166,9 +166,14 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
         }
 
         if (parquetFields.isEmpty()) {
-            // Nothing for us to serve — don't wrap.
+            org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+                "[DEBUG-WRAP] no parquet fields to serve, NOT wrapping. delegate has {} fieldInfos", existing.size());
             return in;
         }
+
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+            "[DEBUG-WRAP] wrapping leaf reader. parquetFields={} totalFieldInfos={}",
+            parquetFields.keySet(), merged.size());
 
         FieldInfos mergedInfos = new FieldInfos(merged.toArray(new FieldInfo[0]));
         return new ParquetDocValuesLeafReader(in, mapperService, state, parquetFields, mergedInfos, queryStats);
@@ -267,7 +272,11 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
      */
     @Override
     public org.apache.lucene.index.PointValues getPointValues(String field) throws IOException {
-        if (parquetFields.containsKey(field)) {
+        boolean isParquet = parquetFields.containsKey(field);
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+            "[DEBUG-POINTVALUES] field={} isParquetField={} parquetFieldsSize={}",
+            field, isParquet, parquetFields.size());
+        if (isParquet) {
             return null;
         }
         return in.getPointValues(field);
@@ -276,6 +285,9 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
     @Override
     public NumericDocValues getNumericDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+            "[DEBUG-NUMDV] field={} parquetFieldInfo={} dvType={}",
+            field, (fi != null), fi != null ? fi.getDocValuesType() : "n/a");
         if (fi != null && fi.getDocValuesType() == DocValuesType.NUMERIC) {
             RowIdResolver resolver = newRowIdResolver();
             NumericDocValues numeric = producer().getNumeric(fi);

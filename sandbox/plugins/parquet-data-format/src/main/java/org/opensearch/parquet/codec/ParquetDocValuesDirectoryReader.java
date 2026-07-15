@@ -51,6 +51,7 @@ public final class ParquetDocValuesDirectoryReader extends FilterDirectoryReader
      * code paths.
      */
     public static DirectoryReader wrap(DirectoryReader in, MapperService mapperService) throws IOException {
+        logger.info("[DEBUG-DIRREADER-WRAP] wrapping DirectoryReader — Parquet DV codec path active");
         return new ParquetDocValuesDirectoryReader(in, mapperService, new QueryParquetStats());
     }
 
