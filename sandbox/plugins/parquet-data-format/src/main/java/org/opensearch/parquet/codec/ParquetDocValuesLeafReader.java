@@ -266,6 +266,13 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     @Override
     public FieldInfos getFieldInfos() {
+        FieldInfo tsFi = mergedFieldInfos.fieldInfo("timestamp");
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+            "[DEBUG-FIELDINFOS] returning merged fieldInfos size={} timestampFI={} dvType={} skipType={}",
+            mergedFieldInfos.size(),
+            (tsFi != null),
+            tsFi != null ? tsFi.getDocValuesType() : "n/a",
+            tsFi != null ? tsFi.docValuesSkipIndexType() : "n/a");
         return mergedFieldInfos;
     }
 
