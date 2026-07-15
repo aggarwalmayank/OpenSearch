@@ -167,22 +167,53 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
     @Override
     public int maxDocID(int level) {
         checkLevel(level);
-        if (currentPage < 0) return -1;
-        if (currentPage >= pageIndex.pageCount()) return DocIdSetIterator.NO_MORE_DOCS;
+        if (currentPage < 0) {
+            LOGGER.info("[DV-SKIP-CALL] {}.maxDocID(0) → -1 (pre-advance)", fieldNameForLog);
+            return -1;
+        }
+        if (currentPage >= pageIndex.pageCount()) {
+            LOGGER.info("[DV-SKIP-CALL] {}.maxDocID(0) → NO_MORE_DOCS (exhausted)", fieldNameForLog);
+            return DocIdSetIterator.NO_MORE_DOCS;
+        }
         long last = pageIndex.firstRowOf(currentPage) + pageIndex.numRowsOf(currentPage) - 1;
-        return Math.toIntExact(Math.min(last, maxDoc - 1L));
+        int v = Math.toIntExact(Math.min(last, maxDoc - 1L));
+        LOGGER.info("[DV-SKIP-CALL] {}.maxDocID(0) → {} (page={} lastRow={} maxDoc={})",
+            fieldNameForLog, v, currentPage, last, maxDoc);
+        return v;
     }
 
     @Override
     public long minValue(int level) {
         checkLevel(level);
-        return pageIndex.minOf(currentPage);
+        long v = pageIndex.minOf(currentPage);
+        LOGGER.info("[DV-SKIP-CALL] {}.minValue(0) → {} (page={})", fieldNameForLog, v, currentPage);
+        return v;
     }
 
     @Override
     public long maxValue(int level) {
         checkLevel(level);
-        return pageIndex.maxOf(currentPage);
+        long v = pageIndex.maxOf(currentPage);
+        LOGGER.info("[DV-SKIP-CALL] {}.maxValue(0) → {} (page={})", fieldNameForLog, v, currentPage);
+        return v;
+    }
+
+    @Override
+    public long minValue() {
+        LOGGER.info("[DV-SKIP-CALL] {}.minValue() → {}", fieldNameForLog, globalMin);
+        return globalMin;
+    }
+
+    @Override
+    public long maxValue() {
+        LOGGER.info("[DV-SKIP-CALL] {}.maxValue() → {}", fieldNameForLog, globalMax);
+        return globalMax;
+    }
+
+    @Override
+    public int docCount() {
+        LOGGER.info("[DV-SKIP-CALL] {}.docCount() → {}", fieldNameForLog, globalDocCount);
+        return globalDocCount;
     }
 
     @Override
@@ -191,22 +222,10 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
         long rows = pageIndex.numRowsOf(currentPage);
         long nc = pageIndex.nullCountOf(currentPage);
         long docs = (nc >= 0) ? (rows - nc) : rows;
-        return Math.toIntExact(docs);
-    }
-
-    @Override
-    public long minValue() {
-        return globalMin;
-    }
-
-    @Override
-    public long maxValue() {
-        return globalMax;
-    }
-
-    @Override
-    public int docCount() {
-        return globalDocCount;
+        int v = Math.toIntExact(docs);
+        LOGGER.info("[DV-SKIP-CALL] {}.docCount(0) → {} (page={} rows={} nc={})",
+            fieldNameForLog, v, currentPage, rows, nc);
+        return v;
     }
 
     private static void checkLevel(int level) {

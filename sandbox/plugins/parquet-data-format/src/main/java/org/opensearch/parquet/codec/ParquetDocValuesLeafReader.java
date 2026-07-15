@@ -351,7 +351,12 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
             NumericDocValues remapped = resolver == RowIdResolver.IDENTITY
                 ? numeric
                 : RowIdRemappingDocValues.numeric(numeric, resolver, maxDoc());
-            return DocValues.singleton(remapped);
+            SortedNumericDocValues result = DocValues.singleton(remapped);
+            org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+                "[DEBUG-SORTEDNUMDV-RET] field={} returning singleton class={} unwrap={}",
+                field, result.getClass().getSimpleName(),
+                DocValues.unwrapSingleton(result) != null);
+            return result;
         }
         return in.getSortedNumericDocValues(field);
     }

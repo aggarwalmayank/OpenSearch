@@ -8,6 +8,8 @@
 
 package org.opensearch.parquet.codec.iter;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.opensearch.parquet.bridge.ParquetColumnReader;
 
@@ -23,6 +25,8 @@ import java.util.Arrays;
  * per-doc values are buffered in a reused array (Layer 5) and walked by {@link #nextValue()}.
  */
 public final class ParquetSortedNumericDocValues extends SortedNumericDocValues {
+
+    private static final Logger LOGGER = LogManager.getLogger(ParquetSortedNumericDocValues.class);
 
     private final ParquetColumnReader reader;
     private final int maxDoc;
@@ -83,13 +87,16 @@ public final class ParquetSortedNumericDocValues extends SortedNumericDocValues 
 
     @Override
     public int advance(int target) throws IOException {
+        LOGGER.info("[DV-SORTNUM-CALL] advance({}) starting from doc={}", target, doc);
         for (int d = target; d < maxDoc; d++) {
             if (advanceExact(d)) {
                 doc = d;
+                LOGGER.info("[DV-SORTNUM-CALL] advance({}) → {} count={}", target, d, count);
                 return d;
             }
         }
         doc = NO_MORE_DOCS;
+        LOGGER.info("[DV-SORTNUM-CALL] advance({}) → NO_MORE_DOCS", target);
         return NO_MORE_DOCS;
     }
 
