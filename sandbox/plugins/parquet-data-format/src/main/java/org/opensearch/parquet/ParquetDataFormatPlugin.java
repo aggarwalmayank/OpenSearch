@@ -327,7 +327,32 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
             if (indexService.getIndexSettings().isPluggableDataFormatEnabled() == false) {
                 return null;
             }
-            return reader -> ParquetDocValuesDirectoryReader.wrap(reader, indexService.mapperService());
+            return reader -> org.opensearch.parquet.codec.ParquetDocValuesDirectoryReader.wrap(reader, indexService.mapperService());
+        });
+
+        // Query-phase intercept: on pluggable-dataformat indices, rewrite any
+        // IndexOrDocValuesQuery in the parsed query tree to its doc-values half.
+        // The Lucene secondary writes no BKD for numeric fields on this path, so the
+        // point side of IDVQ short-circuits to zero hits. Stripping it forces
+        // execution through the doc-values scan (where the DV skipper fires).
+        indexModule.addSearchOperationListener(new org.opensearch.index.shard.SearchOperationListener() {
+            @Override
+            public void onPreQueryPhase(org.opensearch.search.internal.SearchContext searchContext) {
+                if (searchContext.indexShard().indexSettings().isPluggableDataFormatEnabled() == false) {
+                    return;
+                }
+                org.opensearch.index.query.ParsedQuery pq = searchContext.parsedQuery();
+                if (pq == null || pq.query() == null) {
+                    return;
+                }
+                org.apache.lucene.search.Query rewritten =
+                    org.opensearch.parquet.codec.PointToDocValuesRewriter.rewrite(pq.query());
+                if (rewritten != pq.query()) {
+                    org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class)
+                        .info("[POINT-TO-DV-REWRITE] applied to query — before={} after={}", pq.query(), rewritten);
+                    searchContext.parsedQuery(new org.opensearch.index.query.ParsedQuery(rewritten, pq));
+                }
+            }
         });
     }
 }
