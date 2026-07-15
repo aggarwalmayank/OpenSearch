@@ -153,6 +153,15 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
             RustBridge.liquidCacheSetEnabled(true, liquidCacheMaxBytes, liquidCacheDir.toString());
         }
 
+        // Wire the Parquet DocValues skipper gate to the cluster setting.
+        // Initial value: read from static settings; dynamic updates via consumer below.
+        org.opensearch.parquet.codec.DocValuesSkipperGate.INSTANCE.set(
+            ParquetSettings.DOC_VALUES_SKIPPER_ENABLED.get(this.settings));
+        clusterService.getClusterSettings().addSettingsUpdateConsumer(
+            ParquetSettings.DOC_VALUES_SKIPPER_ENABLED,
+            org.opensearch.parquet.codec.DocValuesSkipperGate.INSTANCE::set
+        );
+
         // Register virtual pools if allocator is available (arrow-base loaded)
         if (nativeAllocator != null) {
             NativeAllocator.VirtualPoolHandle writePool = nativeAllocator.registerVirtualPool(

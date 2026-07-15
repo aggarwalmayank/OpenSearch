@@ -72,6 +72,8 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private final BufferPool bufferPool = new BufferPool();
     private final Map<String, ParquetColumnReader> columnReaders = new HashMap<>();
     private final Map<String, OrdinalTable> ordinalTables = new HashMap<>();
+    /** Skippers created by {@link #getSkipper}; we log their per-query stats when the producer closes. */
+    private final java.util.List<ParquetDocValuesSkipper> activeSkippers = new java.util.ArrayList<>();
 
     /** Nanoseconds spent in producer setup (file resolve + metadata read); flushed when query stats are attached. */
     private final long setupNanos;
@@ -182,10 +184,43 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return new ParquetSortedSetDocValues(table, maxDoc);
     }
 
-    /** No skip lists for Parquet-backed doc values. */
+    /**
+     * Returns a {@link DocValuesSkipper} backed by Parquet per-page min/max statistics
+     * (Layer 4) for integer numeric fields. Returns {@code null} for non-numeric types,
+     * for FLOAT/DOUBLE (which need IEEE-754-aware sortable encoding before their raw
+     * bits can be used as monotonic bounds — out of scope for this POC), and when the
+     * underlying column has no page statistics.
+     *
+     * <p>Lucene's numeric range comparators call the returned skipper to skip whole
+     * Parquet pages whose {@code [min, max]} does not intersect the query range, giving
+     * range-filter behavior comparable to BKD-based skipping on vanilla Lucene indices.
+     */
     @Override
     public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
-        return null;
+        if (!DocValuesSkipperGate.INSTANCE.isEnabled()) {
+            return null;   // gate off → baseline (no skipping)
+        }
+        DocValuesType dvType = field.getDocValuesType();
+        if (dvType != DocValuesType.NUMERIC && dvType != DocValuesType.SORTED_NUMERIC) {
+            logger.info("[PARQUET-DVSKIPPER-GET] field={} dvType={} → null (unsupported dv type)", field.getName(), dvType);
+            return null;
+        }
+        ParquetPhysicalType phys = physicalType(field);
+        if (phys != ParquetPhysicalType.INT32 && phys != ParquetPhysicalType.INT64) {
+            logger.info("[PARQUET-DVSKIPPER-GET] field={} phys={} → null (POC skips FLOAT/DOUBLE/BOOL/BYTE_ARRAY)", field.getName(), phys);
+            return null;
+        }
+        boolean repeated = dvType == DocValuesType.SORTED_NUMERIC;
+        ParquetColumnReader reader = readerFor(field, repeated);
+        if (reader.pageIndex() == null || reader.pageIndex().pageCount() == 0) {
+            logger.info("[PARQUET-DVSKIPPER-GET] field={} → null (no page index)", field.getName());
+            return null;
+        }
+        logger.info("[PARQUET-DVSKIPPER-GET] field={} phys={} pages={} → returning ParquetDocValuesSkipper",
+            field.getName(), phys, reader.pageIndex().pageCount());
+        ParquetDocValuesSkipper skipper = new ParquetDocValuesSkipper(reader.pageIndex(), maxDoc, field.getName());
+        activeSkippers.add(skipper);
+        return skipper;
     }
 
     /**
@@ -214,9 +249,14 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         if (closed) {
             return;
         }
+        // Emit per-skipper stats so perf runs can grep [SKIPPER-STATS] to see skip effectiveness.
+        for (ParquetDocValuesSkipper sk : activeSkippers) {
+            sk.logStats();
+        }
+        activeSkippers.clear();
         // Aggregate cache-effectiveness summary across all columns touched by this segment's
         // producer. Per-column detail is logged by each ParquetColumnReader on its own close.
-        if (columnReaders.isEmpty() == false && logger.isDebugEnabled()) {
+        if (columnReaders.isEmpty() == false) {
             long hits = 0, misses = 0, decodes = 0, allNullSkips = 0;
             for (ParquetColumnReader reader : columnReaders.values()) {
                 hits += reader.stats().pageCacheHits();
@@ -226,17 +266,32 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             }
             long lookups = hits + misses;
             double hitRate = lookups == 0 ? 0.0 : (double) hits / lookups * 100.0;
-            logger.debug(
-                "[PARQUET_DV_CACHE_STATS] segment summary: file={} columns={} | L1/2 hits={} misses={} (hitRate={}%) "
-                    + "| L4 allNullSkips={} | FFM pageDecodes={}",
-                parquetFile,
-                columnReaders.size(),
-                hits,
-                misses,
-                String.format(Locale.ROOT, "%.2f", hitRate),
-                allNullSkips,
-                decodes
-            );
+            // Emit at info level so it's grep'able for the benchmark run.
+            // (Also kept as debug for existing log-level configs.)
+            if (decodes > 0 || allNullSkips > 0) {
+                logger.info(
+                    "[SKIPPER-READ-STATS] file={} columns={} pageDecodes={} allNullSkips={} cacheHits={} cacheMisses={} hitRate={}%",
+                    parquetFile,
+                    columnReaders.size(),
+                    decodes,
+                    allNullSkips,
+                    hits,
+                    misses,
+                    String.format(Locale.ROOT, "%.2f", hitRate));
+            }
+            if (logger.isDebugEnabled()) {
+                logger.debug(
+                    "[PARQUET_DV_CACHE_STATS] segment summary: file={} columns={} | L1/2 hits={} misses={} (hitRate={}%) "
+                        + "| L4 allNullSkips={} | FFM pageDecodes={}",
+                    parquetFile,
+                    columnReaders.size(),
+                    hits,
+                    misses,
+                    String.format(Locale.ROOT, "%.2f", hitRate),
+                    allNullSkips,
+                    decodes
+                );
+            }
         }
         closed = true;
         IOException first = null;

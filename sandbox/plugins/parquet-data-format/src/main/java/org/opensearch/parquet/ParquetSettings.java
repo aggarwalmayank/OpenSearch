@@ -239,6 +239,22 @@ public final class ParquetSettings {
     );
 
     /**
+     * Enables the Parquet DocValues skipper (Layer 4 page min/max skipping) on the DSL codec
+     * fallback path. When false (default), {@code ParquetDocValuesProducer.getSkipper} returns
+     * null and Lucene falls back to a linear doc-values scan on numeric range filters —
+     * baseline behavior for perf comparison.
+     *
+     * <p>Dynamic + cluster-scope: flip on/off at benchmark time via
+     * {@code PUT _cluster/settings {"persistent":{"plugins.parquet.doc_values_skipper.enabled": true}}}.
+     */
+    public static final Setting<Boolean> DOC_VALUES_SKIPPER_ENABLED = Setting.boolSetting(
+        "plugins.parquet.doc_values_skipper.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Minimum number of variable-width (string/binary) non-sort columns required to activate
      * deferred data loading during merge. Below this threshold, all columns are decoded eagerly
      * (original behavior). Set to 0 to always defer; set very high to disable deferral.
@@ -872,6 +888,7 @@ public final class ParquetSettings {
             MERGE_IO_THREADS,
             LIQUID_CACHE_ENABLED,
             LIQUID_CACHE_MAX_BYTES,
+            DOC_VALUES_SKIPPER_ENABLED,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,
             WRITE_POOL_MAX,
