@@ -338,21 +338,24 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         indexModule.addSearchOperationListener(new org.opensearch.index.shard.SearchOperationListener() {
             @Override
             public void onPreQueryPhase(org.opensearch.search.internal.SearchContext searchContext) {
-                if (searchContext.indexShard().indexSettings().isPluggableDataFormatEnabled() == false) {
-                    return;
-                }
+                org.apache.logging.log4j.Logger log = org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class);
+                boolean pluggable = searchContext.indexShard().indexSettings().isPluggableDataFormatEnabled();
                 org.opensearch.index.query.ParsedQuery pq = searchContext.parsedQuery();
-                if (pq == null || pq.query() == null) {
-                    return;
-                }
+                log.info("[POINT-TO-DV-REWRITE-HOOK] onPreQueryPhase fired pluggable={} query={}",
+                    pluggable, pq == null ? "null" : pq.query());
+                if (!pluggable || pq == null || pq.query() == null) return;
                 org.apache.lucene.search.Query rewritten =
                     org.opensearch.parquet.codec.PointToDocValuesRewriter.rewrite(pq.query());
                 if (rewritten != pq.query()) {
-                    org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class)
-                        .info("[POINT-TO-DV-REWRITE] applied to query — before={} after={}", pq.query(), rewritten);
+                    log.info("[POINT-TO-DV-REWRITE] applied — before={} after={}", pq.query(), rewritten);
                     searchContext.parsedQuery(new org.opensearch.index.query.ParsedQuery(rewritten, pq));
+                } else {
+                    log.info("[POINT-TO-DV-REWRITE] no IndexOrDocValuesQuery found — query left unchanged");
                 }
             }
         });
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class)
+            .info("[POINT-TO-DV-REWRITE-INSTALL] SearchOperationListener registered for index {}",
+                indexModule.getIndex().getName());
     }
 }
