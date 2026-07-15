@@ -349,6 +349,11 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
                 if (rewritten != pq.query()) {
                     log.info("[POINT-TO-DV-REWRITE] applied — before={} after={}", pq.query(), rewritten);
                     searchContext.parsedQuery(new org.opensearch.index.query.ParsedQuery(rewritten, pq));
+                    // Re-run preProcess so DefaultSearchContext.query (used by QueryPhase) is
+                    // rebuilt from the updated parsedQuery. Without this, QueryPhase's
+                    // `assert query == searcher.rewrite(query)` fails because query() still
+                    // points to the pre-rewrite object.
+                    searchContext.preProcess(true);
                 } else {
                     log.info("[POINT-TO-DV-REWRITE] no IndexOrDocValuesQuery found — query left unchanged");
                 }
