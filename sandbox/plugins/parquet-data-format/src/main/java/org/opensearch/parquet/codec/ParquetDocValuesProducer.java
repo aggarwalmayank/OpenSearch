@@ -72,8 +72,6 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private final BufferPool bufferPool = new BufferPool();
     private final Map<String, ParquetColumnReader> columnReaders = new HashMap<>();
     private final Map<String, OrdinalTable> ordinalTables = new HashMap<>();
-    /** Skippers created by {@link #getSkipper}; we log their per-query stats when the producer closes. */
-    private final java.util.List<ParquetDocValuesSkipper> activeSkippers = new java.util.ArrayList<>();
 
     /** Nanoseconds spent in producer setup (file resolve + metadata read); flushed when query stats are attached. */
     private final long setupNanos;
@@ -199,25 +197,21 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
         DocValuesType dvType = field.getDocValuesType();
         if (dvType != DocValuesType.NUMERIC && dvType != DocValuesType.SORTED_NUMERIC) {
-            logger.info("[PARQUET-DVSKIPPER-GET] field={} dvType={} → null (unsupported dv type)", field.getName(), dvType);
             return null;
         }
         ParquetPhysicalType phys = physicalType(field);
         if (phys != ParquetPhysicalType.INT32 && phys != ParquetPhysicalType.INT64) {
-            logger.info("[PARQUET-DVSKIPPER-GET] field={} phys={} → null (POC skips FLOAT/DOUBLE/BOOL/BYTE_ARRAY)", field.getName(), phys);
             return null;
         }
-        boolean repeated = dvType == DocValuesType.SORTED_NUMERIC;
-        ParquetColumnReader reader = readerFor(field, repeated);
+        // Mustang's Parquet writer only supports single-valued numeric columns today
+        // (multi-valued docs are rejected at ingest with "Cannot accept multiple values for
+        // field"). Always open the single-valued reader — its ColumnPageIndex is all the
+        // skipper needs, regardless of how the field is advertised via DocValuesType.
+        ParquetColumnReader reader = readerFor(field, /*repeated*/ false);
         if (reader.pageIndex() == null || reader.pageIndex().pageCount() == 0) {
-            logger.info("[PARQUET-DVSKIPPER-GET] field={} → null (no page index)", field.getName());
             return null;
         }
-        logger.info("[PARQUET-DVSKIPPER-GET] field={} phys={} pages={} → returning ParquetDocValuesSkipper",
-            field.getName(), phys, reader.pageIndex().pageCount());
-        ParquetDocValuesSkipper skipper = new ParquetDocValuesSkipper(reader.pageIndex(), maxDoc, field.getName());
-        activeSkippers.add(skipper);
-        return skipper;
+        return new ParquetDocValuesSkipper(reader.pageIndex(), maxDoc, field.getName());
     }
 
     /**
@@ -246,11 +240,6 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         if (closed) {
             return;
         }
-        // Emit per-skipper stats so perf runs can grep [SKIPPER-STATS] to see skip effectiveness.
-        for (ParquetDocValuesSkipper sk : activeSkippers) {
-            sk.logStats();
-        }
-        activeSkippers.clear();
         // Aggregate cache-effectiveness summary across all columns touched by this segment's
         // producer. Per-column detail is logged by each ParquetColumnReader on its own close.
         if (columnReaders.isEmpty() == false) {

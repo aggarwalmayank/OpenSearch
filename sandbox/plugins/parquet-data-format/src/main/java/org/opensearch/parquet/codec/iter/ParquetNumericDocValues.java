@@ -49,7 +49,7 @@ public final class ParquetNumericDocValues extends NumericDocValues {
         if (target >= maxDoc) {
             doc = NO_MORE_DOCS;
             currentPresent = false;
-            LOGGER.info("[DV-NUM-CALL] advanceExact({}) → false (>=maxDoc={})", target, maxDoc);
+            LOGGER.debug("[DV-NUM-CALL] advanceExact({}) → false (>=maxDoc={})", target, maxDoc);
             return false;
         }
         doc = target;
@@ -63,13 +63,13 @@ public final class ParquetNumericDocValues extends NumericDocValues {
             if (cache == null) { // Layer 4: page is all-nulls.
                 currentPresent = false;
                 currentValue = 0L;
-                LOGGER.info("[DV-NUM-CALL] advanceExact({}) → false (all-null page)", target);
+                LOGGER.debug("[DV-NUM-CALL] advanceExact({}) → false (all-null page)", target);
                 return false;
             }
         }
         currentPresent = cache.isPresent(target);
         currentValue = currentPresent ? cache.valueAt(target) : 0L;
-        LOGGER.info("[DV-NUM-CALL] advanceExact({}) → present={} value={}", target, currentPresent, currentValue);
+        LOGGER.debug("[DV-NUM-CALL] advanceExact({}) → present={} value={}", target, currentPresent, currentValue);
         return currentPresent;
     }
 
@@ -77,7 +77,7 @@ public final class ParquetNumericDocValues extends NumericDocValues {
     public long longValue() {
         longValueCalls++;
         if (longValueCalls <= 5 || longValueCalls % 500 == 0) {
-            LOGGER.info("[DV-NUM-CALL] longValue()#{} → {} (doc={})", longValueCalls, currentValue, doc);
+            LOGGER.debug("[DV-NUM-CALL] longValue()#{} → {} (doc={})", longValueCalls, currentValue, doc);
         }
         return currentValue;
     }
@@ -92,7 +92,7 @@ public final class ParquetNumericDocValues extends NumericDocValues {
         nextDocCalls++;
         int r = advance(doc + 1);
         if (nextDocCalls <= 5 || nextDocCalls % 500 == 0) {
-            LOGGER.info("[DV-NUM-CALL] nextDoc()#{} startFrom={} → {}", nextDocCalls, doc, r);
+            LOGGER.debug("[DV-NUM-CALL] nextDoc()#{} startFrom={} → {}", nextDocCalls, doc, r);
         }
         return r;
     }
@@ -104,13 +104,13 @@ public final class ParquetNumericDocValues extends NumericDocValues {
             if (advanceExact(d)) {
                 doc = d;
                 if (advanceCalls <= 5 || advanceCalls % 500 == 0) {
-                    LOGGER.info("[DV-NUM-CALL] advance({})#{} → {} value={}", target, advanceCalls, d, currentValue);
+                    LOGGER.debug("[DV-NUM-CALL] advance({})#{} → {} value={}", target, advanceCalls, d, currentValue);
                 }
                 return d;
             }
         }
         doc = NO_MORE_DOCS;
-        LOGGER.info("[DV-NUM-CALL] advance({})#{} → NO_MORE_DOCS", target, advanceCalls);
+        LOGGER.debug("[DV-NUM-CALL] advance({})#{} → NO_MORE_DOCS", target, advanceCalls);
         return NO_MORE_DOCS;
     }
 
