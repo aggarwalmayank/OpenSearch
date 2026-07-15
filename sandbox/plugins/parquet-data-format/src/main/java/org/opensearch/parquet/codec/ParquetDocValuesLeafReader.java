@@ -257,6 +257,22 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
         return mergedFieldInfos;
     }
 
+    /**
+     * Return {@code null} for fields whose values live in Parquet (no BKD tree in the Lucene
+     * secondary). This forces Lucene's {@link org.apache.lucene.search.IndexOrDocValuesQuery} —
+     * built by {@code NumberFieldType.rangeQuery} et al. — to fall back from the empty
+     * point-values (BKD) branch to the doc-values scan branch, which uses this reader's
+     * {@link #getNumericDocValues}/{@link #getSortedNumericDocValues} implementations plus
+     * {@link ParquetDocValuesProducer#getSkipper} for page-level min/max skipping.
+     */
+    @Override
+    public org.apache.lucene.index.PointValues getPointValues(String field) throws IOException {
+        if (parquetFields.containsKey(field)) {
+            return null;
+        }
+        return in.getPointValues(field);
+    }
+
     @Override
     public NumericDocValues getNumericDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
