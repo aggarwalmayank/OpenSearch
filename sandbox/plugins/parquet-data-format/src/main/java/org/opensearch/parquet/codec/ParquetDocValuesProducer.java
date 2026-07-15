@@ -197,9 +197,6 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      */
     @Override
     public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
-        if (!DocValuesSkipperGate.INSTANCE.isEnabled()) {
-            return null;   // gate off → baseline (no skipping)
-        }
         DocValuesType dvType = field.getDocValuesType();
         if (dvType != DocValuesType.NUMERIC && dvType != DocValuesType.SORTED_NUMERIC) {
             logger.info("[PARQUET-DVSKIPPER-GET] field={} dvType={} → null (unsupported dv type)", field.getName(), dvType);
