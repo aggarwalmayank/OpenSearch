@@ -21,6 +21,7 @@ import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.DisjunctionMaxQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
+import org.apache.lucene.search.IndexSortSortedNumericDocValuesRangeQuery;
 import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.Query;
 import org.opensearch.search.approximate.ApproximateScoreQuery;
@@ -79,6 +80,17 @@ public final class PointToDocValuesRewriter {
             Query dv = idv.getRandomAccessQuery();
             LOGGER.info("[POINT-TO-DV-REWRITE] stripping IDVQ point-side; keeping dv: {}", dv);
             return rewrite(dv); // recurse in case the dv half itself contains nested IDVQs
+        }
+
+        // OpenSearch's NumberFieldMapper wraps range queries on index-sorted fields in
+        // IndexSortSortedNumericDocValuesRangeQuery. That class tries a BKD-based iterator
+        // first (returns null for us since we have no BKD) and then falls back to its
+        // fallbackQuery — usually an IndexOrDocValuesQuery whose point side also fails.
+        // Unwrap to the fallback and recurse so the IDVQ inside gets stripped too.
+        if (q instanceof IndexSortSortedNumericDocValuesRangeQuery iss) {
+            Query fb = iss.getFallbackQuery();
+            LOGGER.info("[POINT-TO-DV-REWRITE] unwrapping IndexSortSortedNumericDocValuesRangeQuery → fallback={}", fb);
+            return rewrite(fb);
         }
 
         // The most important case for our POC: convert a bare PointRangeQuery (from
