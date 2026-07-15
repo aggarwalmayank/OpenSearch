@@ -181,6 +181,13 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
 
     /** Builds a synthetic doc-values {@link FieldInfo} carrying the given DV type. */
     private static FieldInfo newDocValuesFieldInfo(String name, int number, DocValuesType dvType) {
+        // For numeric DV types, advertise a RANGE skip-index so Lucene's range comparator calls
+        // getDocValuesSkipper(field). Our override there routes to ParquetDocValuesProducer.getSkipper,
+        // which returns null when the runtime gate is off — matching the "no skipper" behavior.
+        DocValuesSkipIndexType skipType =
+            (dvType == DocValuesType.NUMERIC || dvType == DocValuesType.SORTED_NUMERIC)
+                ? DocValuesSkipIndexType.RANGE
+                : DocValuesSkipIndexType.NONE;
         return new FieldInfo(
             name,
             number,
@@ -189,7 +196,7 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
             false,                       // storePayloads
             IndexOptions.NONE,           // not indexed via this reader
             dvType,
-            DocValuesSkipIndexType.NONE,
+            skipType,
             -1,                          // dvGen
             new HashMap<>(),             // attributes (mutable, per FieldInfo contract)
             0,                           // pointDimensionCount
@@ -282,6 +289,23 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
         return in.getPointValues(field);
     }
 
+    /**
+     * Route {@code getDocValuesSkipper} for Parquet-backed fields to the producer so Lucene's
+     * numeric range comparator can obtain a {@link ParquetDocValuesSkipper}.
+     * {@code FilterLeafReader}'s default delegates to the wrapped reader, which has no skipper
+     * for our synthetic FieldInfos → returns null → the DV-scan path degrades to linear scan.
+     */
+    @Override
+    public org.apache.lucene.index.DocValuesSkipper getDocValuesSkipper(String field) throws IOException {
+        FieldInfo fi = parquetFieldInfo(field);
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+            "[DEBUG-DVSKIPPER] field={} parquetFieldInfo={}", field, (fi != null));
+        if (fi != null) {
+            return producer().getSkipper(fi);
+        }
+        return in.getDocValuesSkipper(field);
+    }
+
     @Override
     public NumericDocValues getNumericDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
@@ -301,6 +325,9 @@ public final class ParquetDocValuesLeafReader extends FilterLeafReader {
     @Override
     public SortedNumericDocValues getSortedNumericDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
+        org.apache.logging.log4j.LogManager.getLogger(ParquetDocValuesLeafReader.class).info(
+            "[DEBUG-SORTEDNUMDV] field={} parquetFieldInfo={} dvType={}",
+            field, (fi != null), fi != null ? fi.getDocValuesType() : "n/a");
         if (fi != null) {
             // OpenSearch numeric value sources request SORTED_NUMERIC even for single-valued fields,
             // then call DocValues.unwrapSingleton(...) to take a leaner single-valued collector when
