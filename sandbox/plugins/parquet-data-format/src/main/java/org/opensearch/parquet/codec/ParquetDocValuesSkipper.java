@@ -90,13 +90,16 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
     @Override
     public void advance(int target) throws IOException {
         advanceCalls++;
+        int prev = currentPage;
         if (target >= maxDoc) {
             currentPage = pageIndex.pageCount();
+            LOGGER.info("[DV-SKIP-CALL] {}.advance({}) → exhausted (target>=maxDoc={})", fieldNameForLog, target, maxDoc);
             return;
         }
         int p = pageIndex.pageForRow(target);
         if (p < 0) {
             currentPage = pageIndex.pageCount();
+            LOGGER.info("[DV-SKIP-CALL] {}.advance({}) → exhausted (pageForRow<0)", fieldNameForLog, target);
             return;
         }
         if (p != lastLoggedPage) {
@@ -104,6 +107,9 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
             lastLoggedPage = p;
         }
         currentPage = p;
+        LOGGER.info("[DV-SKIP-CALL] {}.advance({}) → currentPage {} → {} min={} max={}",
+            fieldNameForLog, target, prev, currentPage,
+            pageIndex.minOf(currentPage), pageIndex.maxOf(currentPage));
     }
 
     /** Total invocations of {@link #advance(int)} since construction. */
@@ -145,9 +151,17 @@ public final class ParquetDocValuesSkipper extends DocValuesSkipper {
     @Override
     public int minDocID(int level) {
         checkLevel(level);
-        if (currentPage < 0) return -1;
-        if (currentPage >= pageIndex.pageCount()) return DocIdSetIterator.NO_MORE_DOCS;
-        return Math.toIntExact(pageIndex.firstRowOf(currentPage));
+        if (currentPage < 0) {
+            LOGGER.info("[DV-SKIP-CALL] {}.minDocID(0) → -1 (pre-advance)", fieldNameForLog);
+            return -1;
+        }
+        if (currentPage >= pageIndex.pageCount()) {
+            LOGGER.info("[DV-SKIP-CALL] {}.minDocID(0) → NO_MORE_DOCS (exhausted)", fieldNameForLog);
+            return DocIdSetIterator.NO_MORE_DOCS;
+        }
+        int v = Math.toIntExact(pageIndex.firstRowOf(currentPage));
+        LOGGER.info("[DV-SKIP-CALL] {}.minDocID(0) → {} (page={})", fieldNameForLog, v, currentPage);
+        return v;
     }
 
     @Override
