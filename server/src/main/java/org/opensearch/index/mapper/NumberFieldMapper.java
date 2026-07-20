@@ -1989,7 +1989,8 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query termQuery(Object value, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
-            Query query = type.termQuery(name(), value, hasDocValues(), isSearchable());
+            // POC (issearchable-false-poc): force the DV branch — see rangeQuery below.
+            Query query = type.termQuery(name(), value, hasDocValues(), false);
             if (boost() != 1f) {
                 query = new BoostQuery(query, boost());
             }
@@ -1999,7 +2000,8 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query termsQuery(List values, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
-            Query query = type.termsQuery(name(), values, hasDocValues(), isSearchable());
+            // POC (issearchable-false-poc): force the DV branch — see rangeQuery below.
+            Query query = type.termsQuery(name(), values, hasDocValues(), false);
             if (boost() != 1f) {
                 query = new BoostQuery(query, boost());
             }
@@ -2008,7 +2010,8 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
 
         public Query bitmapQuery(BytesArray bitmap) {
             failIfNotIndexedAndNoDocValues();
-            return type.bitmapQuery(name(), bitmap, isSearchable(), hasDocValues());
+            // POC (issearchable-false-poc): force the DV branch — see rangeQuery below.
+            return type.bitmapQuery(name(), bitmap, false, hasDocValues());
         }
 
         @Override
