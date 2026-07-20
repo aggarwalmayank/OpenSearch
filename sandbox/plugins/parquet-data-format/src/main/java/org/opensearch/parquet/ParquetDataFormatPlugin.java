@@ -326,7 +326,14 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         // The Lucene secondary writes no BKD for numeric fields on this path, so the
         // point side of IDVQ short-circuits to zero hits. Stripping it forces
         // execution through the doc-values scan (where the DV skipper fires).
-        indexModule.addSearchOperationListener(new org.opensearch.index.shard.SearchOperationListener() {
+        //
+        // POC (issearchable-false-poc): DISABLED — NumberFieldMapper now hardcodes
+        // isSearchable=false for rangeQuery, so the mapper emits the DV query directly
+        // and no rewrite is needed. Re-enable by flipping this flag if testing the
+        // rewriter path.
+        final boolean REWRITER_ENABLED = false;
+        if (REWRITER_ENABLED) {
+            indexModule.addSearchOperationListener(new org.opensearch.index.shard.SearchOperationListener() {
             @Override
             public void onPreQueryPhase(org.opensearch.search.internal.SearchContext searchContext) {
                 org.apache.logging.log4j.Logger log = org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class);
@@ -349,9 +356,10 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
                     log.info("[POINT-TO-DV-REWRITE] no IndexOrDocValuesQuery found — query left unchanged");
                 }
             }
-        });
-        org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class)
-            .info("[POINT-TO-DV-REWRITE-INSTALL] SearchOperationListener registered for index {}",
-                indexModule.getIndex().getName());
+            });
+            org.apache.logging.log4j.LogManager.getLogger(ParquetDataFormatPlugin.class)
+                .info("[POINT-TO-DV-REWRITE-INSTALL] SearchOperationListener registered for index {}",
+                    indexModule.getIndex().getName());
+        }
     }
 }

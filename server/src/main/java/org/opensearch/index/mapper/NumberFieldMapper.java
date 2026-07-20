@@ -2014,6 +2014,11 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query rangeQuery(Object lowerTerm, Object upperTerm, boolean includeLower, boolean includeUpper, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
+            // POC (issearchable-false-poc): force the pure doc-values branch. With
+            // isSearchable=false the per-type rangeQuery never builds PointRangeQuery /
+            // IndexOrDocValuesQuery / ApproximateScoreQuery and instead returns the DV
+            // slow-range query directly (wrapped in ISSNDVRQ when index-sorted), so
+            // BKD-less Parquet-primary indices need no query rewriting.
             Query query = type.rangeQuery(
                 name(),
                 lowerTerm,
@@ -2021,7 +2026,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
                 includeLower,
                 includeUpper,
                 hasDocValues(),
-                isSearchable(),
+                false,
                 context
             );
             if (boost() != 1f) {
