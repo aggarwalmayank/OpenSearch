@@ -8,6 +8,8 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.opensearch.parquet.codec.cache.ColumnPageIndex;
@@ -33,6 +35,8 @@ import org.opensearch.parquet.codec.cache.ColumnPageIndex;
  */
 final class ParquetDocValuesSkipper extends DocValuesSkipper {
 
+    private static final Logger LOGGER = LogManager.getLogger(ParquetDocValuesSkipper.class);
+
     private final ColumnPageIndex pageIndex;
     private final int maxDoc;
     private final long globalMin;
@@ -56,6 +60,22 @@ final class ParquetDocValuesSkipper extends DocValuesSkipper {
         this.globalMin = pageIndex.pageCount() == 0 ? Long.MIN_VALUE : min;
         this.globalMax = pageIndex.pageCount() == 0 ? Long.MAX_VALUE : max;
         this.globalDocCount = (int) withValue;
+        // TEMP DEBUG: dump per-page min/max so we can see whether the native side
+        // populated ColumnIndex stats for this column (particularly date/timestamp).
+        // Remove before merge.
+        StringBuilder pages = new StringBuilder();
+        for (int p = 0; p < pageIndex.pageCount(); p++) {
+            if (p > 0) pages.append(",");
+            pages.append("[").append(pageIndex.minOf(p)).append(",").append(pageIndex.maxOf(p)).append("]");
+        }
+        LOGGER.info(
+            "ParquetDocValuesSkipper built: pageCount={} globalMin={} globalMax={} globalDocCount={} pages={}",
+            pageIndex.pageCount(),
+            this.globalMin,
+            this.globalMax,
+            this.globalDocCount,
+            pages
+        );
     }
 
     /**
