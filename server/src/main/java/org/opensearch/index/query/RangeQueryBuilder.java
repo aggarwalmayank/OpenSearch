@@ -475,7 +475,9 @@ public class RangeQueryBuilder extends AbstractQueryBuilder<RangeQueryBuilder>
                 // No reader, this may happen e.g. for percolator queries.
                 return MappedFieldType.Relation.INTERSECTS;
             }
-
+            if (!fieldType.isEffectiveSearchable(shardContext)) {
+                return MappedFieldType.Relation.INTERSECTS;
+            }
             DateMathParser dateMathParser = getForceDateParser();
             final MappedFieldType.Relation relation = fieldType.isFieldWithinQuery(
                 shardContext.getIndexReader(),
