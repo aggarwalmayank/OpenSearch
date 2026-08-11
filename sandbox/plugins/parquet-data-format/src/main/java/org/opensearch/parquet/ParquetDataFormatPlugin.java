@@ -144,6 +144,9 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         ParquetDocValuesProducer.setDictionaryMaxTerms(ParquetSettings.DOCVALUES_DICTIONARY_MAX_TERMS.get(this.settings));
         ParquetDocValuesProducer.setDictionaryCacheBytes(ParquetSettings.DOCVALUES_DICTIONARY_CACHE_BYTES.get(this.settings));
         ParquetDocValuesProducer.setUninvertMaxDiskBytes(ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_BYTES.get(this.settings));
+        org.opensearch.index.fielddata.ordinals.GlobalOrdinalsBuilder.setBuildConcurrency(
+            ParquetSettings.DOCVALUES_GLOBAL_ORDINALS_BUILD_CONCURRENCY.get(this.settings)
+        );
         org.opensearch.parquet.codec.UninvertedOrdinalsCache.setOrdsDir(environment.dataFiles()[0].resolve("parquet-ords"));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE, ParquetDocValuesProducer::setInitialBatchSize);
@@ -157,6 +160,11 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
             .addSettingsUpdateConsumer(
                 ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_BYTES,
                 ParquetDocValuesProducer::setUninvertMaxDiskBytes
+            );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                ParquetSettings.DOCVALUES_GLOBAL_ORDINALS_BUILD_CONCURRENCY,
+                org.opensearch.index.fielddata.ordinals.GlobalOrdinalsBuilder::setBuildConcurrency
             );
 
         // Register virtual pools if allocator is available (arrow-base loaded)

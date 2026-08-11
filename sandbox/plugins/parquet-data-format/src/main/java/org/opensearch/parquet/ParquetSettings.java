@@ -271,6 +271,22 @@ public final class ParquetSettings {
     );
 
     /**
+     * How many segments' global-ordinal field-data loads run concurrently when building global
+     * ordinals for a shard. {@code 1} (default) preserves the original one-segment-at-a-time
+     * behavior; {@code > 1} overlaps the codec's cold per-segment ordinal reads/builds (dominated
+     * by scattered mmap page faults) across that many segments. This is the single bound on build
+     * concurrency and caps how many transient per-segment build buffers may coexist. Applied to
+     * {@link org.opensearch.index.fielddata.ordinals.GlobalOrdinalsBuilder}.
+     */
+    public static final Setting<Integer> DOCVALUES_GLOBAL_ORDINALS_BUILD_CONCURRENCY = Setting.intSetting(
+        "parquet.fielddata.global_ordinals.build_concurrency",
+        1,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Minimum number of variable-width (string/binary) non-sort columns required to activate
      * deferred data loading during merge. Below this threshold, all columns are decoded eagerly
      * (original behavior). Set to 0 to always defer; set very high to disable deferral.
@@ -907,6 +923,7 @@ public final class ParquetSettings {
             DOCVALUES_DICTIONARY_MAX_TERMS,
             DOCVALUES_DICTIONARY_CACHE_BYTES,
             DOCVALUES_UNINVERT_MAX_DISK_BYTES,
+            DOCVALUES_GLOBAL_ORDINALS_BUILD_CONCURRENCY,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,
             WRITE_POOL_MAX,

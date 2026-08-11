@@ -51,9 +51,18 @@ import org.opensearch.index.fielddata.ScriptDocValues;
 import org.opensearch.index.fielddata.plain.AbstractLeafOrdinalsFieldData;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 /**
@@ -63,6 +72,58 @@ import java.util.function.Function;
  */
 public enum GlobalOrdinalsBuilder {
     ;
+
+    /**
+     * How many per-segment field-data loads inside {@link #build} run concurrently.
+     *
+     * <p>{@code 1} (default) is the original behavior: one segment at a time. A value {@code > 1}
+     * loads that many segments on a bounded pool, overlapping expensive cold loads (e.g. the
+     * composite codec's postings→ordinal read/uninvert, whose cost is dominated by scattered mmap
+     * page faults) across segments; the cheap native-doc-values load is unaffected in practice.
+     * This pool size is the single bound on build concurrency.
+     *
+     * <p>The value is owned by whichever component wires it (currently the parquet-data-format
+     * plugin, via a dynamic cluster setting); {@link #setBuildConcurrency} pushes updates here and
+     * {@link #build} reads this field live. Left at {@code 1}, this class behaves exactly as before.
+     */
+    private static volatile int buildConcurrency = 1;
+
+    /** Names + daemonizes build threads so they are recognizable in dumps and never block shutdown. */
+    private static final ThreadFactory BUILD_THREAD_FACTORY = new ThreadFactory() {
+        private final AtomicInteger n = new AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "global-ordinals-build-" + n.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        }
+    };
+
+    /** Shared daemon pool, (re)sized to match {@link #buildConcurrency}. Guarded by the class monitor. */
+    private static ExecutorService loadPool;
+    private static int loadPoolSize;
+
+    /**
+     * Sets the per-segment load concurrency. Values below 1 are clamped to 1 (serial). Takes effect
+     * on the next {@link #build}; an already-running build keeps the pool it started with.
+     */
+    public static void setBuildConcurrency(int concurrency) {
+        buildConcurrency = Math.max(1, concurrency);
+    }
+
+    /** Returns a pool sized to {@code concurrency}, rebuilding it if the value changed since last use. */
+    private static synchronized ExecutorService loadPool(int concurrency) {
+        if (loadPool == null || loadPoolSize != concurrency) {
+            ExecutorService old = loadPool;
+            loadPool = Executors.newFixedThreadPool(concurrency, BUILD_THREAD_FACTORY);
+            loadPoolSize = concurrency;
+            if (old != null) {
+                old.shutdown(); // let in-flight builds drain on the old pool; never interrupt them
+            }
+        }
+        return loadPool;
+    }
 
     /**
      * Build global ordinals for the provided {@link IndexReader}.
@@ -99,11 +160,53 @@ public enum GlobalOrdinalsBuilder {
         // atomicFD retains the original unwrapped values to preserve SingletonSortedSetDocValues
         // type for DocValues.unwrapSingleton().
         final SortedSetDocValues[] cancellableSubs = new SortedSetDocValues[indexReader.leaves().size()];
-        for (int i = 0; i < indexReader.leaves().size(); ++i) {
-            cancellationCheck.run();
-            atomicFD[i] = indexFieldData.load(indexReader.leaves().get(i));
-            subs[i] = atomicFD[i].getOrdinalsValues();
-            cancellableSubs[i] = new CancellableTermsSortedSetDocValues(subs[i], cancellationCheck);
+        final int numLeaves = indexReader.leaves().size();
+        final int concurrency = buildConcurrency;
+        final ExecutorService pool = concurrency > 1 ? loadPool(concurrency) : null;
+        if (pool != null && numLeaves > 1) {
+            // Parallel per-segment load. Each leaf index is independent: load() + getOrdinalsValues()
+            // is where an expensive codec build (e.g. postings uninvert into an .ord) fires, and that
+            // is exactly the cold work we want to overlap across segments. OrdinalMap.build below
+            // still runs serially once every sub is materialized. Concurrency is bounded by the pool
+            // size; the underlying per-segment build cache applies its own admission control.
+            final List<Callable<Void>> tasks = new ArrayList<>(numLeaves);
+            for (int i = 0; i < numLeaves; ++i) {
+                final int idx = i;
+                tasks.add(() -> {
+                    cancellationCheck.run();
+                    atomicFD[idx] = indexFieldData.load(indexReader.leaves().get(idx));
+                    subs[idx] = atomicFD[idx].getOrdinalsValues();
+                    cancellableSubs[idx] = new CancellableTermsSortedSetDocValues(subs[idx], cancellationCheck);
+                    return null;
+                });
+            }
+            try {
+                for (Future<Void> f : pool.invokeAll(tasks)) {
+                    f.get();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while building global ordinals for " + indexFieldData.getFieldName(), e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                throw new IOException("failed building global ordinals for " + indexFieldData.getFieldName(), cause);
+            }
+        } else {
+            for (int i = 0; i < numLeaves; ++i) {
+                cancellationCheck.run();
+                atomicFD[i] = indexFieldData.load(indexReader.leaves().get(i));
+                subs[i] = atomicFD[i].getOrdinalsValues();
+                cancellableSubs[i] = new CancellableTermsSortedSetDocValues(subs[i], cancellationCheck);
+            }
         }
         final OrdinalMap ordinalMap = OrdinalMap.build(null, cancellableSubs, PackedInts.DEFAULT);
         final long memorySizeInBytes = ordinalMap.ramBytesUsed();
