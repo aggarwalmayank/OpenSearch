@@ -82,11 +82,11 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
     public static class Builder extends ParametrizedFieldMapper.Builder {
 
         private final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+        private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         public Builder(String name) {
-            this(name, false);
+            super(name);
         }
 
         public Builder(String name, boolean hasDocValues) {
@@ -251,15 +251,25 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     protected void canDeriveSourceInternal() {
-        checkStoredForDerivedSource();
+        checkStoredAndDocValuesForDerivedSource();
     }
 
+    /**
+     * 1. If the field is stored, build source from the stored field, which preserves the values verbatim.
+     * 2. Otherwise build it from doc values. Note that binary doc values are sorted and deduplicated on write by
+     *    {@link CustomBinaryDocValuesField#binaryValue()}, so a multi valued field loses the original ordering and any
+     *    duplicate values. This matches the behaviour of the other doc values backed field types.
+     */
     @Override
     protected DerivedFieldGenerator derivedFieldGenerator() {
-        return new DerivedFieldGenerator(mappedFieldType, null, new StoredFieldFetcher(mappedFieldType, simpleName())) {
+        return new DerivedFieldGenerator(
+            mappedFieldType,
+            new BinaryDocValuesFetcher(mappedFieldType, simpleName()),
+            new StoredFieldFetcher(mappedFieldType, simpleName())
+        ) {
             @Override
             public FieldValueType getDerivedFieldPreference() {
-                return FieldValueType.STORED;
+                return mappedFieldType.isStored() ? FieldValueType.STORED : FieldValueType.DOC_VALUES;
             }
         };
     }
