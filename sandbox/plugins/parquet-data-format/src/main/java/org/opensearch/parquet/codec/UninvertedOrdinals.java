@@ -47,13 +47,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <h2>Read</h2>
  * {@code ordinal(doc)} is one packed read from the mapped file (0 = missing; stored values are
- * ord + 1). {@code lookupOrd} uses sparse in-heap checkpoints (every {@value #CHECKPOINT_INTERVAL}
- * terms) plus a bounded {@code TermsEnum} advance — only final buckets and sort bounds resolve
- * terms, never per-document access.
+ * ord + 1). {@code lookupOrd} uses sparse in-heap checkpoints (every {@code checkpointInterval}
+ * terms, set via {@code parquet.docvalues.checkpoint.interval}) plus a bounded {@code TermsEnum}
+ * advance — only final buckets and sort bounds resolve terms, never per-document access. The
+ * interval is written into each file and read back, so an instance always uses the interval its
+ * own {@code .ord} was built with.
  */
 public final class UninvertedOrdinals implements Closeable {
 
-    static final int CHECKPOINT_INTERVAL = 256;
     private static final String CODEC_PREFIX = "parquet-ords";
     // PORD = parquet ord file header magic.
     private static final int ORD_FILE_MAGIC = 0x504F5244; // "PORD"
@@ -114,6 +115,15 @@ public final class UninvertedOrdinals implements Closeable {
     }
 
     /**
+     * Current checkpoint interval from the dynamic node setting {@code parquet.docvalues.checkpoint.interval}.
+     * A {@code .ord} is rebuilt on load if its stored interval differs, so read-side use of the live value
+     * is safe as long as the setting is only changed with the ordinal files wiped/rebuilt.
+     */
+    private static int checkpointInterval() {
+        return ParquetDocValuesProducer.checkpointInterval();
+    }
+
+    /**
      * Builds (or maps an existing) ordinal file for the field. {@code cancelled} is polled
      * between terms during the sweep so runaway builds die with their task.
      */
@@ -161,17 +171,18 @@ public final class UninvertedOrdinals implements Closeable {
             }
 
             if (exists == false) {
+                int interval = checkpointInterval();
                 PackedInts.Mutable building = PackedInts.getMutable(maxDoc, bits, PackedInts.COMPACT);
-                List<BytesRef> checkpoints = new ArrayList<>((int) (termCount / CHECKPOINT_INTERVAL) + 1);
+                List<BytesRef> checkpoints = new ArrayList<>((int) (termCount / interval) + 1);
                 TermsEnum termsEnum = terms.iterator();
                 PostingsEnum postings = null;
                 long ord = 0;
                 long assignedDocs = 0;
                 for (BytesRef term = termsEnum.next(); term != null; term = termsEnum.next(), ord++) {
-                    if ((ord & (CHECKPOINT_INTERVAL - 1)) == 0 && cancelled.getAsBoolean()) {
+                    if ((ord % interval) == 0 && cancelled.getAsBoolean()) {
                         throw new IOException("ordinal build cancelled for " + fileKey);
                     }
-                    if ((ord % CHECKPOINT_INTERVAL) == 0) {
+                    if ((ord % interval) == 0) {
                         checkpoints.add(BytesRef.deepCopyOf(term));
                     }
                     assignedDocs += termsEnum.docFreq();
@@ -187,7 +198,7 @@ public final class UninvertedOrdinals implements Closeable {
                 String tempName = fileName + ".tmp";
                 deleteFileIfPresent(directory, tempName);
                 try (IndexOutput out = directory.createOutput(tempName, IOContext.DEFAULT)) {
-                    writeOrdFileHeader(out, maxDoc, termCount, assignedDocs);
+                    writeOrdFileHeader(out, maxDoc, termCount, assignedDocs, interval);
                     DirectWriter writer = DirectWriter.getInstance(out, maxDoc, bits);
                     for (int doc = 0; doc < maxDoc; doc++) {
                         writer.add(building.get(doc));
@@ -220,7 +231,8 @@ public final class UninvertedOrdinals implements Closeable {
 
     static long estimatedDiskBytes(long termCount, int maxDoc) {
         long bits = DirectWriter.bitsRequired(termCount + 1);
-        long checkpointCount = termCount == 0 ? 0 : (termCount + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL;
+        int interval = checkpointInterval();
+        long checkpointCount = termCount == 0 ? 0 : (termCount + interval - 1) / interval;
         long checkpointEstimate = checkpointCount * 64L;
         return DirectWriter.bytesRequired(maxDoc, (int) bits) + 1024L + checkpointEstimate;
     }
@@ -242,14 +254,14 @@ public final class UninvertedOrdinals implements Closeable {
     }
 
 
-    private static void writeOrdFileHeader(IndexOutput out, int maxDoc, long termCount, long assignedDocs)
+    private static void writeOrdFileHeader(IndexOutput out, int maxDoc, long termCount, long assignedDocs, int checkpointInterval)
         throws IOException {
         out.writeInt(ORD_FILE_MAGIC);
         out.writeInt(ORD_FILE_VERSION);
         out.writeInt(maxDoc);
         out.writeLong(termCount);
         out.writeLong(assignedDocs);
-        out.writeInt(CHECKPOINT_INTERVAL);
+        out.writeInt(checkpointInterval);
     }
 
     private static void writeOrdFileCheckpoints(IndexOutput out, List<BytesRef> checkpoints) throws IOException {
@@ -305,10 +317,11 @@ public final class UninvertedOrdinals implements Closeable {
             if (metadata.assignedDocs() != expectedNonNullDocs) {
                 throw new InvalidOrdFileException(coverageMismatchMessage(fileName, metadata.assignedDocs(), expectedNonNullDocs));
             }
-            if (metadata.checkpointInterval() != CHECKPOINT_INTERVAL) {
+            if (metadata.checkpointInterval() != checkpointInterval()) {
                 throw new InvalidOrdFileException("ord file checkpoint interval mismatch");
             }
-            int expectedCheckpointCount = expectedTermCount == 0 ? 0 : (int) ((expectedTermCount + CHECKPOINT_INTERVAL - 1) / CHECKPOINT_INTERVAL);
+            int interval = metadata.checkpointInterval();
+            int expectedCheckpointCount = expectedTermCount == 0 ? 0 : (int) ((expectedTermCount + interval - 1) / interval);
 
             int bits = DirectWriter.bitsRequired(metadata.termCount() + 1);
             long payloadOffset = input.getFilePointer();
@@ -458,9 +471,10 @@ public final class UninvertedOrdinals implements Closeable {
 
         @Override
         public void seekExact(long ord) throws IOException {
-            int checkpoint = (int) (ord / CHECKPOINT_INTERVAL);
+            int interval = checkpointInterval();
+            int checkpoint = (int) (ord / interval);
             in.seekCeil(checkpoints[checkpoint]);
-            position = (long) checkpoint * CHECKPOINT_INTERVAL;
+            position = (long) checkpoint * interval;
             while (position < ord) {
                 in.next();
                 position++;
@@ -490,10 +504,11 @@ public final class UninvertedOrdinals implements Closeable {
     /** Resolves an ordinal to its term: checkpoint seek plus a bounded enum advance. */
     public BytesRef term(int ord) {
         try {
+            int interval = checkpointInterval();
             TermsEnum termsEnum = terms.iterator();
-            int checkpoint = ord / CHECKPOINT_INTERVAL;
+            int checkpoint = ord / interval;
             termsEnum.seekCeil(checkpoints[checkpoint]);
-            for (int i = checkpoint * CHECKPOINT_INTERVAL; i < ord; i++) {
+            for (int i = checkpoint * interval; i < ord; i++) {
                 termsEnum.next();
             }
             return BytesRef.deepCopyOf(termsEnum.term());
@@ -509,8 +524,8 @@ public final class UninvertedOrdinals implements Closeable {
 
     /**
      * Stateful ord→term resolution for one consumer (not thread-safe, like doc-values
-     * iterators). A stateless resolver pays a checkpoint seek plus up to
-     * {@value #CHECKPOINT_INTERVAL} enum steps on every call; this cursor advances forward from
+     * iterators). A stateless resolver pays a checkpoint seek plus up to a checkpoint interval of
+     * enum steps on every call; this cursor advances forward from
      * its last position when the requested ordinal is ahead, so monotonic access amortizes to a
      * single sequential pass over the terms file.
      */
@@ -520,12 +535,13 @@ public final class UninvertedOrdinals implements Closeable {
 
         public BytesRef term(int ord) {
             try {
+                int interval = checkpointInterval();
                 long delta = cursorEnum == null ? Long.MAX_VALUE : ord - cursorOrd;
-                if (delta < 0 || delta > CHECKPOINT_INTERVAL) {
+                if (delta < 0 || delta > interval) {
                     cursorEnum = terms.iterator();
-                    int checkpoint = ord / CHECKPOINT_INTERVAL;
+                    int checkpoint = ord / interval;
                     cursorEnum.seekCeil(checkpoints[checkpoint]);
-                    cursorOrd = (long) checkpoint * CHECKPOINT_INTERVAL;
+                    cursorOrd = (long) checkpoint * interval;
                 }
                 while (cursorOrd < ord) {
                     cursorEnum.next();
@@ -541,6 +557,7 @@ public final class UninvertedOrdinals implements Closeable {
     /** The ordinal of {@code key}, or {@code -insertionPoint - 1} (the lookupTerm contract). */
     public int rank(BytesRef key) {
         try {
+            int interval = checkpointInterval();
             if (checkpoints.length == 0) {
                 return -1;
             }
@@ -554,13 +571,13 @@ public final class UninvertedOrdinals implements Closeable {
                 } else if (cmp > 0) {
                     high = mid - 1;
                 } else {
-                    return mid * CHECKPOINT_INTERVAL;
+                    return mid * interval;
                 }
             }
             int checkpoint = Math.max(low - 1, 0);
             TermsEnum termsEnum = terms.iterator();
             termsEnum.seekCeil(checkpoints[checkpoint]);
-            int ord = checkpoint * CHECKPOINT_INTERVAL;
+            int ord = checkpoint * interval;
             BytesRef term = termsEnum.term();
             while (term != null) {
                 int cmp = term.compareTo(key);

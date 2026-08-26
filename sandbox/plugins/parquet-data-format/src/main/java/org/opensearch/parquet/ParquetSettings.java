@@ -240,6 +240,20 @@ public final class ParquetSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Interval between sparse term checkpoints in uninverted-ordinal (.ord) files. Smaller means
+     * fewer TermsEnum steps per lookupOrd/seekExact (faster bucket-key resolution) at the cost of a
+     * larger checkpoint section (more .ord bytes and heap). The value is written into each .ord and
+     * used on read, so a change only takes effect for newly built .ord files.
+     */
+    public static final Setting<Integer> DOCVALUES_CHECKPOINT_INTERVAL = Setting.intSetting(
+        "parquet.docvalues.checkpoint.interval",
+        256,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     /** Node-wide heap budget for cached keyword term dictionaries. */
     public static final Setting<Long> DOCVALUES_DICTIONARY_CACHE_BYTES = Setting.longSetting(
         "parquet.docvalues.dictionary.cache_bytes",
@@ -905,6 +919,7 @@ public final class ParquetSettings {
             DOCVALUES_INITIAL_BATCH_SIZE,
             DOCVALUES_DIAGNOSTICS,
             DOCVALUES_DICTIONARY_MAX_TERMS,
+            DOCVALUES_CHECKPOINT_INTERVAL,
             DOCVALUES_DICTIONARY_CACHE_BYTES,
             DOCVALUES_UNINVERT_MAX_DISK_BYTES,
             MERGE_DEFERRED_COLUMN_THRESHOLD,

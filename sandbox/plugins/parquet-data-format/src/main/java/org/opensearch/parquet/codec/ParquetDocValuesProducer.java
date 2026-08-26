@@ -65,6 +65,7 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private static volatile int dataFusionInitialBatchSize = 32;
     private static volatile boolean dataFusionDiagnostics;
     private static volatile int dictionaryMaxTerms = 65536;
+    private static volatile int checkpointInterval = 256;
     private static volatile long dictionaryCacheBytes = 64 * 1024 * 1024;
     private static volatile long uninvertMaxDiskBytes = 2L * 1024 * 1024 * 1024;
 
@@ -80,6 +81,16 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     static int dictionaryMaxTerms() {
         return dictionaryMaxTerms;
+    }
+
+    /** Updates the checkpoint interval used when building uninverted (.ord) keyword ordinals. */
+    public static void setCheckpointInterval(int interval) {
+        checkpointInterval = interval;
+    }
+
+    /** Checkpoint interval applied to newly built uninverted (.ord) ordinals. */
+    static int checkpointInterval() {
+        return checkpointInterval;
     }
 
     static long dictionaryCacheBytes() {
@@ -374,7 +385,7 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private synchronized BinaryPageReader binaryReaderFor(FieldInfo field, boolean repeated) throws IOException {
         // Sorted iterators need instance-scoped cursors (shared producers are accessed
         // concurrently), so each gets a dedicated reader with instance-unique pool slots.
-        DataFusionColumnReader reader = DataFusionColumnReader.open(
+        DataFusionColumnReader reader = DataFusionColumnReader.openDeferred(
             parquetFile,
             field.getName(),
             physicalType(field),
