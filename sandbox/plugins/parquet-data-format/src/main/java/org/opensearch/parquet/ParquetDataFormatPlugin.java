@@ -142,6 +142,7 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         ParquetDocValuesProducer.setInitialBatchSize(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE.get(this.settings));
         ParquetDocValuesProducer.setDiagnostics(ParquetSettings.DOCVALUES_DIAGNOSTICS.get(this.settings));
         ParquetDocValuesProducer.setDictionaryMaxTerms(ParquetSettings.DOCVALUES_DICTIONARY_MAX_TERMS.get(this.settings));
+        ParquetDocValuesProducer.setCheckpointInterval(ParquetSettings.DOCVALUES_CHECKPOINT_INTERVAL.get(this.settings));
         ParquetDocValuesProducer.setDictionaryCacheBytes(ParquetSettings.DOCVALUES_DICTIONARY_CACHE_BYTES.get(this.settings));
         ParquetDocValuesProducer.setUninvertMaxDiskBytes(ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_BYTES.get(this.settings));
         org.opensearch.parquet.codec.UninvertedOrdinalsCache.setOrdsDir(environment.dataFiles()[0].resolve("parquet-ords"));
@@ -151,6 +152,8 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_DIAGNOSTICS, ParquetDocValuesProducer::setDiagnostics);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_DICTIONARY_MAX_TERMS, ParquetDocValuesProducer::setDictionaryMaxTerms);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_CHECKPOINT_INTERVAL, ParquetDocValuesProducer::setCheckpointInterval);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_DICTIONARY_CACHE_BYTES, ParquetDocValuesProducer::setDictionaryCacheBytes);
         clusterService.getClusterSettings()

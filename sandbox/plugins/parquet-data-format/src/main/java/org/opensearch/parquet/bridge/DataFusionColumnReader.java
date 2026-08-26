@@ -37,6 +37,7 @@ import java.util.Arrays;
 public final class DataFusionColumnReader implements Closeable, NumericPageReader, BinaryPageReader {
 
     private static final long CLOSED_HANDLE = -1L;
+    private static final long NOT_OPENED = Long.MIN_VALUE;   // handle value before the native cursor is opened
 
     /**
      * Mirrors {@code MAX_BATCH_SIZE} in the native {@code doc_values_cursor.rs} and the upper
@@ -103,8 +104,8 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
     private final String valueKindSlot;
     private final String slotPrefix;
 
-    private long handle;
-    private final CursorState cursorState;
+    private long openHandle = NOT_OPENED;   // read ONLY via handle()
+    private CursorState cursorState;        // set lazily in handle(); null until first open
     private ColumnPageIndex pageIndex;
     private PageCache cache;
     private int outputRowsCapacity;
@@ -112,7 +113,6 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
     private long binaryValueCapacity = 64 * 1024L;
 
     private DataFusionColumnReader(
-        long handle,
         Path file,
         String column,
         ParquetPhysicalType type,
@@ -120,9 +120,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
         BufferPool bufferPool,
         int initialBatchSize
     ) {
-        this.handle = handle;
-        this.cursorState = new CursorState(handle);
-        CLEANER.register(this, cursorState);
+        // Native cursor is opened lazily on first use (see handle()); nothing opened/registered here.
         this.file = file;
         this.column = column;
         this.type = type;
@@ -163,8 +161,42 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
         BufferPool pool,
         int initialBatchSize
     ) throws IOException {
-        long handle = RustBridge.dfOpenIter(file.toString(), column, initialBatchSize);
-        return new DataFusionColumnReader(handle, file, column, type, repeated, pool, initialBatchSize);
+        DataFusionColumnReader reader = new DataFusionColumnReader(file, column, type, repeated, pool, initialBatchSize);
+        reader.handle(); // force the native open now — unchanged (eager) behavior for numeric/binary/shared readers
+        return reader;
+    }
+
+    /**
+     * Deferred variant: constructs the reader without opening the native cursor. The cursor is
+     * opened lazily on first use (see {@link #handle()}). Used by the keyword sorted/sorted-set
+     * path, where an ordinal-only aggregation never reads values and so never needs the cursor.
+     */
+    public static DataFusionColumnReader openDeferred(
+        Path file,
+        String column,
+        ParquetPhysicalType type,
+        boolean repeated,
+        BufferPool pool,
+        int initialBatchSize
+    ) {
+        return new DataFusionColumnReader(file, column, type, repeated, pool, initialBatchSize);
+    }
+
+    /**
+     * The native cursor handle, opened lazily on first use. This is the only code that reads
+     * {@code openHandle}, so every caller is guaranteed to open the cursor before using it and no
+     * caller can reach an unopened handle.
+     */
+    private synchronized long handle() throws IOException {
+        if (openHandle == CLOSED_HANDLE) {
+            throw new IOException("DataFusionColumnReader is closed: " + column);
+        }
+        if (openHandle == NOT_OPENED) {
+            openHandle = RustBridge.dfOpenIter(file.toString(), column, initialBatchSize);
+            cursorState = new CursorState(openHandle);
+            CLEANER.register(this, cursorState);
+        }
+        return openHandle;
     }
 
     /** Page statistics loaded through DataFusion's scoped page-index cache. */
@@ -209,7 +241,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
      */
     private void reopen() throws IOException {
         cache = null;
-        RustBridge.dfResetIter(handle);
+        RustBridge.dfResetIter(handle());
     }
 
     /** One native batch call. Fetches pooled buffers itself so a retry after growth sees the new capacity. */
@@ -249,7 +281,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
             long valueCap = (long) outputRowsCapacity * Long.BYTES;
             int presenceWords = presenceWords(outputRowsCapacity);
             return RustBridge.dfNextBatch(
-                handle,
+                handle(),
                 row,
                 firstRowOut,
                 lastRowOut,
@@ -311,7 +343,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
             long rows = outputRowsCapacity;
             int presenceWords = presenceWords(outputRowsCapacity);
             return RustBridge.dfNextBinaryBatch(
-                handle,
+                handle(),
                 row,
                 firstRowOut,
                 lastRowOut,
@@ -349,7 +381,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
         invokeGrowingOnOverflow(row, "repeated numeric", () -> {
             long rows = outputRowsCapacity;
             return RustBridge.dfNextRepeatedBatch(
-                handle,
+                handle(),
                 row,
                 firstRowOut,
                 lastRowOut,
@@ -386,7 +418,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
         invokeGrowingOnOverflow(row, "repeated binary", () -> {
             long rows = outputRowsCapacity;
             return RustBridge.dfNextRepeatedBinaryBatch(
-                handle,
+                handle(),
                 row,
                 firstRowOut,
                 lastRowOut,
@@ -507,25 +539,29 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
     }
 
     private void ensureOpen() {
-        if (handle == CLOSED_HANDLE) {
+        if (openHandle == CLOSED_HANDLE) {   // NOT_OPENED passes here; handle() opens it on first use
             throw new IllegalStateException("DataFusionColumnReader is closed");
         }
     }
 
     @Override
     public void close() throws IOException {
-        if (handle == CLOSED_HANDLE) {
+        if (openHandle == CLOSED_HANDLE) {
             return;
         }
-        long current = handle;
-        handle = CLOSED_HANDLE;
+        long current = openHandle;
+        openHandle = CLOSED_HANDLE;
         cache = null;
-        cursorState.handle.set(CLOSED_HANDLE);
-        RustBridge.dfCloseIter(current);
+        if (cursorState != null) {           // null if the reader was never opened
+            cursorState.handle.set(CLOSED_HANDLE);
+        }
+        if (current != NOT_OPENED) {         // nothing native to release if never opened
+            RustBridge.dfCloseIter(current);
+        }
     }
 
     private ColumnPageIndex loadPageIndex() throws IOException {
-        int pageCount = Math.toIntExact(RustBridge.dfPageCount(handle));
+        int pageCount = Math.toIntExact(RustBridge.dfPageCount(handle()));
         int capacity = Math.max(pageCount, 1);
         MemorySegment firstRow = bufferPool.longs(slotPrefix + "idxFirstRow", capacity);
         MemorySegment fileOffset = bufferPool.longs(slotPrefix + "idxFileOffset", capacity);
@@ -535,7 +571,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
         MemorySegment maxLong = bufferPool.longs(slotPrefix + "idxMax", capacity);
         MemorySegment actualPages = bufferPool.longOut(slotPrefix + "idxActualPages");
 
-        long rc = RustBridge.dfPageIndex(handle, firstRow, fileOffset, compressed, nullCount, minLong, maxLong, pageCount, actualPages);
+        long rc = RustBridge.dfPageIndex(handle(), firstRow, fileOffset, compressed, nullCount, minLong, maxLong, pageCount, actualPages);
         if (rc == RustBridge.RC_OVERFLOW) {
             throw new IOException(
                 "DataFusion page count changed while opening cursor: expected "
@@ -552,7 +588,7 @@ public final class DataFusionColumnReader implements Closeable, NumericPageReade
             toLongArray(nullCount, pageCount),
             toLongArray(minLong, pageCount),
             toLongArray(maxLong, pageCount),
-            RustBridge.dfRowCount(handle)
+            RustBridge.dfRowCount(handle())
         );
     }
 
