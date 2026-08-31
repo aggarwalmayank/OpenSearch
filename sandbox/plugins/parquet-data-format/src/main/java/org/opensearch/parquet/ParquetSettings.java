@@ -251,7 +251,7 @@ public final class ParquetSettings {
      */
     public static final Setting<Integer> DOCVALUES_CHECKPOINT_INTERVAL = Setting.intSetting(
         "parquet.docvalues.checkpoint.interval",
-        256,
+        128,
         1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
