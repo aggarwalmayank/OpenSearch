@@ -35,8 +35,13 @@ import org.opensearch.parquet.codec.iter.ParquetSortedSetDocValues;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 /**
  * Read-only {@link DocValuesProducer} that materializes per-document values from a Parquet
@@ -154,6 +159,12 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private final Map<String, DataFusionColumnReader> dataFusionColumnReaders = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.List<java.io.Closeable> dedicatedReaders = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
+    /** True for the codec / shared-registry producer (reused across requests): track sorted readers weakly, not pinned. */
+    private final boolean reusedAcrossRequests;
+
+    /** Weakly-held dedicated readers for a {@link #reusedAcrossRequests} producer; {@link #close()} is the backstop. */
+    private final Set<DataFusionColumnReader> weakDedicatedReaders = Collections.newSetFromMap(new WeakHashMap<>());
+
     /** Optional per-query accumulator; propagated to each column reader so its stats roll up at close. */
 
     private boolean closed;
@@ -167,6 +178,12 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * @throws IllegalStateException if the Row ID = Doc ID invariant is violated (Req 12.3)
      */
     public ParquetDocValuesProducer(SegmentReadState state, MapperService mapperService) throws IOException {
+        this(state, mapperService, false);
+    }
+
+    /** @param reusedAcrossRequests true for the codec / shared-registry producer; tracks sorted readers weakly. */
+    public ParquetDocValuesProducer(SegmentReadState state, MapperService mapperService, boolean reusedAcrossRequests) throws IOException {
+        this.reusedAcrossRequests = reusedAcrossRequests;
         this.mapperService = mapperService;
         this.maxDoc = state.segmentInfo.maxDoc();
 
@@ -318,6 +335,25 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             }
         }
         dedicatedReaders.clear();
+
+        if (reusedAcrossRequests) {
+            // Backstop: close any weakly-tracked reader still live at segment close.
+            List<DataFusionColumnReader> liveReaders;
+            synchronized (weakDedicatedReaders) {
+                liveReaders = new ArrayList<>(weakDedicatedReaders);
+                weakDedicatedReaders.clear();
+            }
+            for (DataFusionColumnReader reader : liveReaders) {
+                try {
+                    reader.close();
+                } catch (IOException | RuntimeException e) {
+                    if (first == null && e instanceof IOException io) {
+                        first = io;
+                    }
+                }
+            }
+        }
+
         dataFusionColumnReaders.clear();
         bufferPool.close();
         if (first != null) {
@@ -393,7 +429,14 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             bufferPool,
             dataFusionInitialBatchSize
         );
-        dedicatedReaders.add(reader);
+        if (reusedAcrossRequests) {
+            // Don't pin: track weakly so the cleaner frees the cursor once its iterator is unreachable.
+            synchronized (weakDedicatedReaders) {
+                weakDedicatedReaders.add(reader);
+            }
+        } else {
+            dedicatedReaders.add(reader);
+        }
         return reader;
     }
 

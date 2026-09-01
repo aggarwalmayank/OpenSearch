@@ -58,7 +58,7 @@ final class SharedProducerRegistry {
             if (existing != null) {
                 return existing;
             }
-            ParquetDocValuesProducer created = new ParquetDocValuesProducer(segmentReadState, mapperService);
+            ParquetDocValuesProducer created = new ParquetDocValuesProducer(segmentReadState, mapperService, true);
             PRODUCERS.put(key, created);
             coreHelper.addClosedListener(k -> {
                 ParquetDocValuesProducer removed = PRODUCERS.remove(k);
