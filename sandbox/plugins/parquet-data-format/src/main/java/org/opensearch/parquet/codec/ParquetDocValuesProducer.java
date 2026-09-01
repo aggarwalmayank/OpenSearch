@@ -20,12 +20,14 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.opensearch.index.mapper.BinaryFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.parquet.bridge.DataFusionColumnReader;
 import org.opensearch.parquet.bridge.ParquetFileMetadata;
 import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.codec.cache.BufferPool;
+import org.opensearch.parquet.codec.iter.BinaryFramingDocValues;
 import org.opensearch.parquet.codec.iter.ParquetBinaryDocValues;
 import org.opensearch.parquet.codec.iter.ParquetNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
@@ -224,7 +226,14 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     public BinaryDocValues getBinary(FieldInfo field) throws IOException {
         ensureOpen();
         validate(field, DocValuesType.BINARY);
-        return new ParquetBinaryDocValues(dedicatedReaderFor(field, false), maxDoc);
+        BinaryDocValues binary = new ParquetBinaryDocValues(dedicatedReaderFor(field, false), maxDoc);
+        // Parquet stores the value itself, unframed. A binary field's doc values consumers expect the
+        // field type's own encoding (value count + per-value length), so add it here. Other field types
+        // mapped to BINARY doc values, notably text, read the value raw and must not be framed.
+        if (isBinaryMappingType(field)) {
+            binary = new BinaryFramingDocValues(binary);
+        }
+        return binary;
     }
 
     @Override
@@ -336,6 +345,19 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             return; // low-level tests may bypass mapping validation
         }
         FieldTypeMapping.validate(field.getName(), mappingType(field), requested);
+    }
+
+    /**
+     * Whether the mapping types this field as {@code binary}. False when no mapper is present, as in
+     * the low-level tests that construct a producer without one: those assert on the Parquet column's
+     * own bytes, so the framing must stay off for them.
+     */
+    private boolean isBinaryMappingType(FieldInfo field) {
+        if (mapperService == null) {
+            return false;
+        }
+        MappedFieldType mft = mapperService.fieldType(field.getName());
+        return mft != null && BinaryFieldMapper.CONTENT_TYPE.equals(mft.typeName());
     }
 
     private String mappingType(FieldInfo field) {

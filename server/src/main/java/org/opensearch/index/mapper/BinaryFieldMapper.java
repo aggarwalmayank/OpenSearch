@@ -39,6 +39,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.util.CollectionUtils;
@@ -82,16 +83,33 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
     public static class Builder extends ParametrizedFieldMapper.Builder {
 
         private final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+        private final Parameter<Boolean> hasDocValues;
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         public Builder(String name) {
             this(name, false);
         }
 
+        /**
+         * Defaults doc values to on when the index uses a pluggable data format, off otherwise.
+         *
+         * <p>On the Lucene path a binary field has no query surface, so writing doc values by default
+         * would be cost without a consumer, and the upstream default of {@code false} is kept. Under a
+         * pluggable data format the values are held in the columnar store whether or not the mapping
+         * opts in, and derived source is force-enabled, so a field left at {@code false} would fail
+         * {@link BinaryFieldMapper#canDeriveSourceInternal()} for values that are in fact readable.
+         * Defaulting rather than forcing keeps an explicit {@code doc_values} in the mapping
+         * authoritative either way.
+         */
+        public Builder(String name, Settings indexSettings) {
+            this(name, Mapper.isPluggableDataFormatEnabled(indexSettings));
+        }
+
         public Builder(String name, boolean hasDocValues) {
             super(name);
-            this.hasDocValues.setValue(hasDocValues);
+            // Set as the parameter's default rather than via setValue, so that a doc_values in the mapping
+            // is still recorded as explicitly configured and still overrides this.
+            this.hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, hasDocValues);
         }
 
         @Override
@@ -111,7 +129,7 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
         }
     }
 
-    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n));
+    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.getSettings()));
 
     /**
      * Binary field type
@@ -176,6 +194,7 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     private final boolean stored;
     private final boolean hasDocValues;
+    private final boolean hasDocValuesByDefault;
 
     protected BinaryFieldMapper(
         String simpleName,
@@ -187,6 +206,7 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
         super(simpleName, mappedFieldType, multiFields, copyTo);
         this.stored = builder.stored.getValue();
         this.hasDocValues = builder.hasDocValues.getValue();
+        this.hasDocValuesByDefault = builder.hasDocValues.getDefaultValue();
     }
 
     @Override
@@ -241,7 +261,14 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     public ParametrizedFieldMapper.Builder getMergeBuilder() {
-        return new BinaryFieldMapper.Builder(simpleName()).init(this);
+        // Carry over the default this mapper was built with rather than either the upstream false or this
+        // mapper's own hasDocValues, following NumberFieldMapper's handling of ignoreMalformedByDefault.
+        // init() copies the value across, so the merged mapper is unaffected by the choice, but
+        // serialization is not: doXContentBody goes through this builder and omits any parameter whose
+        // value equals its default. Using false would drop an explicit doc_values: false on an index that
+        // defaults it on, and re-parsing that output would silently flip the field back to true; using
+        // hasDocValues would instead drop an explicit doc_values: true on the Lucene path.
+        return new BinaryFieldMapper.Builder(simpleName(), hasDocValuesByDefault).init(this);
     }
 
     @Override
@@ -251,15 +278,25 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     protected void canDeriveSourceInternal() {
-        checkStoredForDerivedSource();
+        checkStoredAndDocValuesForDerivedSource();
     }
 
+    /**
+     * 1. If the field is stored, build source from the stored field, which preserves the values verbatim.
+     * 2. Otherwise build it from doc values. Note that binary doc values are sorted and deduplicated on write by
+     *    {@link CustomBinaryDocValuesField#binaryValue()}, so a multi valued field loses the original ordering and any
+     *    duplicate values. This matches the behaviour of the other doc values backed field types.
+     */
     @Override
     protected DerivedFieldGenerator derivedFieldGenerator() {
-        return new DerivedFieldGenerator(mappedFieldType, null, new StoredFieldFetcher(mappedFieldType, simpleName())) {
+        return new DerivedFieldGenerator(
+            mappedFieldType,
+            new BinaryDocValuesFetcher(mappedFieldType, simpleName()),
+            new StoredFieldFetcher(mappedFieldType, simpleName())
+        ) {
             @Override
             public FieldValueType getDerivedFieldPreference() {
-                return FieldValueType.STORED;
+                return mappedFieldType.isStored() ? FieldValueType.STORED : FieldValueType.DOC_VALUES;
             }
         };
     }
