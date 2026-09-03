@@ -150,18 +150,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
 
         public Builder(String name, NumberType type, Settings settings) {
             this(name, type, IGNORE_MALFORMED_SETTING.get(settings), COERCE_SETTING.get(settings));
-<<<<<<< HEAD
-            if (Mapper.isPluggableDataFormatEnabled(settings)) {
-                // Pluggable data formats serve numeric queries from the doc-values column and write
-                // no BKD points, so the field is not point-searchable. Default `index` to false; an
-                // explicit `index: true` overwrites this during parameter parsing and is rejected in
-                // build().
-                this.pluggableDataFormat = true;
-                this.indexed.setValue(false);
-            }
-=======
             this.pluggableDataFormat = Mapper.isPluggableDataFormatEnabled(settings);
->>>>>>> origin/main
         }
 
         public static Builder docValuesOnly(String name, NumberType type) {
