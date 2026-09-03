@@ -48,6 +48,8 @@ public final class UninvertedOrdinalsCache {
     /** Marks a (segment, field) whose ordinals failed coverage verification — do not retry. */
     private static final Map<Object, Set<String>> INELIGIBLE = new ConcurrentHashMap<>();
     private static final Map<Object, Map<String, CacheEntry>> CACHE = new ConcurrentHashMap<>();
+    // Multi-valued (SORTED_SET) ordinals, keyed the same way. Parallel to CACHE; shares BUILD_LOCK/ORDS_DIR.
+    private static final Map<Object, Map<String, SetCacheEntry>> CACHE_SET = new ConcurrentHashMap<>();
     private static final Object BUILD_LOCK = new Object();
 
     /** Default under java.io.tmpdir (unit tests); the plugin points this at the node data path. */
@@ -146,6 +148,116 @@ public final class UninvertedOrdinalsCache {
         public void close() {
             if (closed.compareAndSet(false, true)) {
                 entry.release();
+            }
+        }
+    }
+
+    // ---- Multi-valued (SORTED_SET) ordinals cache ----
+
+    private static final class SetCacheEntry {
+        private final UninvertedSortedSetOrdinals ords;
+        private int inUse;
+        private boolean evicted;
+
+        private SetCacheEntry(UninvertedSortedSetOrdinals ords) {
+            this.ords = ords;
+        }
+
+        private synchronized SetLease tryAcquire() {
+            if (evicted) {
+                return null;
+            }
+            inUse++;
+            return new SetLease(this);
+        }
+
+        private synchronized void release() {
+            inUse--;
+        }
+    }
+
+    /** Request-scoped handle keeping a multi-value entry in-use until the reader closes. */
+    static final class SetLease implements AutoCloseable {
+        private final SetCacheEntry entry;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private SetLease(SetCacheEntry entry) {
+            this.entry = entry;
+        }
+
+        UninvertedSortedSetOrdinals ordinals() {
+            return entry.ords;
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                entry.release();
+            }
+        }
+    }
+
+    /**
+     * Acquires multi-valued (SORTED_SET) uninverted ordinals for {@code field}. Mirrors
+     * {@link #acquire} but for {@link UninvertedSortedSetOrdinals}; returns {@code null} when the
+     * segment lacks a core cache identity or terms index. (MVP: no disk-budget eviction yet —
+     * multi-value keyword fields are the exception, not the norm.)
+     */
+    static SetLease acquireSortedSet(LeafReader leaf, SegmentInfo segmentInfo, String field) throws IOException {
+        IndexReader.CacheHelper helper = leaf.getCoreCacheHelper();
+        Terms terms = leaf.terms(field);
+        if (helper == null || terms == null) {
+            return null;
+        }
+        Object key = helper.getKey();
+        Map<String, SetCacheEntry> perSegment = CACHE_SET.computeIfAbsent(key, k -> {
+            helper.addClosedListener(closedKey -> {
+                Map<String, SetCacheEntry> removed = CACHE_SET.remove(closedKey);
+                if (removed != null) {
+                    for (SetCacheEntry entry : removed.values()) {
+                        try {
+                            entry.ords.close();
+                        } catch (IOException e) {
+                            // segment going away; nothing actionable
+                        }
+                    }
+                }
+            });
+            return new ConcurrentHashMap<>();
+        });
+
+        for (;;) {
+            SetCacheEntry cached = perSegment.get(field);
+            if (cached != null) {
+                SetLease lease = cached.tryAcquire();
+                if (lease != null) {
+                    return lease;
+                }
+                perSegment.remove(field, cached);
+                continue;
+            }
+            synchronized (BUILD_LOCK) {
+                cached = perSegment.get(field);
+                if (cached != null) {
+                    SetLease lease = cached.tryAcquire();
+                    if (lease != null) {
+                        return lease;
+                    }
+                    perSegment.remove(field, cached);
+                    continue;
+                }
+                String fileKey = StringHelper.idToString(segmentInfo.getId()) + "-" + field;
+                UninvertedSortedSetOrdinals built = UninvertedSortedSetOrdinals.build(
+                    ORDS_DIR,
+                    fileKey,
+                    terms,
+                    leaf.maxDoc(),
+                    () -> shuttingDown || Thread.currentThread().isInterrupted()
+                );
+                SetCacheEntry entry = new SetCacheEntry(built);
+                SetLease lease = entry.tryAcquire();
+                perSegment.put(field, entry);
+                return lease;
             }
         }
     }

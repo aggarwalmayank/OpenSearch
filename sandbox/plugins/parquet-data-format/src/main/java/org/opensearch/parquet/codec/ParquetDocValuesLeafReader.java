@@ -26,6 +26,7 @@ import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.IOContext;
@@ -37,6 +38,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.parquet.codec.iter.ParquetDictionarySortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetUninvertedSortedDocValues;
+import org.opensearch.parquet.codec.iter.ParquetUninvertedSortedSetDocValues;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -98,6 +100,7 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     /** Request-scoped uninverted-ordinal leases keyed by field, released when this reader closes. */
     private final Map<String, UninvertedOrdinalsCache.Lease> uninvertedOrdinalsLeases = new HashMap<>();
+    private final Map<String, UninvertedOrdinalsCache.SetLease> uninvertedSortedSetLeases = new HashMap<>();
 
     /** The segment read state used to build the producer (captured at construction). */
     private final SegmentReadState segmentReadState;
@@ -382,6 +385,18 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         return lease;
     }
 
+    private synchronized UninvertedOrdinalsCache.SetLease acquireSortedSetLease(String field) throws IOException {
+        UninvertedOrdinalsCache.SetLease lease = uninvertedSortedSetLeases.get(field);
+        if (lease != null) {
+            return lease;
+        }
+        lease = UninvertedOrdinalsCache.acquireSortedSet(in, segmentReadState.segmentInfo, field);
+        if (lease != null) {
+            uninvertedSortedSetLeases.put(field, lease);
+        }
+        return lease;
+    }
+
     private SortedDocValues withDictionaryOrdinals(String field, SortedDocValues sorted) throws IOException {
         // Ordinal tiers rank Parquet VALUES against the Lucene sidecar's TERMS, which only
         // coincide for untokenized (keyword) fields. A text field's terms are analyzer tokens:
@@ -415,6 +430,20 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
+            // Genuinely multi-valued keyword fields (some doc has >1 value → sumDocFreq > docCount in
+            // the sidecar) get real segment-global ordinals via the uninverted SORTED_SET path, so
+            // terms aggregations run on global_ordinals instead of requiring execution_hint:map.
+            if (isKeywordField(field)) {
+                Terms t = in.terms(field);
+                if (t != null && t.getSumDocFreq() > t.getDocCount()) {
+                    UninvertedOrdinalsCache.SetLease setLease = acquireSortedSetLease(field);
+                    if (setLease != null) {
+                        SortedSetDocValues ss = new ParquetUninvertedSortedSetDocValues(setLease.ordinals(), maxDoc());
+                        RowIdResolver resolver = newRowIdResolver();
+                        return resolver == RowIdResolver.IDENTITY ? ss : RowIdRemappingDocValues.sortedSet(ss, resolver, maxDoc());
+                    }
+                }
+            }
             // Mirror getSortedNumericDocValues: keyword value sources request SORTED_SET even for
             // single-valued fields, then call DocValues.unwrapSingleton(...). Serve single-valued
             // keywords through the single-valued ordinal-table iterator (producer().getSorted →
@@ -470,6 +499,10 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             lease.close();
         }
         uninvertedOrdinalsLeases.clear();
+        for (UninvertedOrdinalsCache.SetLease lease : uninvertedSortedSetLeases.values()) {
+            lease.close();
+        }
+        uninvertedSortedSetLeases.clear();
 
         IOException first = null;
         try {
