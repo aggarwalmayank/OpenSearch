@@ -113,7 +113,7 @@ public class BooleanFieldMapper extends ParametrizedFieldMapper {
     public static class Builder extends ParametrizedFieldMapper.Builder {
 
         private final Parameter<Boolean> docValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
-        private final Parameter<Boolean> indexed = Parameter.indexParam(m -> toType(m).indexed, true);
+        private final Parameter<Boolean> indexed = Parameter.indexParam(m -> toType(m).indexed, () -> pluggableDataFormat == false);
         private final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
 
         private final Parameter<Boolean> nullValue = new Parameter<>(
@@ -141,14 +141,7 @@ public class BooleanFieldMapper extends ParametrizedFieldMapper {
 
         public Builder(String name, Settings settings) {
             super(name);
-            if (Mapper.isPluggableDataFormatEnabled(settings)) {
-                // Pluggable data formats serve boolean queries from the doc-values column and write no
-                // terms for the field in the Lucene secondary, so it is not searchable through the
-                // inverted index. Default `index` to false; an explicit `index: true` overwrites this
-                // during parameter parsing and is rejected in build().
-                this.pluggableDataFormat = true;
-                this.indexed.setValue(false);
-            }
+            this.pluggableDataFormat = Mapper.isPluggableDataFormatEnabled(settings);
         }
 
         @Override
@@ -395,7 +388,7 @@ public class BooleanFieldMapper extends ParametrizedFieldMapper {
         CopyTo copyTo,
         Builder builder
     ) {
-        super(simpleName, mappedFieldType, multiFields, copyTo);
+        super(simpleName, mappedFieldType, multiFields, copyTo, builder.isPluggableDataFormat());
         this.nullValue = builder.nullValue.getValue();
         this.stored = builder.stored.getValue();
         this.indexed = builder.indexed.getValue();

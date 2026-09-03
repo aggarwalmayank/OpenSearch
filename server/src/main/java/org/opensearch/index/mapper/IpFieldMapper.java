@@ -102,7 +102,7 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
      */
     public static class Builder extends ParametrizedFieldMapper.Builder {
 
-        private final Parameter<Boolean> indexed = Parameter.indexParam(m -> toType(m).indexed, true);
+        private final Parameter<Boolean> indexed = Parameter.indexParam(m -> toType(m).indexed, () -> pluggableDataFormat == false);
         private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
         private final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
 
@@ -137,13 +137,7 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
                 m -> toType(m).ignoreMalformed,
                 ignoreMalformedByDefault
             );
-            if (Mapper.isPluggableDataFormatEnabled(settings)) {
-                // Pluggable data formats serve IP queries from the doc-values column and write no BKD
-                // points, so the field is not point-searchable. Default `index` to false; an explicit
-                // `index: true` overwrites this during parameter parsing and is rejected in build().
-                this.pluggableDataFormat = true;
-                this.indexed.setValue(false);
-            }
+            this.pluggableDataFormat = Mapper.isPluggableDataFormatEnabled(settings);
         }
 
         Builder nullValue(String nullValue) {
@@ -639,7 +633,7 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
     private final Version indexCreatedVersion;
 
     private IpFieldMapper(String simpleName, MappedFieldType mappedFieldType, MultiFields multiFields, CopyTo copyTo, Builder builder) {
-        super(simpleName, mappedFieldType, multiFields, copyTo);
+        super(simpleName, mappedFieldType, multiFields, copyTo, builder.isPluggableDataFormat());
         this.ignoreMalformedByDefault = builder.ignoreMalformedByDefault;
         this.indexed = builder.indexed.getValue();
         this.hasDocValues = builder.hasDocValues.getValue();

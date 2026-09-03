@@ -120,7 +120,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
      */
     public static class Builder extends ParametrizedFieldMapper.Builder {
 
-        private final Parameter<Boolean> indexed = Parameter.indexParam(m -> toType(m).indexed, true);
+        private final Parameter<Boolean> indexed = Parameter.indexParam(m -> toType(m).indexed, () -> pluggableDataFormat == false);
         private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
         private final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
         private final Parameter<Boolean> skiplist = new Parameter<>(
@@ -150,6 +150,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
 
         public Builder(String name, NumberType type, Settings settings) {
             this(name, type, IGNORE_MALFORMED_SETTING.get(settings), COERCE_SETTING.get(settings));
+<<<<<<< HEAD
             if (Mapper.isPluggableDataFormatEnabled(settings)) {
                 // Pluggable data formats serve numeric queries from the doc-values column and write
                 // no BKD points, so the field is not point-searchable. Default `index` to false; an
@@ -158,6 +159,9 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
                 this.pluggableDataFormat = true;
                 this.indexed.setValue(false);
             }
+=======
+            this.pluggableDataFormat = Mapper.isPluggableDataFormatEnabled(settings);
+>>>>>>> origin/main
         }
 
         public static Builder docValuesOnly(String name, NumberType type) {
@@ -2158,7 +2162,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
     private final boolean coerceByDefault;
 
     private NumberFieldMapper(String simpleName, MappedFieldType mappedFieldType, MultiFields multiFields, CopyTo copyTo, Builder builder) {
-        super(simpleName, mappedFieldType, multiFields, copyTo);
+        super(simpleName, mappedFieldType, multiFields, copyTo, builder.isPluggableDataFormat());
         this.type = builder.type;
         this.indexed = builder.indexed.getValue();
         this.hasDocValues = builder.hasDocValues.getValue();
