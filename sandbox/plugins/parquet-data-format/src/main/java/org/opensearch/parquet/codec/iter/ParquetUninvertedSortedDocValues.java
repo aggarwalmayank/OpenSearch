@@ -36,6 +36,7 @@ public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
     private final int maxDoc;
 
     private UninvertedOrdinals.TermCursor termCursor;
+    private UninvertedOrdinals.OrdinalCursor ordCursor; // block-caching; forward-only for sparse (IndexedDISI)
     private int doc = -1;
     private int currentOrd = -1;
     private boolean streamingPositioned = false;
@@ -55,7 +56,10 @@ public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
         }
         doc = target;
         streamingPositioned = false; // value read is lazy; most consumers never need it
-        currentOrd = ordinals.ordinal(target);
+        if (ordCursor == null) {
+            ordCursor = ordinals.newOrdinalCursor();
+        }
+        currentOrd = ordCursor.ordinal(target);
         return currentOrd >= 0;
     }
 
