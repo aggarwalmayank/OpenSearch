@@ -115,13 +115,6 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
         private final boolean ignoreMalformedByDefault;
         private final Version indexCreatedVersion;
 
-        /**
-         * True when this builder defaulted {@code index} to false because the index uses a pluggable
-         * data format. Only set by the constructor that receives index settings, so builders created
-         * for internal field types — derived fields, which evaluate queries against an in-memory
-         * index of their own rather than the pluggable storage — are unaffected.
-         */
-        private boolean pluggableDataFormat;
 
         public Builder(String name, boolean ignoreMalformedByDefault, Version indexCreatedVersion) {
             this(name, ignoreMalformedByDefault, indexCreatedVersion, Settings.EMPTY);
