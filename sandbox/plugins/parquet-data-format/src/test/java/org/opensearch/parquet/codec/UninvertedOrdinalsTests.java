@@ -31,9 +31,10 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     public void testReloadUsesPersistedCheckpointsWithoutCheckpointRebuild() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "reload";
+        final int checkpointInterval = ParquetDocValuesProducer.checkpointInterval();
 
         try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
-            final int termCount = UninvertedOrdinals.CHECKPOINT_INTERVAL + 128;
+            final int termCount = checkpointInterval + 128;
             for (int i = 0; i < termCount; i++) {
                 Document doc = new Document();
                 doc.add(new StringField("f", termValue(i), Field.Store.NO));
@@ -46,21 +47,91 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 Terms baseTerms = leaf.terms("f");
                 assertNotNull(baseTerms);
 
-                try (UninvertedOrdinals built = UninvertedOrdinals.build(ordsDir, fileKey, baseTerms, leaf.maxDoc(), termCount, () -> false)) {
+                try (
+                    UninvertedOrdinals built = UninvertedOrdinals.build(ordsDir, fileKey, baseTerms, leaf.maxDoc(), termCount, () -> false)
+                ) {
                     assertEquals(termCount, built.valueCount());
-                    assertEquals(0, built.ordinal(0));
-                    assertEquals(termCount - 1, built.ordinal(termCount - 1));
+                    UninvertedOrdinals.OrdinalCursor cursor = built.newOrdinalCursor();
+                    assertEquals(0, cursor.ordinal(0));
+                    assertEquals(termCount - 1, cursor.ordinal(termCount - 1));
                 }
 
                 AtomicInteger iteratorCalls = new AtomicInteger();
                 Terms countingTerms = countingTerms(baseTerms, iteratorCalls);
-                try (UninvertedOrdinals reloaded = UninvertedOrdinals.build(ordsDir, fileKey, countingTerms, leaf.maxDoc(), termCount, () -> false)) {
+                try (
+                    UninvertedOrdinals reloaded = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        countingTerms,
+                        leaf.maxDoc(),
+                        termCount,
+                        () -> false
+                    )
+                ) {
                     assertEquals("existing .ord should load without rebuilding checkpoints", 0, iteratorCalls.get());
                     assertEquals(termCount, reloaded.valueCount());
-                    assertEquals(termCount - 1, reloaded.ordinal(termCount - 1));
-                    assertEquals(termValue(UninvertedOrdinals.CHECKPOINT_INTERVAL + 5), reloaded.term(UninvertedOrdinals.CHECKPOINT_INTERVAL + 5).utf8ToString());
+                    assertEquals(termCount - 1, reloaded.newOrdinalCursor().ordinal(termCount - 1));
+                    int probe = checkpointInterval + 5;
+                    assertEquals(termValue(probe), reloaded.term(probe).utf8ToString());
                     assertEquals(1, iteratorCalls.get());
-                    assertEquals(UninvertedOrdinals.CHECKPOINT_INTERVAL + 5, reloaded.rank(new BytesRef(termValue(UninvertedOrdinals.CHECKPOINT_INTERVAL + 5))));
+                    assertEquals(probe, reloaded.rank(new BytesRef(termValue(probe))));
+                }
+            }
+        }
+    }
+
+    /**
+     * The interval a .ord was built with is recorded in its header and honoured on read, so a
+     * setting change must not invalidate an existing file nor shift its ord&harr;term mapping.
+     */
+    public void testReloadHonoursTheIntervalTheFileWasBuiltWith() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "interval-change";
+        final int buildInterval = ParquetDocValuesProducer.checkpointInterval();
+        final int termCount = buildInterval + 64;
+
+        try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
+            for (int i = 0; i < termCount; i++) {
+                Document doc = new Document();
+                doc.add(new StringField("f", termValue(i), Field.Store.NO));
+                writer.addDocument(doc);
+            }
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = writer.getReader()) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                try (
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), termCount, () -> false)
+                ) {
+                    // built with the default interval
+                }
+
+                // Simulate a dynamic cluster-setting change to a different interval.
+                ParquetDocValuesProducer.setCheckpointInterval(buildInterval * 2 + 7);
+                try {
+                    AtomicInteger iteratorCalls = new AtomicInteger();
+                    Terms countingTerms = countingTerms(terms, iteratorCalls);
+                    try (
+                        UninvertedOrdinals reloaded = UninvertedOrdinals.build(
+                            ordsDir,
+                            fileKey,
+                            countingTerms,
+                            leaf.maxDoc(),
+                            termCount,
+                            () -> false
+                        )
+                    ) {
+                        assertEquals("interval change must not force a re-uninvert", 0, iteratorCalls.get());
+                        for (int ord : new int[] { 0, 1, buildInterval - 1, buildInterval, buildInterval + 5, termCount - 1 }) {
+                            assertEquals("ord->term must survive the setting change", termValue(ord), reloaded.term(ord).utf8ToString());
+                            assertEquals("term->ord must survive the setting change", ord, reloaded.rank(new BytesRef(termValue(ord))));
+                        }
+                    }
+                } finally {
+                    ParquetDocValuesProducer.setCheckpointInterval(buildInterval);
                 }
             }
         }
@@ -93,7 +164,9 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
                 AtomicInteger iteratorCalls = new AtomicInteger();
                 Terms countingTerms = countingTerms(baseTerms, iteratorCalls);
-                try (UninvertedOrdinals rebuilt = UninvertedOrdinals.build(ordsDir, fileKey, countingTerms, leaf.maxDoc(), 3, () -> false)) {
+                try (
+                    UninvertedOrdinals rebuilt = UninvertedOrdinals.build(ordsDir, fileKey, countingTerms, leaf.maxDoc(), 3, () -> false)
+                ) {
                     assertTrue("corrupt assignedDocs metadata should force rebuild", iteratorCalls.get() > 0);
                     assertEquals("beta", rebuilt.term(1).utf8ToString());
                     assertEquals(2, rebuilt.rank(new BytesRef("gamma")));

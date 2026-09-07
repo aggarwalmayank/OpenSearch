@@ -34,7 +34,6 @@ import org.opensearch.common.lucene.index.SequentialStoredFieldsLeafReader;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
-import org.opensearch.parquet.codec.iter.ParquetDictionarySortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetUninvertedSortedDocValues;
 
@@ -169,8 +168,9 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
                 continue;
             }
             FieldTypeMapping.Mapping mapping = FieldTypeMapping.forType(mft.typeName());
-            DocValuesType dvType = mapping.singleValued();
-            FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType, skipIndexTypeFor(mapping));
+            ValueCardinality cardinality = ValueCardinality.of(mft);
+            DocValuesType dvType = cardinality.isSingleValued() ? mapping.singleValued() : mapping.multiValued();
+            FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType, skipIndexTypeFor(mapping, cardinality));
             parquetFields.put(name, synthetic);
             // If a DV-less FieldInfo already exists for this field, replace it with the synthetic
             // one carrying the DV type; otherwise append.
@@ -195,8 +195,15 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * (raw-bits order == numeric order), NONE otherwise. Must stay in sync with
      * {@link ParquetDocValuesProducer#getSkipper}'s physical-type gate: declaring RANGE for a
      * field whose getSkipper returns null would break consumers that trust the declaration.
+     *
+     * <p>Multi-valued columns get NONE: repeated values may span Parquet pages, so OffsetIndex
+     * page row ranges no longer define independent Lucene document ranges. This mirrors the
+     * {@code SORTED_NUMERIC} guard in {@link ParquetDocValuesProducer#getSkipper}.
      */
-    private static DocValuesSkipIndexType skipIndexTypeFor(FieldTypeMapping.Mapping mapping) {
+    private static DocValuesSkipIndexType skipIndexTypeFor(FieldTypeMapping.Mapping mapping, ValueCardinality cardinality) {
+        if (cardinality.isSingleValued() == false) {
+            return DocValuesSkipIndexType.NONE;
+        }
         ParquetPhysicalType phys = mapping.physical();
         boolean skippable = phys == ParquetPhysicalType.INT32 || phys == ParquetPhysicalType.INT64 || phys == ParquetPhysicalType.BOOL;
         return skippable ? DocValuesSkipIndexType.RANGE : DocValuesSkipIndexType.NONE;
@@ -243,12 +250,6 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             return shared;
         }
         return producer;
-    }
-
-    /** Whether the mapper types this field (or subfield) as keyword — values indexed verbatim. */
-    private boolean isKeywordField(String field) {
-        org.opensearch.index.mapper.MappedFieldType fieldType = mapperService.fieldType(field);
-        return fieldType != null && "keyword".equals(fieldType.typeName());
     }
 
     /** Returns the synthetic FieldInfo if the given field is served from Parquet, else null. */
@@ -356,18 +357,47 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.SORTED) {
             RowIdResolver resolver = newRowIdResolver();
-            SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(fi));
+            SortedDocValues sorted = withSegmentOrdinals(field, producer().getSorted(fi));
             return resolver == RowIdResolver.IDENTITY ? sorted : RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
         }
         return in.getSortedDocValues(field);
     }
 
     /**
-     * Upgrades a streaming sorted iterator to fully contract-compliant segment ordinals when the
-     * field's cardinality fits the dictionary budget. The sorted term dictionary is read from
-     * the composite index's Lucene sidecar (O(distinct), cached per segment) — never from a row
-     * scan. Above-budget fields keep the streaming iterator, whose global-ordinal operations
-     * fail fast rather than materialize.
+     * This field's value cardinality — the single read-path decision point for single- vs
+     * multi-valued behaviour. See {@link ValueCardinality} for why it is always single-valued today
+     * and what enabling multi-value requires. Unmapped fields cannot be served from Parquet at all
+     * (they would have no synthetic FieldInfo), so the fallback is the safe shape.
+     */
+    private ValueCardinality cardinalityOf(String field) {
+        MappedFieldType fieldType = mapperService.fieldType(field);
+        return fieldType == null ? ValueCardinality.SINGLE_VALUED : ValueCardinality.of(fieldType);
+    }
+
+    /**
+     * Whether this field is eligible for segment-global ordinals.
+     *
+     * <p>Ordinals rank the Lucene sidecar's <b>terms</b>, and a document's ordinal is only correct
+     * if the sidecar term for that document is byte-identical to the value stored in Parquet. That
+     * holds only for untokenized fields. A {@code text} field's terms are analyzer tokens — a
+     * document holding {@code "quick brown fox"} produces three terms, none equal to the stored
+     * value — so ranking against them would yield silently wrong ordinals. Ineligible fields stay
+     * on the streaming iterator, whose global operations fail fast toward {@code execution_hint:map}
+     * rather than return wrong numbers.
+     *
+     * <p>Note {@code ip} is also untokenized and stored verbatim in its sidecar terms, so it is
+     * eligible on the same reasoning; it is excluded here only because that has not been validated
+     * yet. Widening this predicate is the intended follow-up.
+     */
+    private boolean supportsSegmentOrdinals(String field) {
+        MappedFieldType fieldType = mapperService.fieldType(field);
+        return fieldType != null && "keyword".equals(fieldType.typeName());
+    }
+
+    /**
+     * Acquires (building on first use) the request-scoped lease on this field's disk-backed
+     * uninverted ordinals, memoized so repeated accessor calls within one search share one lease.
+     * Released in {@link #closeParquetResources()}.
      */
     private synchronized UninvertedOrdinalsCache.Lease acquireUninvertedOrdinalsLease(String field, long expectedNonNullDocs)
         throws IOException {
@@ -382,26 +412,11 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         return lease;
     }
 
-    private SortedDocValues withDictionaryOrdinals(String field, SortedDocValues sorted) throws IOException {
-        // Ordinal tiers rank Parquet VALUES against the Lucene sidecar's TERMS, which only
-        // coincide for untokenized (keyword) fields. A text field's terms are analyzer tokens:
-        // ranking values against tokens would produce silently wrong ordinals. Text fields stay
-        // on the streaming iterator, whose global operations fail fast toward execution_hint:map.
-        if (isKeywordField(field) == false) {
+    private SortedDocValues withSegmentOrdinals(String field, SortedDocValues sorted) throws IOException {
+        if (supportsSegmentOrdinals(field) == false) {
             return sorted;
         }
         if (sorted instanceof ParquetSortedDocValues streaming) {
-            TermDictionary dictionary = TermDictionaryCache.get(
-                in,
-                field,
-                ParquetDocValuesProducer.dictionaryMaxTerms(),
-                ParquetDocValuesProducer.dictionaryCacheBytes()
-            );
-            if (dictionary != null) {
-                return new ParquetDictionarySortedDocValues(streaming, dictionary);
-            }
-            // Above the dictionary budget: disk-backed uninverted ordinals (built once per
-            // segment from the sidecar's postings, memory-mapped, working-set resident).
             long expectedNonNull = producer().nonNullRowCount(parquetFieldInfo(field));
             UninvertedOrdinalsCache.Lease lease = acquireUninvertedOrdinalsLease(field, expectedNonNull);
             if (lease != null) {
@@ -415,20 +430,30 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
-            // Mirror getSortedNumericDocValues: keyword value sources request SORTED_SET even for
-            // single-valued fields, then call DocValues.unwrapSingleton(...). Serve single-valued
-            // keywords through the single-valued ordinal-table iterator (producer().getSorted →
-            // ParquetSortedDocValues), remap docId→row, and wrap with DocValues.singleton(...) so the
-            // returned value is a real SingletonSortedSetDocValues that unwrapSingleton(...) detects.
-            //
-            // TODO(multi-value): intentionally treats every keyword field as single-valued and so breaks
-            // true multi-valued (array) keyword fields. Restore the multi-valued path for genuinely
-            // repeated columns and return RowIdRemappingDocValues.sortedSet(
-            // producer().getSortedSet(asSortedSet), newRowIdResolver(), maxDoc()) for those.
+            if (cardinalityOf(field).isSingleValued() == false) {
+                // MULTI_VALUE_TODO(step 4): repeated keyword column — serve the multi-valued
+                // iterator directly. ParquetSortedSetDocValues already implements the SORTED_SET
+                // contract (per-doc sort + dedup); it needs list-shaped ordinals from
+                // UninvertedOrdinals (step 3) before global-ordinal consumers can use it.
+                FieldInfo asSortedSet = fi.getDocValuesType() == DocValuesType.SORTED_SET
+                    ? fi
+                    : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED_SET, DocValuesSkipIndexType.NONE);
+                SortedSetDocValues sortedSet = producer().getSortedSet(asSortedSet);
+                RowIdResolver multiResolver = newRowIdResolver();
+                return multiResolver == RowIdResolver.IDENTITY
+                    ? sortedSet
+                    : RowIdRemappingDocValues.sortedSet(sortedSet, multiResolver, maxDoc());
+            }
+            // Single-valued (the only shape the write path can produce today). OpenSearch keyword
+            // value sources request SORTED_SET even for single-valued fields, then call
+            // DocValues.unwrapSingleton(...) to take a leaner collector. So serve the single-valued
+            // ordinal iterator and wrap it with DocValues.singleton(...): the result is a real
+            // SingletonSortedSetDocValues that unwrapSingleton(...) detects, giving the aggregator
+            // its single-valued fast path over genuine segment ordinals.
             FieldInfo asSorted = fi.getDocValuesType() == DocValuesType.SORTED
                 ? fi
                 : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED, fi.docValuesSkipIndexType());
-            SortedDocValues sorted = withDictionaryOrdinals(field, producer().getSorted(asSorted));
+            SortedDocValues sorted = withSegmentOrdinals(field, producer().getSorted(asSorted));
             RowIdResolver resolver = newRowIdResolver();
             SortedDocValues remapped = resolver == RowIdResolver.IDENTITY
                 ? sorted

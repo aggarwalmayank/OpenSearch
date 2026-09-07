@@ -69,26 +69,17 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private static final Logger logger = LogManager.getLogger(ParquetDocValuesProducer.class);
     private static volatile int dataFusionInitialBatchSize = 32;
     private static volatile boolean dataFusionDiagnostics;
-    private static volatile int dictionaryMaxTerms = 65536;
     private static volatile int checkpointInterval = 256;
-    private static volatile long dictionaryCacheBytes = 64 * 1024 * 1024;
     private static volatile long uninvertMaxDiskBytes = 2L * 1024 * 1024 * 1024;
 
-    /** Updates the cardinality budget for dictionary-rank keyword ordinals. */
-    public static void setDictionaryMaxTerms(int maxTerms) {
-        dictionaryMaxTerms = maxTerms;
-    }
-
-    /** Updates the node-wide heap budget for cached term dictionaries. */
-    public static void setDictionaryCacheBytes(long bytes) {
-        dictionaryCacheBytes = bytes;
-    }
-
-    static int dictionaryMaxTerms() {
-        return dictionaryMaxTerms;
-    }
-
-    /** Updates the checkpoint interval used when building uninverted (.ord) keyword ordinals. */
+    /**
+     * Updates the checkpoint interval stamped into <em>newly built</em> uninverted (.ord) ordinals.
+     *
+     * <p>Safe to change at any time: each .ord file records the interval it was built with, and
+     * {@link UninvertedOrdinals} honours that recorded value for every lookup. Files already on
+     * disk — and readers already holding them open — are unaffected, so a change never has to be
+     * paired with wiping the ords directory.
+     */
     public static void setCheckpointInterval(int interval) {
         checkpointInterval = interval;
     }
@@ -96,10 +87,6 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     /** Checkpoint interval applied to newly built uninverted (.ord) ordinals. */
     static int checkpointInterval() {
         return checkpointInterval;
-    }
-
-    static long dictionaryCacheBytes() {
-        return dictionaryCacheBytes;
     }
 
     public static void setUninvertMaxDiskBytes(long bytes) {

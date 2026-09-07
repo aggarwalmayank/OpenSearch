@@ -8,13 +8,13 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.util.StringHelper;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -40,9 +40,7 @@ import java.util.stream.Stream;
  */
 public final class UninvertedOrdinalsCache {
 
-    private static final Logger LOGGER = LogManager.getLogger(
-        UninvertedOrdinalsCache.class
-    );
+    private static final Logger LOGGER = LogManager.getLogger(UninvertedOrdinalsCache.class);
     private static final double EVICTION_WATERMARK_FRACTION = 0.90d;
 
     /** Marks a (segment, field) whose ordinals failed coverage verification — do not retry. */

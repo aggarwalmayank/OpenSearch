@@ -67,30 +67,14 @@ public final class UninvertedOrdinals implements Closeable {
     // Trailer: blockIndexStart, checkpointStart, disiStart, disiLength (4 longs) + jumpTableEntryCount, footerMagic (2 ints).
     private static final int TRAILER_BYTES = 8 * 4 + 4 * 2;
 
-    private record OrdFileMetadata(
-        int maxDoc,
-        long termCount,
-        long assignedDocs, // == numPresent
-        int checkpointInterval,
-        int blockShift,
-        boolean dense
-    ) {}
+    private record OrdFileMetadata(int maxDoc, long termCount, long assignedDocs, // == numPresent
+        int checkpointInterval, int blockShift, boolean dense) {
+    }
 
-    private record LoadedOrdFile(
-        IndexInput input,
-        IndexInput payloadInput,
-        IndexInput disiInput, // null when dense
-        BytesRef[] checkpoints,
-        long sizeInBytes,
-        int blockShift,
-        int maxDoc,
-        boolean dense,
-        int numPresent,
-        int jumpTableEntryCount,
-        long[] blockRelOffset,
-        long[] blockBase,
-        byte[] blockBits
-    ) {}
+    private record LoadedOrdFile(IndexInput input, IndexInput payloadInput, IndexInput disiInput, // null when dense
+        BytesRef[] checkpoints, int checkpointInterval, long sizeInBytes, int blockShift, int maxDoc, boolean dense, int numPresent,
+        int jumpTableEntryCount, long[] blockRelOffset, long[] blockBase, byte[] blockBits) {
+    }
 
     private static final class InvalidOrdFileException extends IOException {
         private InvalidOrdFileException(String message) {
@@ -107,6 +91,12 @@ public final class UninvertedOrdinals implements Closeable {
     private final IndexInput payloadInput;
     private final IndexInput disiInput; // null when dense
     private final BytesRef[] checkpoints;
+    /**
+     * The checkpoint spacing this file was actually built with, read from its header. Every
+     * ord&harr;term lookup uses this, never the current cluster setting, so a dynamic setting
+     * change can never desynchronise a live reader from its on-disk checkpoints.
+     */
+    private final int checkpointInterval;
     private final Terms terms;
     private final int valueCount;
     private final long sizeInBytes;
@@ -130,6 +120,7 @@ public final class UninvertedOrdinals implements Closeable {
         IndexInput payloadInput,
         IndexInput disiInput,
         BytesRef[] checkpoints,
+        int checkpointInterval,
         Terms terms,
         int valueCount,
         long sizeInBytes,
@@ -148,6 +139,7 @@ public final class UninvertedOrdinals implements Closeable {
         this.payloadInput = payloadInput;
         this.disiInput = disiInput;
         this.checkpoints = checkpoints;
+        this.checkpointInterval = checkpointInterval;
         this.terms = terms;
         this.valueCount = valueCount;
         this.sizeInBytes = sizeInBytes;
@@ -163,7 +155,14 @@ public final class UninvertedOrdinals implements Closeable {
         this.blockBits = blockBits;
     }
 
-    private static int checkpointInterval() {
+    /**
+     * The interval to stamp into a <em>newly built</em> ord file (and to use when estimating its
+     * size). Never used on a read path: an already-built file carries its own interval in its
+     * header, and {@link #checkpointInterval} is what every lookup honours. Changing the setting
+     * therefore only affects files built afterwards; files already on disk (or already mapped by a
+     * live reader) stay self-consistent and keep serving correct results.
+     */
+    private static int configuredCheckpointInterval() {
         return ParquetDocValuesProducer.checkpointInterval();
     }
 
@@ -220,7 +219,7 @@ public final class UninvertedOrdinals implements Closeable {
             }
 
             if (exists == false) {
-                int interval = checkpointInterval();
+                int interval = configuredCheckpointInterval();
                 PackedInts.Mutable building = PackedInts.getMutable(maxDoc, buildBits, PackedInts.COMPACT);
                 List<BytesRef> checkpoints = new ArrayList<>((int) (termCount / interval) + 1);
                 TermsEnum termsEnum = terms.iterator();
@@ -260,6 +259,7 @@ public final class UninvertedOrdinals implements Closeable {
                 loaded.payloadInput(),
                 loaded.disiInput(),
                 loaded.checkpoints(),
+                loaded.checkpointInterval(),
                 terms,
                 (int) termCount,
                 loaded.sizeInBytes(),
@@ -281,7 +281,7 @@ public final class UninvertedOrdinals implements Closeable {
 
     static long estimatedDiskBytes(long termCount, int maxDoc) {
         long bits = DirectWriter.bitsRequired(termCount + 1);
-        int interval = checkpointInterval();
+        int interval = configuredCheckpointInterval();
         long checkpointCount = termCount == 0 ? 0 : (termCount + interval - 1) / interval;
         long checkpointEstimate = checkpointCount * 64L;
         return DirectWriter.bytesRequired(maxDoc, (int) bits) + 1024L + checkpointEstimate;
@@ -453,9 +453,11 @@ public final class UninvertedOrdinals implements Closeable {
             if (metadata.assignedDocs() != expectedNonNullDocs) {
                 throw new InvalidOrdFileException(coverageMismatchMessage(fileName, metadata.assignedDocs(), expectedNonNullDocs));
             }
-            if (metadata.checkpointInterval() != checkpointInterval()) {
-                throw new InvalidOrdFileException("ord file checkpoint interval mismatch");
-            }
+            // NOTE: deliberately no check against the *current* checkpoint-interval setting. The
+            // file's own interval (metadata.checkpointInterval()) is authoritative and is what the
+            // returned instance uses for every lookup, so a file built under a different setting
+            // stays perfectly valid. Rejecting it here would have forced a full re-uninvert of
+            // every segment on any setting change.
             if (metadata.blockShift() != BLOCK_SHIFT) {
                 throw new InvalidOrdFileException("ord file block layout mismatch");
             }
@@ -526,6 +528,7 @@ public final class UninvertedOrdinals implements Closeable {
                 payloadInput,
                 disiInput,
                 checkpoints,
+                interval,
                 directory.fileLength(fileName),
                 metadata.blockShift(),
                 expectedMaxDoc,
@@ -713,7 +716,7 @@ public final class UninvertedOrdinals implements Closeable {
 
         @Override
         public void seekExact(long ord) throws IOException {
-            int interval = checkpointInterval();
+            int interval = checkpointInterval;
             int checkpoint = (int) (ord / interval);
             in.seekCeil(checkpoints[checkpoint]);
             position = (long) checkpoint * interval;
@@ -746,7 +749,7 @@ public final class UninvertedOrdinals implements Closeable {
     /** Resolves an ordinal to its term: checkpoint seek plus a bounded enum advance. */
     public BytesRef term(int ord) {
         try {
-            int interval = checkpointInterval();
+            int interval = checkpointInterval;
             TermsEnum termsEnum = terms.iterator();
             int checkpoint = ord / interval;
             termsEnum.seekCeil(checkpoints[checkpoint]);
@@ -777,7 +780,7 @@ public final class UninvertedOrdinals implements Closeable {
 
         public BytesRef term(int ord) {
             try {
-                int interval = checkpointInterval();
+                int interval = checkpointInterval;
                 long delta = cursorEnum == null ? Long.MAX_VALUE : ord - cursorOrd;
                 if (delta < 0 || delta > interval) {
                     cursorEnum = terms.iterator();
@@ -799,7 +802,7 @@ public final class UninvertedOrdinals implements Closeable {
     /** The ordinal of {@code key}, or {@code -insertionPoint - 1} (the lookupTerm contract). */
     public int rank(BytesRef key) {
         try {
-            int interval = checkpointInterval();
+            int interval = checkpointInterval;
             if (checkpoints.length == 0) {
                 return -1;
             }
