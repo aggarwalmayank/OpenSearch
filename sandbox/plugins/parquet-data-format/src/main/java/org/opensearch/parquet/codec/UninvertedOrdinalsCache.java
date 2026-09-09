@@ -42,6 +42,8 @@ public final class UninvertedOrdinalsCache {
 
     private static final Logger LOGGER = LogManager.getLogger(UninvertedOrdinalsCache.class);
     private static final double EVICTION_WATERMARK_FRACTION = 0.90d;
+    /** Budget floor: a non-zero percent always admits at least this much (see enforceDiskBudget). */
+    static final long MIN_BUDGET_BYTES = 64L * 1024 * 1024;
 
     /** Marks a (segment, field) whose ordinals failed coverage verification — do not retry. */
     private static final Map<Object, Set<String>> INELIGIBLE = new ConcurrentHashMap<>();
@@ -283,7 +285,15 @@ public final class UninvertedOrdinalsCache {
         if (storeBytes < 0) {
             return; // fallback dir or unreadable store: no meaningful base, do not refuse
         }
-        long budget = (long) (storeBytes * ParquetDocValuesProducer.uninvertMaxDiskPercent() / 100.0d);
+        double percent = ParquetDocValuesProducer.uninvertMaxDiskPercent();
+        long budget = (long) (storeBytes * percent / 100.0d);
+        if (percent > 0) {
+            // A percentage of a small shard can be less than one .ord file's fixed overhead
+            // (~1 KiB header/trailer/checkpoints), which would refuse every build on small
+            // indices. Floor the budget so any non-zero percent admits at least a few files;
+            // percent == 0 remains an explicit "no ordinals" switch.
+            budget = Math.max(budget, MIN_BUDGET_BYTES);
+        }
         long estimate = UninvertedOrdinals.estimatedDiskBytes(Math.max(terms.size(), 0), maxDoc);
         long used = 0;
         long target = evictionTargetBytes(budget);

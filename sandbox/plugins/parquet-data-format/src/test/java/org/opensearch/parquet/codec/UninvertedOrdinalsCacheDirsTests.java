@@ -141,6 +141,22 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * Regression: on a tiny shard, a percentage of the store is smaller than one .ord file's
+     * fixed overhead (~1 KiB), which used to refuse every build on small test indices. Any
+     * non-zero percent must admit the build via the budget floor.
+     */
+    public void testSmallShardBuildsUnderDefaultPercentBudget() throws Exception {
+        double before = ParquetDocValuesProducer.uninvertMaxDiskPercent();
+        try {
+            ParquetDocValuesProducer.setUninvertMaxDiskPercent(10.0);
+            Path smallShard = createTempDir();
+            assertNotNull("a tiny shard must not be refused by the percent budget", acquireOnFreshShard(smallShard));
+        } finally {
+            ParquetDocValuesProducer.setUninvertMaxDiskPercent(before);
+        }
+    }
+
     /** Indexes three docs with postings for {@code city} into {@code <shard>/index} and acquires ordinals. */
     private static UninvertedOrdinalsCache.Lease acquireOnFreshShard(Path shardDir) throws Exception {
         Path storeDir = shardDir.resolve("index");
