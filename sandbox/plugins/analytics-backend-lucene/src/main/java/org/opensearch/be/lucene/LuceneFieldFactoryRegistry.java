@@ -10,18 +10,21 @@ package org.opensearch.be.lucene;
 
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.InetAddressPoint;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.mapper.IdFieldMapper;
+import org.opensearch.index.mapper.IpFieldMapper;
 import org.opensearch.index.mapper.KeywordFieldMapper;
 import org.opensearch.index.mapper.MatchOnlyTextFieldMapper;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.mapper.TextFieldMapper;
 
+import java.net.InetAddress;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -49,6 +52,24 @@ public final class LuceneFieldFactoryRegistry {
         ID_FIELD_TYPE.freeze();
     }
 
+    /**
+     * Terms-only postings for ip values, indexed as the same 16-byte {@code InetAddressPoint}
+     * encoding the Parquet column stores. Written even though the mapping reports
+     * {@code index: false} (ip cannot be point-indexed on pluggable indices): these terms exist
+     * solely as the source for uninverted segment ordinals, so ip aggregations can run on
+     * global ordinals instead of falling back to map execution.
+     */
+    private static final FieldType IP_FIELD_TYPE = new FieldType();
+
+    static {
+        IP_FIELD_TYPE.setTokenized(false);
+        IP_FIELD_TYPE.setIndexOptions(IndexOptions.DOCS);
+        IP_FIELD_TYPE.setOmitNorms(true);
+        IP_FIELD_TYPE.setStored(false);
+        IP_FIELD_TYPE.setDocValuesType(DocValuesType.NONE);
+        IP_FIELD_TYPE.freeze();
+    }
+
     // ── Default factories ──
     private static final LuceneFieldFactory TEXT_FACTORY = (doc, ft, value, lft) -> {
         doc.add(new Field(ft.name(), value.toString(), lft));
@@ -66,6 +87,10 @@ public final class LuceneFieldFactoryRegistry {
         doc.add(new Field(ft.name(), new BytesRef((byte[]) value), ID_FIELD_TYPE));
     };
 
+    private static final LuceneFieldFactory IP_FACTORY = (doc, ft, value, lft) -> {
+        doc.add(new Field(ft.name(), new BytesRef(InetAddressPoint.encode((InetAddress) value)), IP_FIELD_TYPE));
+    };
+
     private static final LuceneFieldFactory SEQ_NO_FIELD_FACTORY = (doc, ft, value, lft) -> {
         // do nothing for now since we don't want to index seq no indexing without soft deletes enabled.
     };
@@ -81,6 +106,7 @@ public final class LuceneFieldFactoryRegistry {
         register(TextFieldMapper.CONTENT_TYPE, TEXT_FACTORY);
         register(KeywordFieldMapper.CONTENT_TYPE, KEYWORD_FACTORY);
         register(MatchOnlyTextFieldMapper.CONTENT_TYPE, MATCH_ONLY_TEXT_FACTORY);
+        register(IpFieldMapper.CONTENT_TYPE, IP_FACTORY);
         registerMetaFields();
     }
 

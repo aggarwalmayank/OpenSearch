@@ -62,6 +62,30 @@ public class LuceneDocumentInputTests extends LucenePluginBaseTests {
         assertNotEquals("text: should be indexed", IndexOptions.NONE, ft.indexOptions());
     }
 
+    public void testIpFieldWritesEncodedBinaryTerm() throws Exception {
+        MappedFieldType ipField = mockIpField("client_ip");
+
+        LuceneDocumentInput input = new LuceneDocumentInput();
+        java.net.InetAddress address = java.net.InetAddress.getByName("10.1.2.3");
+        input.addField(ipField, address);
+
+        Document doc = input.getFinalInput();
+        IndexableField field = doc.getField("client_ip");
+        assertNotNull("ip field should be present in document", field);
+        assertEquals(
+            "ip term must be the same 16-byte encoded form the Parquet column stores",
+            new org.apache.lucene.util.BytesRef(org.apache.lucene.document.InetAddressPoint.encode(address)),
+            field.binaryValue()
+        );
+
+        IndexableFieldType ft = field.fieldType();
+        assertEquals("ip: terms-only postings", IndexOptions.DOCS, ft.indexOptions());
+        assertFalse("ip: should not be stored", ft.stored());
+        assertTrue("ip: should omit norms", ft.omitNorms());
+        assertEquals("ip: should have no doc values", DocValuesType.NONE, ft.docValuesType());
+        assertFalse("ip: should not be tokenized", ft.tokenized());
+    }
+
     public void testKeywordFieldProperties() {
         MappedFieldType keywordField = mockKeywordField("status");
 
