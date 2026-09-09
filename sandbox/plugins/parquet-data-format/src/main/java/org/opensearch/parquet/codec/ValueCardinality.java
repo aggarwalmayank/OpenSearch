@@ -23,31 +23,29 @@ import org.opensearch.index.mapper.MappedFieldType;
  * {@link #of(MappedFieldType)} plus the already-written {@code MULTI_VALUED} arms at each call
  * site — not an audit of the whole codec.
  *
- * <h2>Current state: single-valued only</h2>
- * {@link #of(MappedFieldType)} returns {@link #SINGLE_VALUED} unconditionally. This is not an
- * approximation the read path papers over — it is enforced end to end:
- * <ol>
- *   <li><b>Write path.</b> {@code ParquetDocumentInput} rejects a second value for the same field
- *       with {@code "Cannot accept multiple values for field: [x] of type: [y]"}, so no segment
- *       reachable by this reader contains a repeated column for a user field.</li>
- *   <li><b>Ordinals.</b> {@link UninvertedOrdinals} stores exactly one ordinal slot per document
- *       and verifies coverage as {@code sum(docFreq) == nonNullRowCount}. A multi-valued field
- *       would both overwrite slots and fail that check — it refuses rather than undercounts.</li>
- * </ol>
- * The multi-valued machinery on the decode side already exists and is deliberately retained:
- * {@link org.opensearch.parquet.codec.iter.ParquetSortedSetDocValues} in repeated mode,
- * {@link org.opensearch.parquet.codec.iter.ParquetSortedNumericDocValues}, and
- * {@code DataFusionColumnReader}'s repeated batch loaders. See {@code MULTI_VALUE_TODO} below for
- * the ordered checklist.
+ * <h2>Current state: mapping-level detection, streaming multi-value</h2>
+ * {@link #of(MappedFieldType)} reads the keyword {@code multi_value} mapping state (adaptive
+ * keyword promotion, upstream #22883). {@code MULTI_VALUED} fields are served through the
+ * retained repeated decoders — {@link org.opensearch.parquet.codec.iter.ParquetSortedSetDocValues}
+ * in repeated mode, {@link org.opensearch.parquet.codec.iter.ParquetSortedNumericDocValues}, and
+ * {@code DataFusionColumnReader}'s repeated batch loaders — with <em>no uninverted ordinals</em>:
+ * {@link UninvertedOrdinals} stores one slot per document, so multi-valued fields are excluded
+ * from the ordinals tier and aggregations on them run in {@code map} execution (the terms
+ * aggregator falls back automatically when segment-global ordinals are unavailable). Two
+ * backstops make a LIST column on the single-valued path impossible to serve silently wrong:
+ * this gate, and the ordinals coverage check ({@code sum(docFreq) == nonNullRowCount}), which a
+ * multi-valued segment always fails.
  *
- * <h2>MULTI_VALUE_TODO — what enabling multi-value requires</h2>
+ * <h2>MULTI_VALUE_TODO — remaining for full multi-value ordinal support</h2>
  * <ol>
- *   <li>Write path: emit {@code REPEATED} Parquet columns and drop the single-value rejection.</li>
- *   <li>Mapping: expose per-field cardinality (mapping-declared, or the column's Parquet
- *       repetition level) and return {@link #MULTI_VALUED} from {@link #of(MappedFieldType)}.</li>
+ *   <li>Per-segment cardinality: expose the segment's physical column shape (scalar vs LIST)
+ *       through the bridge so promoted fields' pre-promotion scalar segments keep the
+ *       single-valued path (today the mapping-level answer routes them through the repeated arm;
+ *       mixed-generation search is unsupported upstream too).</li>
  *   <li>Ordinals: give {@link UninvertedOrdinals} a per-document ordinal <em>list</em> (offsets
  *       array + flat ord array, as Lucene's own {@code SortedSetDocValues} writer does) and
- *       change the coverage check to compare against total values, not documents.</li>
+ *       change the coverage check to compare against total values, not documents — this upgrades
+ *       multi-valued aggregations from {@code map} execution to real ordinals.</li>
  *   <li>Nothing else: the call sites in {@link ParquetDocValuesLeafReader} and
  *       {@link ParquetDocValuesProducer} already branch on this enum.</li>
  * </ol>
@@ -63,17 +61,31 @@ public enum ValueCardinality {
     MULTI_VALUED;
 
     /**
-     * The cardinality of {@code fieldType}'s Parquet column.
+     * The cardinality of {@code fieldType}'s Parquet column, from the keyword {@code multi_value}
+     * mapping state (adaptive keyword promotion, upstream #22883):
      *
-     * <p>Always {@link #SINGLE_VALUED} today — see the class javadoc for why that is safe and what
-     * changing it entails. This is the only method to change when multi-value support lands.
+     * <ul>
+     *   <li>{@code SCALAR} ({@code "multi_value": false}) — locked: ingest rejects arrays, every
+     *       segment is provably scalar → {@link #SINGLE_VALUED}.</li>
+     *   <li>{@code AUTO} (parameter omitted) — the field has <em>never promoted</em>: promotion
+     *       publishes a one-way mapping update to {@code LIST}, so a field still in {@code AUTO}
+     *       has only scalar segments → {@link #SINGLE_VALUED}.</li>
+     *   <li>{@code LIST} — arrays are (or became) allowed → {@link #MULTI_VALUED}: serve through
+     *       the repeated decoders and never build single-slot ordinals.</li>
+     * </ul>
+     *
+     * <p><b>Known coarseness on promoted fields:</b> a field that promoted {@code AUTO → LIST}
+     * mid-life still has scalar columns in its pre-promotion segments, which this mapping-level
+     * answer routes through the repeated arm. Refining that requires a per-segment check of the
+     * Parquet footer's column shape, which the Java side has no bridge API for yet; note that
+     * search over such mixed scalar/LIST generations is explicitly unsupported by upstream #22883
+     * as well. The safety property this method does guarantee: a LIST column is never served
+     * through the single-valued path, so silently wrong scalar reads and corrupt single-slot
+     * ordinals are impossible.
      */
     public static ValueCardinality of(MappedFieldType fieldType) {
-        // MULTI_VALUE_TODO(step 2): return MULTI_VALUED for fields whose Parquet column is
-        // REPEATED. Until the write path can produce one, claiming MULTI_VALUED would only route
-        // reads through the repeated decoders for columns that are not repeated.
         assert fieldType != null : "cardinality requested for a null field type";
-        return SINGLE_VALUED;
+        return fieldType.multiValueState() == MappedFieldType.MultiValueState.LIST ? MULTI_VALUED : SINGLE_VALUED;
     }
 
     /** True when this field stores at most one value per document. */

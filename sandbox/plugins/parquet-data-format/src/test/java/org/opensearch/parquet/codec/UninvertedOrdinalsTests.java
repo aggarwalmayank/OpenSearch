@@ -13,11 +13,13 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FilterLeafReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LogDocMergePolicy;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -28,12 +30,20 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
+    /**
+     * Doc→ord assertions in these tests require document order to survive {@code forceMerge};
+     * randomized merge policies may shuffle docs, so the writer is deliberately deterministic.
+     */
+    private static IndexWriterConfig newDeterministicConfig() {
+        return new IndexWriterConfig().setMergePolicy(new LogDocMergePolicy());
+    }
+
     public void testReloadUsesPersistedCheckpointsWithoutCheckpointRebuild() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "reload";
         final int checkpointInterval = ParquetDocValuesProducer.checkpointInterval();
 
-        try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             final int termCount = checkpointInterval + 128;
             for (int i = 0; i < termCount; i++) {
                 Document doc = new Document();
@@ -42,7 +52,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
             }
             writer.forceMerge(1);
 
-            try (DirectoryReader reader = writer.getReader()) {
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
                 LeafReader leaf = reader.leaves().get(0).reader();
                 Terms baseTerms = leaf.terms("f");
                 assertNotNull(baseTerms);
@@ -90,7 +100,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         final int buildInterval = ParquetDocValuesProducer.checkpointInterval();
         final int termCount = buildInterval + 64;
 
-        try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             for (int i = 0; i < termCount; i++) {
                 Document doc = new Document();
                 doc.add(new StringField("f", termValue(i), Field.Store.NO));
@@ -98,7 +108,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
             }
             writer.forceMerge(1);
 
-            try (DirectoryReader reader = writer.getReader()) {
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
                 LeafReader leaf = reader.leaves().get(0).reader();
                 Terms terms = leaf.terms("f");
                 assertNotNull(terms);
@@ -142,13 +152,13 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         String fileKey = "assigned-docs";
         Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
 
-        try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
             addDoc(writer, "beta");
             addDoc(writer, "gamma");
             writer.forceMerge(1);
 
-            try (DirectoryReader reader = writer.getReader()) {
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
                 LeafReader leaf = reader.leaves().get(0).reader();
                 Terms baseTerms = leaf.terms("f");
                 assertNotNull(baseTerms);
@@ -180,13 +190,13 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         String fileKey = "coverage-mismatch";
         Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
 
-        try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
             addDoc(writer, "beta");
             writer.addDocument(new Document());
             writer.forceMerge(1);
 
-            try (DirectoryReader reader = writer.getReader()) {
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
                 LeafReader leaf = reader.leaves().get(0).reader();
                 Terms terms = leaf.terms("f");
                 assertNotNull(terms);
@@ -211,7 +221,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         };
     }
 
-    private static void addDoc(RandomIndexWriter writer, String value) throws Exception {
+    private static void addDoc(IndexWriter writer, String value) throws Exception {
         Document doc = new Document();
         doc.add(new StringField("f", value, Field.Store.NO));
         writer.addDocument(doc);

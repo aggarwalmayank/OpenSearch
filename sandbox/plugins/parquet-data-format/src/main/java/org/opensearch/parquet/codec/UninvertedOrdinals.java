@@ -37,22 +37,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Segment-global ordinals for a keyword field, uninverted once from the Lucene sidecar's postings
- * and spilled to a memory-mapped node-local file — read-side only.
+ * into a memory-mapped node-local file (v3).
  *
- * <h2>On-disk format (v3 = Phase 1 + Phase 2)</h2>
- * <ul>
- *   <li><b>Phase 1 — per-block base + bit-width.</b> The ordinal sequence is split into fixed
- *       {@value #BLOCK_SIZE}-entry blocks; each block stores {@code (value - base)} bit-packed at
- *       its own minimal width, or is a <b>constant</b> block ({@code bits == 0}, base only, no
- *       payload) when all its values are equal. Decode-free on read.</li>
- *   <li><b>Phase 2 — presence via IndexedDISI.</b> A <b>dense</b> field ({@code numPresent ==
- *       maxDoc}) indexes the sequence by doc id directly. A <b>sparse</b> field writes an
- *       {@link IndexedDISI} presence bitmap and blocks the present docs only, so missing docs cost
- *       ~1 bit rather than a full slot.</li>
- * </ul>
- * Layout: {@code [header][DISI (sparse only)][block data][block index][checkpoints][trailer]}.
- * Stored values are {@code ord + 1} (so 0 would mean missing, though the dense path has none);
- * the read side returns {@code value - 1}.
+ * <p>Layout: {@code [header][DISI (sparse only)][block data][block index][checkpoints][trailer]}.
+ * Ordinals are stored as {@code ord + 1} in fixed {@value #BLOCK_SIZE}-entry blocks, each
+ * bit-packed against its own base (constant blocks carry no payload). Sparse fields index only
+ * present docs, with an {@link IndexedDISI} presence bitmap.
  */
 public final class UninvertedOrdinals implements Closeable {
 
@@ -91,11 +81,7 @@ public final class UninvertedOrdinals implements Closeable {
     private final IndexInput payloadInput;
     private final IndexInput disiInput; // null when dense
     private final BytesRef[] checkpoints;
-    /**
-     * The checkpoint spacing this file was actually built with, read from its header. Every
-     * ord&harr;term lookup uses this, never the current cluster setting, so a dynamic setting
-     * change can never desynchronise a live reader from its on-disk checkpoints.
-     */
+    /** Checkpoint spacing from this file's own header — never the live cluster setting. */
     private final int checkpointInterval;
     private final Terms terms;
     private final int valueCount;
@@ -156,11 +142,8 @@ public final class UninvertedOrdinals implements Closeable {
     }
 
     /**
-     * The interval to stamp into a <em>newly built</em> ord file (and to use when estimating its
-     * size). Never used on a read path: an already-built file carries its own interval in its
-     * header, and {@link #checkpointInterval} is what every lookup honours. Changing the setting
-     * therefore only affects files built afterwards; files already on disk (or already mapped by a
-     * live reader) stay self-consistent and keep serving correct results.
+     * Interval stamped into newly built files (and used for size estimates). Read paths always
+     * honour the file's own header instead, so setting changes never invalidate existing files.
      */
     private static int configuredCheckpointInterval() {
         return ParquetDocValuesProducer.checkpointInterval();
@@ -453,11 +436,8 @@ public final class UninvertedOrdinals implements Closeable {
             if (metadata.assignedDocs() != expectedNonNullDocs) {
                 throw new InvalidOrdFileException(coverageMismatchMessage(fileName, metadata.assignedDocs(), expectedNonNullDocs));
             }
-            // NOTE: deliberately no check against the *current* checkpoint-interval setting. The
-            // file's own interval (metadata.checkpointInterval()) is authoritative and is what the
-            // returned instance uses for every lookup, so a file built under a different setting
-            // stays perfectly valid. Rejecting it here would have forced a full re-uninvert of
-            // every segment on any setting change.
+            // The file's own interval is authoritative; checking it against the live setting
+            // would force a re-uninvert of every segment on any setting change.
             if (metadata.blockShift() != BLOCK_SHIFT) {
                 throw new InvalidOrdFileException("ord file block layout mismatch");
             }
@@ -682,10 +662,8 @@ public final class UninvertedOrdinals implements Closeable {
     }
 
     /**
-     * The field's real terms enumeration — the exact sorted term space these ordinals rank —
-     * wrapped with ordinal tracking, because consumers like {@code OrdinalMap} require
-     * {@link TermsEnum#ord()} which BlockTree does not implement. Ord seeks use the sparse
-     * checkpoints; byte seeks re-derive the position via {@link #rank}.
+     * The field's terms enum wrapped with ordinal tracking: consumers like {@code OrdinalMap}
+     * need {@link TermsEnum#ord()}, which BlockTree does not implement.
      */
     public TermsEnum termsEnum() throws IOException {
         return new OrdTrackingTermsEnum(terms.iterator());
@@ -768,11 +746,8 @@ public final class UninvertedOrdinals implements Closeable {
     }
 
     /**
-     * Stateful ord→term resolution for one consumer (not thread-safe, like doc-values
-     * iterators). A stateless resolver pays a checkpoint seek plus up to a checkpoint interval of
-     * enum steps on every call; this cursor advances forward from
-     * its last position when the requested ordinal is ahead, so monotonic access amortizes to a
-     * single sequential pass over the terms file.
+     * Stateful ord→term resolver for one consumer (not thread-safe): keeps its enum position so
+     * ascending ordinal walks amortize to a single sequential pass.
      */
     public final class TermCursor {
         private TermsEnum cursorEnum;

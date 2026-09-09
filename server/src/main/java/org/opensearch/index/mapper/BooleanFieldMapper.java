@@ -127,7 +127,6 @@ public class BooleanFieldMapper extends ParametrizedFieldMapper {
         private final Parameter<Float> boost = Parameter.boostParam();
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
-
         public Builder(String name) {
             this(name, Settings.EMPTY);
         }

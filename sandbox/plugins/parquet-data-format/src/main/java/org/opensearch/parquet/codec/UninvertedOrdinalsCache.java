@@ -17,9 +17,12 @@ import org.apache.lucene.index.Terms;
 import org.apache.lucene.util.StringHelper;
 
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -31,12 +34,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 /**
- * Node-level cache of {@link UninvertedOrdinals}, keyed by (segment core key, field).
- *
- * <p>Builds are serialized node-wide (one postings sweep at a time — the transient packed buffer
- * and the sweep's CPU never stack). Entries are evicted (and their mapped files closed) by the
- * segment core's closed-listener; the on-disk artifact is keyed by the segment's stable id and
- * survives restarts, so a re-opened segment maps the existing file instead of rebuilding.
+ * Node-level cache of {@link UninvertedOrdinals}, keyed by (segment core key, field). Builds are
+ * serialized node-wide; entries close with their segment core; the on-disk file is keyed by the
+ * segment's stable id and survives restarts, so a re-opened segment maps it instead of rebuilding.
  */
 public final class UninvertedOrdinalsCache {
 
@@ -48,9 +48,12 @@ public final class UninvertedOrdinalsCache {
     private static final Map<Object, Map<String, CacheEntry>> CACHE = new ConcurrentHashMap<>();
     private static final Object BUILD_LOCK = new Object();
 
-    /** Default under java.io.tmpdir (unit tests); the plugin points this at the node data path. */
-    private static volatile Path ORDS_DIR = Path.of(System.getProperty("java.io.tmpdir"), "opensearch-parquet-ords");
+    /** Directories already created and swept of stale .tmp files this process lifetime. */
+    private static final Set<Path> PREPARED_DIRS = ConcurrentHashMap.newKeySet();
     private static volatile boolean shuttingDown = false;
+
+    /** Name of the per-shard ord-file directory, a sibling of the shard's store directory. */
+    static final String ORDS_DIR_NAME = "parquet-ords";
 
     private UninvertedOrdinalsCache() {}
 
@@ -148,11 +151,13 @@ public final class UninvertedOrdinalsCache {
         }
     }
 
-    /** Called once at plugin init: ord files live with the node's data, not in tmp. */
-    public static void setOrdsDir(Path dir) {
-        ORDS_DIR = dir;
+    /**
+     * Called once at plugin init: wipes the pre-move node-global directory (its files are
+     * unreachable derived data; they rebuild on demand at the per-shard location).
+     */
+    public static void setOrdsDir(Path legacyDir) {
         shuttingDown = false;
-        cleanupAtStartup(dir);
+        wipeLegacyDir(legacyDir);
     }
 
     /** Called at plugin close: aborts in-flight builds so node shutdown is not held hostage. */
@@ -161,17 +166,49 @@ public final class UninvertedOrdinalsCache {
     }
 
     /**
-     * Builds ordinals, retrying ONCE after deleting the on-disk file when verification fails on
-     * a pre-existing file: a file left by a crashed or killed process may be stale for reasons a
-     * rebuild fixes (segment data moved on after an unclean stop). Only a failure on a FRESH
-     * build is genuine (unindexed stored values) and latches the field ineligible.
+     * The segment's ord-file directory: {@code parquet-ords} beside the shard's store (like the
+     * translog — never inside the store, whose unknown files recovery deletes). {@code null} when
+     * the directory is not filesystem-backed: no shard folder to place or budget files in.
      */
-    private static UninvertedOrdinals buildWithRetry(String fileKey, Terms terms, int maxDoc, long expectedNonNullDocs) throws IOException {
+    static Path resolveOrdsDir(org.apache.lucene.store.Directory directory) {
+        org.apache.lucene.store.Directory unwrapped = org.apache.lucene.store.FilterDirectory.unwrap(directory);
+        if (unwrapped instanceof org.apache.lucene.store.FSDirectory) {
+            Path storeDir = ((org.apache.lucene.store.FSDirectory) unwrapped).getDirectory();
+            Path shardDir = storeDir.getParent();
+            if (shardDir != null) {
+                return shardDir.resolve(ORDS_DIR_NAME);
+            }
+        }
+        return null;
+    }
+
+    /** Creates the directory and sweeps stale {@code .tmp} files, once per process lifetime. */
+    private static void prepareDir(Path ordsDir) throws IOException {
+        if (PREPARED_DIRS.add(ordsDir) == false) {
+            return;
+        }
+        Files.createDirectories(ordsDir);
+        try (Stream<Path> listing = Files.list(ordsDir)) {
+            for (Path file : (Iterable<Path>) listing::iterator) {
+                if (file.getFileName().toString().endsWith(".tmp")) {
+                    Files.deleteIfExists(file);
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds ordinals, retrying once (after deleting the file) when verification fails on a
+     * PRE-EXISTING file — it may be stale from a crashed process. A failure on a fresh build is
+     * genuine (unindexed stored values) and latches the field ineligible.
+     */
+    private static UninvertedOrdinals buildWithRetry(Path ordsDir, String fileKey, Terms terms, int maxDoc, long expectedNonNullDocs)
+        throws IOException {
         String fileName = "parquet-ords-" + fileKey + ".ord";
-        boolean preExisting = Files.exists(ORDS_DIR.resolve(fileName));
+        boolean preExisting = Files.exists(ordsDir.resolve(fileName));
         try {
             return UninvertedOrdinals.build(
-                ORDS_DIR,
+                ordsDir,
                 fileKey,
                 terms,
                 maxDoc,
@@ -183,9 +220,9 @@ public final class UninvertedOrdinalsCache {
                 throw e;
             }
             LOGGER.warn("ord file [{}] failed verification ({}); deleting and rebuilding once", fileName, e.getMessage());
-            Files.deleteIfExists(ORDS_DIR.resolve(fileName));
+            Files.deleteIfExists(ordsDir.resolve(fileName));
             return UninvertedOrdinals.build(
-                ORDS_DIR,
+                ordsDir,
                 fileKey,
                 terms,
                 maxDoc,
@@ -207,42 +244,21 @@ public final class UninvertedOrdinalsCache {
         }
     }
 
-    private static void cleanupAtStartup(Path dir) {
-        long budget = ParquetDocValuesProducer.uninvertMaxDiskBytes();
-        long target = evictionTargetBytes(budget);
-        long used = 0;
-        List<Path> files = new ArrayList<>();
+    /** Removes ord and tmp files from the pre-move node-global directory; nothing reads them now. */
+    private static void wipeLegacyDir(Path dir) {
         try (Stream<Path> listing = Files.list(dir)) {
             for (Path file : (Iterable<Path>) listing::iterator) {
-                if (file.getFileName().toString().endsWith(".tmp")) {
-                    Files.deleteIfExists(file);
-                } else {
-                    used += Files.size(file);
-                    files.add(file);
+                String name = file.getFileName().toString();
+                if (name.endsWith(".ord") || name.endsWith(".tmp")) {
+                    if (Files.deleteIfExists(file)) {
+                        LOGGER.info("removed legacy ord file [{}] (ord files now live beside each shard's store)", name);
+                    }
                 }
             }
         } catch (NoSuchFileException e) {
-            return;
+            // nothing to migrate
         } catch (IOException e) {
-            LOGGER.warn("ords directory startup cleanup failed for [{}]: {}", dir, e.getMessage());
-            return;
-        }
-        if (used <= budget) {
-            return;
-        }
-        files.sort(Comparator.comparingLong(UninvertedOrdinalsCache::fileLastUsedMillis));
-        for (Path victim : files) {
-            if (used <= target) {
-                break;
-            }
-            try {
-                long size = Files.size(victim);
-                Files.deleteIfExists(victim);
-                used -= size;
-                LOGGER.info("reclaimed ord file [{}] at startup (over budget)", victim.getFileName());
-            } catch (IOException e) {
-                // skip
-            }
+            LOGGER.warn("legacy ords directory cleanup failed for [{}]: {}", dir, e.getMessage());
         }
     }
 
@@ -254,17 +270,20 @@ public final class UninvertedOrdinalsCache {
     }
 
     /**
-     * Keeps the ords directory within {@code parquet.docvalues.uninvert.max_disk_bytes}. Active
-     * files are those with {@code inUse > 0}. When eviction starts, reclaim least-recently-used
-     * evictable files until projected usage reaches the watermark target; if that cannot bring
-     * usage under the hard limit, the build is refused.
+     * Keeps a shard's ords directory within {@code max_disk_percent} of that shard's store size.
+     * Over budget: evict least-recently-used unpinned files down to the watermark; if it still
+     * does not fit, refuse the build (transient). No-op when the store size is unknowable.
      */
-    private static void enforceDiskBudget(String fileKey, Terms terms, int maxDoc) throws IOException {
+    private static void enforceDiskBudget(Path ordsDir, String fileKey, Terms terms, int maxDoc) throws IOException {
         String fileName = "parquet-ords-" + fileKey + ".ord";
-        if (Files.exists(ORDS_DIR.resolve(fileName))) {
+        if (Files.exists(ordsDir.resolve(fileName))) {
             return;
         }
-        long budget = ParquetDocValuesProducer.uninvertMaxDiskBytes();
+        long storeBytes = shardStoreBytes(ordsDir);
+        if (storeBytes < 0) {
+            return; // fallback dir or unreadable store: no meaningful base, do not refuse
+        }
+        long budget = (long) (storeBytes * ParquetDocValuesProducer.uninvertMaxDiskPercent() / 100.0d);
         long estimate = UninvertedOrdinals.estimatedDiskBytes(Math.max(terms.size(), 0), maxDoc);
         long used = 0;
         long target = evictionTargetBytes(budget);
@@ -278,7 +297,7 @@ public final class UninvertedOrdinalsCache {
         }
 
         List<EvictionCandidate> candidates = new ArrayList<>();
-        try (Stream<Path> listing = Files.list(ORDS_DIR)) {
+        try (Stream<Path> listing = Files.list(ordsDir)) {
             for (Path file : (Iterable<Path>) listing::iterator) {
                 long size = Files.size(file);
                 used += size;
@@ -323,15 +342,59 @@ public final class UninvertedOrdinalsCache {
 
         if (used + estimate > budget) {
             throw new BudgetExceededException(
-                "uninverted ordinals disk budget exceeded: "
+                "uninverted ordinals disk budget exceeded for shard: "
                     + used
                     + "B used + "
                     + estimate
                     + "B needed > "
                     + budget
-                    + "B (parquet.docvalues.uninvert.max_disk_bytes)"
+                    + "B ("
+                    + ParquetDocValuesProducer.uninvertMaxDiskPercent()
+                    + "% of "
+                    + storeBytes
+                    + "B shard store; parquet.docvalues.uninvert.max_disk_percent)"
             );
         }
+    }
+
+    /**
+     * Shard store bytes: everything under the ords dir's parent except the ords dir and the
+     * translog. Returns {@code -1} when unknowable (no parent, or walk failure) — callers treat
+     * that as "budget not enforceable".
+     */
+    // package-private for tests
+    static long shardStoreBytes(Path ordsDir) {
+        Path shardDir = ordsDir.getParent();
+        if (shardDir == null || Files.isDirectory(shardDir) == false) {
+            return -1;
+        }
+        long[] total = { 0 };
+        try {
+            Files.walkFileTree(shardDir, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (dir.equals(ordsDir) || dir.getFileName().toString().equals("translog")) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    total[0] += attrs.size();
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE; // file vanished mid-walk (merge, delete): skip
+                }
+            });
+        } catch (IOException e) {
+            LOGGER.debug("failed sizing shard store beside [{}]: {}", ordsDir, e.getMessage());
+            return -1;
+        }
+        return total[0];
     }
 
     /**
@@ -351,9 +414,7 @@ public final class UninvertedOrdinalsCache {
         }
         Map<String, CacheEntry> perSegment = CACHE.computeIfAbsent(key, k -> {
             helper.addClosedListener(closedKey -> {
-                // Core close happens only after Lucene has retired the segment reader, so there
-                // should be no live leases here; unlike budget eviction we rely on that lifecycle
-                // guarantee rather than checking inUse before closing entries.
+                // Core close happens after Lucene retires the reader, so no live leases remain.
                 INELIGIBLE.remove(closedKey);
                 Map<String, CacheEntry> removed = CACHE.remove(closedKey);
                 if (removed != null) {
@@ -391,8 +452,21 @@ public final class UninvertedOrdinalsCache {
                 }
                 String fileKey = StringHelper.idToString(segmentInfo.getId()) + "-" + field;
                 try {
-                    enforceDiskBudget(fileKey, terms, leaf.maxDoc());
-                    UninvertedOrdinals built = buildWithRetry(fileKey, terms, leaf.maxDoc(), expectedNonNullDocs);
+                    Path ordsDir = resolveOrdsDir(segmentInfo.dir);
+                    if (ordsDir == null) {
+                        // No filesystem shard folder: permanent for this segment, latch like a
+                        // coverage failure; the field is served by the streaming path.
+                        LOGGER.warn(
+                            "refusing uninverted ordinals for field [{}]: segment directory [{}] is not filesystem-backed",
+                            field,
+                            segmentInfo.dir.getClass().getName()
+                        );
+                        INELIGIBLE.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(field);
+                        return null;
+                    }
+                    prepareDir(ordsDir);
+                    enforceDiskBudget(ordsDir, fileKey, terms, leaf.maxDoc());
+                    UninvertedOrdinals built = buildWithRetry(ordsDir, fileKey, terms, leaf.maxDoc(), expectedNonNullDocs);
                     CacheEntry entry = new CacheEntry(built);
                     Lease lease = entry.tryAcquire();
                     if (lease == null) {

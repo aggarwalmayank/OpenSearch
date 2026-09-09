@@ -377,21 +377,24 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     /**
      * Whether this field is eligible for segment-global ordinals.
      *
-     * <p>Ordinals rank the Lucene sidecar's <b>terms</b>, and a document's ordinal is only correct
-     * if the sidecar term for that document is byte-identical to the value stored in Parquet. That
-     * holds only for untokenized fields. A {@code text} field's terms are analyzer tokens — a
-     * document holding {@code "quick brown fox"} produces three terms, none equal to the stored
-     * value — so ranking against them would yield silently wrong ordinals. Ineligible fields stay
-     * on the streaming iterator, whose global operations fail fast toward {@code execution_hint:map}
-     * rather than return wrong numbers.
+     * <p>Ordinals rank the Lucene sidecar's <b>terms</b>, so correctness needs the sidecar term to
+     * be byte-identical to the Parquet value, and availability needs the field to have postings at
+     * all. The synthetic FieldInfo's {@code SORTED} type (from {@link FieldTypeMapping}) marks the
+     * byte-compatible single-valued types: {@code keyword} (value == term) and {@code ip} (both
+     * sides use {@code InetAddressPoint.encode}). {@code text} is {@code BINARY} — its terms are
+     * analyzer tokens, ranking them would be silently wrong — and multi-valued fields are
+     * {@code SORTED_SET}; both answer false here.
      *
-     * <p>Note {@code ip} is also untokenized and stored verbatim in its sidecar terms, so it is
-     * eligible on the same reasoning; it is excluded here only because that has not been validated
-     * yet. Widening this predicate is the intended follow-up.
+     * <p>Note {@code ip} passes this check but can never actually build: ip's "index" is a BKD
+     * point tree, not postings, so the sidecar has no terms for it and
+     * {@link UninvertedOrdinalsCache#acquire} refuses on {@code terms == null}. It degrades to the
+     * streaming path (aggregations run in map execution via the automatic fallback). Real ip
+     * ordinals need an alternative source — sidecar postings/doc-values for ip, or a
+     * Parquet-column-sort builder.
      */
     private boolean supportsSegmentOrdinals(String field) {
-        MappedFieldType fieldType = mapperService.fieldType(field);
-        return fieldType != null && "keyword".equals(fieldType.typeName());
+        FieldInfo fi = parquetFieldInfo(field);
+        return fi != null && fi.getDocValuesType() == DocValuesType.SORTED;
     }
 
     /**

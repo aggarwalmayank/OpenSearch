@@ -16,27 +16,13 @@ import java.io.IOException;
 import java.util.Arrays;
 
 /**
- * Streaming {@link SortedSetDocValues} over a Parquet keyword column — sequential access only,
- * with no segment-wide ordinal structure.
- *
- * <h2>Capability contract (fail-fast, never silently wrong)</h2>
- * Consumers that use ordinals as transient per-document handles — position with
- * {@link #advanceExact}, drain {@link #nextOrd()}, resolve each ord immediately via
- * {@link #lookupOrd} — are served directly from the row's values through the column reader's
- * resident batch: O(rows visited), no dictionary, no table, no full-column scan. This covers the
- * fetch phase ({@code docvalue_fields}), {@code FieldData.toString(...)}-style bytes views, and
- * every {@code execution_hint: map} aggregation.
- *
- * <p>Consumers that need segment-global ordinal semantics — {@link #getValueCount()},
- * {@link #lookupTerm}, {@link #termsEnum()}, or resolving an ord issued for a different document
- * — throw {@link UnsupportedOperationException} immediately. Global ordinals require a
- * segment-wide sorted term index that this codec does not materialize at read time: the previous
- * implementation built one by scanning the entire column per query, which is unacceptable at any
- * scale (a wide fetch on a 100M-row segment wedged a search thread for minutes). Failing loudly
- * is deliberate: an aggregation that needs ordinals must run with {@code execution_hint: map}.
- *
- * <p>Ords encode their issuing document ({@code doc << 20 | index}) so a stale ord from another
- * document is detected and rejected rather than resolved to the wrong term.
+ * Streaming {@link SortedSetDocValues} over a Parquet keyword column: per-document values only,
+ * no segment-wide ordinal structure. Transient ordinals encode their issuing document
+ * ({@code doc << 20 | index}) so a stale ord from another document is rejected, not resolved
+ * wrongly. Segment-global operations ({@link #getValueCount()}, {@link #lookupTerm},
+ * {@link #termsEnum()}) throw, steering ordinal-comparing consumers to
+ * {@code execution_hint: map}; per-document consumers (fetch, bytes views, map-mode aggs) are
+ * served zero-copy at O(rows visited).
  */
 public final class ParquetSortedSetDocValues extends SortedSetDocValues {
 

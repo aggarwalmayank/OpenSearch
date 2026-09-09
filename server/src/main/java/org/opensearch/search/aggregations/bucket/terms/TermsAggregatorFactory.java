@@ -32,6 +32,9 @@
 
 package org.opensearch.search.aggregations.bucket.terms;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.IndexSearcher;
@@ -77,6 +80,8 @@ import java.util.function.Function;
  * @opensearch.internal
  */
 public class TermsAggregatorFactory extends ValuesSourceAggregatorFactory implements StreamingCostEstimable {
+    private static final Logger logger = LogManager.getLogger(TermsAggregatorFactory.class);
+
     static Boolean REMAP_GLOBAL_ORDS, COLLECT_SEGMENT_ORDS;
 
     static void registerAggregators(ValuesSourceRegistry.Builder builder) {
@@ -145,7 +150,28 @@ public class TermsAggregatorFactory extends ValuesSourceAggregatorFactory implem
                     }
                     execution = ExecutionMode.GLOBAL_ORDINALS;
                 }
-                final long maxOrd = execution == ExecutionMode.GLOBAL_ORDINALS ? getMaxOrd(valuesSource, context.searcher()) : -1;
+                long maxOrd = -1;
+                if (execution == ExecutionMode.GLOBAL_ORDINALS) {
+                    try {
+                        maxOrd = getMaxOrd(valuesSource, context.searcher());
+                    } catch (UnsupportedOperationException e) {
+                        // Some doc-values implementations cannot materialize segment-global
+                        // ordinals (e.g. the pluggable Parquet data format serves keyword fields
+                        // from a streaming tier when its uninverted-ordinals disk budget is
+                        // exhausted, and getValueCount() throws). Ordinals are an execution
+                        // strategy, not a correctness requirement: degrade the whole shard to MAP,
+                        // which only needs per-document values, instead of failing the request.
+                        logger.debug(
+                            () -> new ParameterizedMessage(
+                                "aggregation [{}] falling back from [global_ordinals] to [map]: "
+                                    + "segment-global ordinals unavailable for this shard",
+                                name
+                            ),
+                            e
+                        );
+                        execution = ExecutionMode.MAP;
+                    }
+                }
                 if (subAggCollectMode == null) {
                     subAggCollectMode = pickSubAggCollectMode(factories, bucketCountThresholds.getShardSize(), maxOrd, context);
                 }

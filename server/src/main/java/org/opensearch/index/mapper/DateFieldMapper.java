@@ -311,7 +311,6 @@ public final class DateFieldMapper extends ParametrizedFieldMapper {
         private final Resolution resolution;
         private final Version indexCreatedVersion;
 
-
         public Builder(
             String name,
             Resolution resolution,

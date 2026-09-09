@@ -63,8 +63,6 @@ import java.util.List;
 
 import static org.hamcrest.Matchers.containsString;
 
-import static org.hamcrest.Matchers.containsString;
-
 public class BooleanFieldMapperTests extends MapperTestCase {
 
     private static final String FIELD_NAME = "field";

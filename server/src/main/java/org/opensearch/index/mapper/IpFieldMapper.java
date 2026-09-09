@@ -115,7 +115,6 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
         private final boolean ignoreMalformedByDefault;
         private final Version indexCreatedVersion;
 
-
         public Builder(String name, boolean ignoreMalformedByDefault, Version indexCreatedVersion) {
             this(name, ignoreMalformedByDefault, indexCreatedVersion, Settings.EMPTY);
         }

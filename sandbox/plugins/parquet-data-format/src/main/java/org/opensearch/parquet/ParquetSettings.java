@@ -241,21 +241,24 @@ public final class ParquetSettings {
      */
     public static final Setting<Integer> DOCVALUES_CHECKPOINT_INTERVAL = Setting.intSetting(
         "parquet.docvalues.checkpoint.interval",
-        256,
+        128,
         1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
 
     /**
-     * Node-wide disk budget for uninverted-ordinal files. When a new build would exceed it,
-     * unreferenced ord files are reclaimed oldest-first; if it still does not fit, the tier is
-     * refused for that field (consumers fall back to the streaming fail-fast path).
+     * Disk budget for a shard's uninverted-ordinal (.ord) files, as a percentage of that shard's
+     * on-disk store size (Lucene sidecar + Parquet data, excluding the ord files themselves and
+     * the translog). The budget scales with the data: a shard holding 30 GiB may use up to
+     * 3 GiB of ord files at the default. When a new build would exceed it, unreferenced ord
+     * files of that shard are reclaimed oldest-first; if it still does not fit, the tier is
+     * refused for that field (consumers fall back to the streaming path).
      */
-    public static final Setting<Long> DOCVALUES_UNINVERT_MAX_DISK_BYTES = Setting.longSetting(
-        "parquet.docvalues.uninvert.max_disk_bytes",
-        2L * 1024 * 1024 * 1024,
-        0,
+    public static final Setting<Double> DOCVALUES_UNINVERT_MAX_DISK_PERCENT = Setting.doubleSetting(
+        "parquet.docvalues.uninvert.max_disk_percent",
+        10.0,
+        0.0,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -1006,7 +1009,7 @@ public final class ParquetSettings {
             DOCVALUES_INITIAL_BATCH_SIZE,
             DOCVALUES_DIAGNOSTICS,
             DOCVALUES_CHECKPOINT_INTERVAL,
-            DOCVALUES_UNINVERT_MAX_DISK_BYTES,
+            DOCVALUES_UNINVERT_MAX_DISK_PERCENT,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,
             WRITE_POOL_MAX,

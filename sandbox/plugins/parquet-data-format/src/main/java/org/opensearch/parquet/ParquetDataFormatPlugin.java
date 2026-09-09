@@ -146,7 +146,7 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         ParquetDocValuesProducer.setInitialBatchSize(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE.get(this.settings));
         ParquetDocValuesProducer.setDiagnostics(ParquetSettings.DOCVALUES_DIAGNOSTICS.get(this.settings));
         ParquetDocValuesProducer.setCheckpointInterval(ParquetSettings.DOCVALUES_CHECKPOINT_INTERVAL.get(this.settings));
-        ParquetDocValuesProducer.setUninvertMaxDiskBytes(ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_BYTES.get(this.settings));
+        ParquetDocValuesProducer.setUninvertMaxDiskPercent(ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_PERCENT.get(this.settings));
         org.opensearch.parquet.codec.UninvertedOrdinalsCache.setOrdsDir(environment.dataFiles()[0].resolve("parquet-ords"));
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE, ParquetDocValuesProducer::setInitialBatchSize);
@@ -156,8 +156,8 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_CHECKPOINT_INTERVAL, ParquetDocValuesProducer::setCheckpointInterval);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(
-                ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_BYTES,
-                ParquetDocValuesProducer::setUninvertMaxDiskBytes
+                ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_PERCENT,
+                ParquetDocValuesProducer::setUninvertMaxDiskPercent
             );
 
         // Register virtual pools if allocator is available (arrow-base loaded)

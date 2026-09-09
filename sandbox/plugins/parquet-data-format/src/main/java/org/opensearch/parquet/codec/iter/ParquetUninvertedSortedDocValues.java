@@ -16,18 +16,10 @@ import org.opensearch.parquet.codec.UninvertedOrdinals;
 import java.io.IOException;
 
 /**
- * Fully contract-compliant {@link SortedDocValues} for high-cardinality keyword fields, backed by
- * disk-resident {@link UninvertedOrdinals}. Access-path economics:
- *
- * <ul>
- * <li>{@code ordValue()} — one packed read from the memory-mapped ordinal file; no Parquet
- * decode at all (sorting, global-ordinal collection).</li>
- * <li>{@code lookupOrd(currentOrd)} — the per-document value pattern (map-hint terms,
- * cardinality hashing): served zero-copy from the streaming reader's resident page, never
- * through the terms index.</li>
- * <li>{@code lookupOrd(otherOrd)} — bucket-key resolution: a stateful cursor over the sidecar's
- * terms enum; ascending walks amortize to one sequential pass.</li>
- * </ul>
+ * Fully contract-compliant {@link SortedDocValues} for keyword fields, backed by disk-resident
+ * {@link UninvertedOrdinals}: {@code ordValue()} is one packed read from the mapped ord file
+ * (no Parquet); {@code lookupOrd(currentOrd)} is served zero-copy from the streaming reader;
+ * {@code lookupOrd(otherOrd)} resolves through a stateful terms cursor.
  */
 public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
 

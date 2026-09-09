@@ -69,8 +69,8 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private static final Logger logger = LogManager.getLogger(ParquetDocValuesProducer.class);
     private static volatile int dataFusionInitialBatchSize = 32;
     private static volatile boolean dataFusionDiagnostics;
-    private static volatile int checkpointInterval = 256;
-    private static volatile long uninvertMaxDiskBytes = 2L * 1024 * 1024 * 1024;
+    private static volatile int checkpointInterval = 128;
+    private static volatile double uninvertMaxDiskPercent = 10.0;
 
     /**
      * Updates the checkpoint interval stamped into <em>newly built</em> uninverted (.ord) ordinals.
@@ -89,12 +89,12 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return checkpointInterval;
     }
 
-    public static void setUninvertMaxDiskBytes(long bytes) {
-        uninvertMaxDiskBytes = bytes;
+    public static void setUninvertMaxDiskPercent(double percent) {
+        uninvertMaxDiskPercent = percent;
     }
 
-    static long uninvertMaxDiskBytes() {
-        return uninvertMaxDiskBytes;
+    static double uninvertMaxDiskPercent() {
+        return uninvertMaxDiskPercent;
     }
 
     /** Updates the starting window used by newly opened DataFusion cursors. */

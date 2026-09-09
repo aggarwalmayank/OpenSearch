@@ -16,16 +16,11 @@ import org.opensearch.parquet.codec.cache.PageCache;
 import java.io.IOException;
 
 /**
- * Streaming single-valued {@link SortedDocValues} over a Parquet keyword column — sequential
- * access only, with no segment-wide ordinal structure.
- *
- * <p>Same capability contract as {@link ParquetSortedSetDocValues}: transient per-document
- * ordinals (the ordinal <em>is</em> the docId, which keeps it inside {@code int} range),
- * resolved immediately via {@link #lookupOrd}; segment-global operations
- * ({@link #getValueCount()}, {@link #lookupTerm}) and stale-ordinal resolution throw rather
- * than return wrong results. Serves the fetch phase and bytes-view consumers at O(rows
- * visited); ordinal-comparing consumers (global-ordinals aggregations) must use
- * {@code execution_hint: map}.
+ * Streaming single-valued {@link SortedDocValues} over a Parquet keyword column: per-document
+ * values only, no segment-wide ordinal structure. The doc id doubles as a transient ordinal,
+ * resolved immediately via {@link #lookupOrd}; segment-global operations ({@link #getValueCount},
+ * {@link #lookupTerm}) throw rather than return wrong results, steering ordinal-comparing
+ * consumers to {@code execution_hint: map}.
  */
 public final class ParquetSortedDocValues extends SortedDocValues {
 
@@ -49,8 +44,7 @@ public final class ParquetSortedDocValues extends SortedDocValues {
             return false;
         }
         doc = target;
-        // Zero-copy hot path (mirrors ParquetBinaryDocValues): serve the value as a view into
-        // the resident page buffer — no per-document allocation on 100M-doc scans.
+        // Zero-copy: serve the value as a view into the resident page buffer.
         PageCache cache = reader.cache();
         if (cache == null || target > cache.lastRow || target < cache.firstRow) {
             reader.loadPageContaining(target);
@@ -74,8 +68,7 @@ public final class ParquetSortedDocValues extends SortedDocValues {
 
     @Override
     public int ordValue() {
-        // The document id doubles as the transient ordinal: unique per positioned doc,
-        // int-ranged, and verifiable in lookupOrd.
+        // The doc id doubles as the transient ordinal; lookupOrd verifies it.
         return doc;
     }
 
