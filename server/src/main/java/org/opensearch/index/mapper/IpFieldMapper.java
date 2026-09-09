@@ -77,6 +77,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
@@ -260,6 +261,19 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
         @Override
         protected FieldTypeCapabilities.Capability searchCapability() {
             return FieldTypeCapabilities.Capability.POINT_RANGE;
+        }
+
+        /**
+         * On pluggable indices ip is not point-indexed, so nothing *requests* term indexing —
+         * but the Lucene secondary can serve {@code FULL_TEXT_SEARCH} for ip by writing
+         * terms-only postings (the 16-byte encoded form), which the Parquet codec uninverts
+         * into segment ordinals for aggregations. Declaring it optional lets the composite
+         * capability assigner route it to the secondary without making the mapping invalid
+         * on formats that cannot provide it.
+         */
+        @Override
+        public Set<FieldTypeCapabilities.Capability> optionalCapabilities() {
+            return Set.of(FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH);
         }
 
         private static InetAddress parse(Object value) {
