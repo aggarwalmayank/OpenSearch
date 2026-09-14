@@ -89,9 +89,6 @@ public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
 
     @Override
     public TermsEnum termsEnum() throws IOException {
-        // The default implementation resolves every ordinal through lookupOrd — quadratic over
-        // millions of terms when OrdinalMap walks the enum. The sidecar's own enum IS this
-        // ordinal space, in order, streamed off disk.
         return ordinals.termsEnum();
     }
 

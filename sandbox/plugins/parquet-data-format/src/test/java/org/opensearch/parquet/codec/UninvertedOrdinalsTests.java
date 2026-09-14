@@ -68,16 +68,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
                 AtomicInteger iteratorCalls = new AtomicInteger();
                 Terms countingTerms = countingTerms(baseTerms, iteratorCalls);
-                try (
-                    UninvertedOrdinals reloaded = UninvertedOrdinals.build(
-                        ordsDir,
-                        fileKey,
-                        countingTerms,
-                        leaf.maxDoc(),
-                        termCount,
-                        () -> false
-                    )
-                ) {
+                try (UninvertedOrdinals reloaded = UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), termCount)) {
                     assertEquals("existing .ord should load without rebuilding checkpoints", 0, iteratorCalls.get());
                     assertEquals(termCount, reloaded.valueCount());
                     assertEquals(termCount - 1, reloaded.newOrdinalCursor().ordinal(termCount - 1));
@@ -124,16 +115,8 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 try {
                     AtomicInteger iteratorCalls = new AtomicInteger();
                     Terms countingTerms = countingTerms(terms, iteratorCalls);
-                    try (
-                        UninvertedOrdinals reloaded = UninvertedOrdinals.build(
-                            ordsDir,
-                            fileKey,
-                            countingTerms,
-                            leaf.maxDoc(),
-                            termCount,
-                            () -> false
-                        )
-                    ) {
+                    try (UninvertedOrdinals reloaded = UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), termCount)) {
+                        assertNotNull("existing file must load regardless of the live interval setting", reloaded);
                         assertEquals("interval change must not force a re-uninvert", 0, iteratorCalls.get());
                         for (int ord : new int[] { 0, 1, buildInterval - 1, buildInterval, buildInterval + 5, termCount - 1 }) {
                             assertEquals("ord->term must survive the setting change", termValue(ord), reloaded.term(ord).utf8ToString());
@@ -174,10 +157,15 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
                 AtomicInteger iteratorCalls = new AtomicInteger();
                 Terms countingTerms = countingTerms(baseTerms, iteratorCalls);
+                assertNull(
+                    "corrupt assignedDocs metadata must be rejected by load",
+                    UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), 3)
+                );
+                assertFalse("the invalid file must be deleted so a rebuild can replace it", Files.exists(ordFile));
                 try (
                     UninvertedOrdinals rebuilt = UninvertedOrdinals.build(ordsDir, fileKey, countingTerms, leaf.maxDoc(), 3, () -> false)
                 ) {
-                    assertTrue("corrupt assignedDocs metadata should force rebuild", iteratorCalls.get() > 0);
+                    assertTrue("rebuild walks the postings", iteratorCalls.get() > 0);
                     assertEquals("beta", rebuilt.term(1).utf8ToString());
                     assertEquals(2, rebuilt.rank(new BytesRef("gamma")));
                 }

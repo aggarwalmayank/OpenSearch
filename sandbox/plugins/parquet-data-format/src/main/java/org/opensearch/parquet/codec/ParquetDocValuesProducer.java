@@ -70,7 +70,6 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private static volatile int dataFusionInitialBatchSize = 32;
     private static volatile boolean dataFusionDiagnostics;
     private static volatile int checkpointInterval = 128;
-    private static volatile double uninvertMaxDiskPercent = 10.0;
 
     /**
      * Updates the checkpoint interval stamped into <em>newly built</em> uninverted (.ord) ordinals.
@@ -87,14 +86,6 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     /** Checkpoint interval applied to newly built uninverted (.ord) ordinals. */
     static int checkpointInterval() {
         return checkpointInterval;
-    }
-
-    public static void setUninvertMaxDiskPercent(double percent) {
-        uninvertMaxDiskPercent = percent;
-    }
-
-    static double uninvertMaxDiskPercent() {
-        return uninvertMaxDiskPercent;
     }
 
     /** Updates the starting window used by newly opened DataFusion cursors. */

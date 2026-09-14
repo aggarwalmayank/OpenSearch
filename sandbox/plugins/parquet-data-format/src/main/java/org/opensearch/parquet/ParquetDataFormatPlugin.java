@@ -21,6 +21,7 @@ import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -44,6 +45,7 @@ import org.opensearch.index.store.PrecomputedChecksumStrategy;
 import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.codec.ParquetDocValuesDirectoryReader;
 import org.opensearch.parquet.codec.ParquetDocValuesProducer;
+import org.opensearch.parquet.codec.UninvertedOrdinalsCache;
 import org.opensearch.parquet.engine.ParquetDataFormat;
 import org.opensearch.parquet.engine.ParquetIndexingEngine;
 import org.opensearch.parquet.fields.ArrowSchemaBuilder;
@@ -65,10 +67,12 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -109,6 +113,8 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
     /** Initialized to EMPTY to avoid NPE if indexingEngine() is called before createComponents(). */
     private Settings settings = Settings.EMPTY;
     private ThreadPool threadPool;
+    /** Periodic TTL sweeper for uninverted-ordinal files; cancelled in {@link #close()}. */
+    private Scheduler.Cancellable ordSweeper;
     private ArrowNativeAllocator nativeAllocator;
 
     /** Creates a new ParquetDataFormatPlugin. */
@@ -146,8 +152,16 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         ParquetDocValuesProducer.setInitialBatchSize(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE.get(this.settings));
         ParquetDocValuesProducer.setDiagnostics(ParquetSettings.DOCVALUES_DIAGNOSTICS.get(this.settings));
         ParquetDocValuesProducer.setCheckpointInterval(ParquetSettings.DOCVALUES_CHECKPOINT_INTERVAL.get(this.settings));
-        ParquetDocValuesProducer.setUninvertMaxDiskPercent(ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_PERCENT.get(this.settings));
-        org.opensearch.parquet.codec.UninvertedOrdinalsCache.setOrdsDir(environment.dataFiles()[0].resolve("parquet-ords"));
+        UninvertedOrdinalsCache.start();
+        UninvertedOrdinalsCache.setTtl(ParquetSettings.DOCVALUES_UNINVERT_TTL.get(this.settings));
+        UninvertedOrdinalsCache.setMaxConcurrentBuilds(ParquetSettings.DOCVALUES_UNINVERT_MAX_CONCURRENT_BUILDS.get(this.settings));
+        UninvertedOrdinalsCache.setDataRoots(environment.dataFiles());
+        // TTL sweeper: fixed cadence, reads the current (dynamic) ttl each pass.
+        this.ordSweeper = threadPool.scheduleWithFixedDelay(
+            UninvertedOrdinalsCache::sweepExpiredOrdinals,
+            TimeValue.timeValueMinutes(5),
+            ThreadPool.Names.GENERIC
+        );
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_INITIAL_BATCH_SIZE, ParquetDocValuesProducer::setInitialBatchSize);
         clusterService.getClusterSettings()
@@ -155,9 +169,11 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_CHECKPOINT_INTERVAL, ParquetDocValuesProducer::setCheckpointInterval);
         clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(ParquetSettings.DOCVALUES_UNINVERT_TTL, UninvertedOrdinalsCache::setTtl);
+        clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(
-                ParquetSettings.DOCVALUES_UNINVERT_MAX_DISK_PERCENT,
-                ParquetDocValuesProducer::setUninvertMaxDiskPercent
+                ParquetSettings.DOCVALUES_UNINVERT_MAX_CONCURRENT_BUILDS,
+                UninvertedOrdinalsCache::setMaxConcurrentBuilds
             );
 
         // Register virtual pools if allocator is available (arrow-base loaded)
@@ -302,9 +318,12 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
     }
 
     @Override
-    public void close() throws java.io.IOException {
-        // Abort any in-flight uninverted-ordinal builds so node shutdown is not delayed.
-        org.opensearch.parquet.codec.UninvertedOrdinalsCache.shutdown();
+    public void close() throws IOException {
+        // Stop the TTL sweeper and abort in-flight uninverted-ordinal builds.
+        if (ordSweeper != null) {
+            ordSweeper.cancel();
+        }
+        UninvertedOrdinalsCache.shutdown();
         super.close();
     }
 

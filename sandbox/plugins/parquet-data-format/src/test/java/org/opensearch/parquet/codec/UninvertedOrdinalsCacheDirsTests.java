@@ -24,10 +24,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * Tests for the per-shard ord-file location and the percent-of-store disk budget:
- * {@link UninvertedOrdinalsCache#resolveOrdsDir}, {@link UninvertedOrdinalsCache#shardStoreBytes},
- * the legacy-directory wipe in {@link UninvertedOrdinalsCache#setOrdsDir}, and the budget
- * enforcement end to end through {@link UninvertedOrdinalsCache#acquire}.
+ * Tests for the per-shard ord-file location: {@link OrdFilePaths#resolveOrdsDir} and building
+ * end to end through {@link UninvertedOrdinalsCache#acquire}.
  */
 public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
 
@@ -36,7 +34,7 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
         Path storeDir = shardDir.resolve("index");
         Files.createDirectories(storeDir);
         try (Directory directory = FSDirectory.open(storeDir)) {
-            assertEquals(shardDir.resolve("parquet-ords"), UninvertedOrdinalsCache.resolveOrdsDir(directory));
+            assertEquals(shardDir.resolve("parquet-ords"), OrdFilePaths.resolveOrdsDir(directory));
         }
     }
 
@@ -47,13 +45,13 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
         try (Directory fs = FSDirectory.open(storeDir); Directory wrapped = new FilterDirectory(new FilterDirectory(fs) {
         }) {
         }) {
-            assertEquals(shardDir.resolve("parquet-ords"), UninvertedOrdinalsCache.resolveOrdsDir(wrapped));
+            assertEquals(shardDir.resolve("parquet-ords"), OrdFilePaths.resolveOrdsDir(wrapped));
         }
     }
 
     public void testResolveOrdsDirRefusesNonFsDirectories() throws Exception {
         try (Directory directory = new ByteBuffersDirectory()) {
-            assertNull("no shard folder exists for a non-filesystem directory", UninvertedOrdinalsCache.resolveOrdsDir(directory));
+            assertNull("no shard folder exists for a non-filesystem directory", OrdFilePaths.resolveOrdsDir(directory));
         }
     }
 
@@ -75,85 +73,12 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
         }
     }
 
-    public void testShardStoreBytesExcludesOrdsDirAndTranslog() throws Exception {
+    /** End to end through {@link UninvertedOrdinalsCache#acquire}: the .ord file is built under {@code <shard>/parquet-ords/}. */
+    public void testAcquireBuildsUnderShardPath() throws Exception {
         Path shardDir = createTempDir();
-        Path ordsDir = shardDir.resolve("parquet-ords");
-        Files.createDirectories(shardDir.resolve("index"));
-        Files.createDirectories(shardDir.resolve("translog"));
-        Files.createDirectories(shardDir.resolve("_state"));
-        Files.createDirectories(ordsDir);
-        Files.write(shardDir.resolve("index").resolve("segment.parquet"), new byte[100]);
-        Files.write(shardDir.resolve("index").resolve("_0.tim"), new byte[40]);
-        Files.write(shardDir.resolve("_state").resolve("state.st"), new byte[10]);
-        Files.write(shardDir.resolve("translog").resolve("translog.tlog"), new byte[500]);
-        Files.write(ordsDir.resolve("parquet-ords-a-city.ord"), new byte[300]);
-
-        assertEquals(150, UninvertedOrdinalsCache.shardStoreBytes(ordsDir));
-    }
-
-    public void testShardStoreBytesUnenforceableWithoutParent() {
-        assertEquals(-1, UninvertedOrdinalsCache.shardStoreBytes(Path.of("/")));
-    }
-
-    public void testSetOrdsDirWipesLegacyOrdAndTmpFilesOnly() throws Exception {
-        Path legacy = createTempDir();
-        Files.write(legacy.resolve("parquet-ords-a-city.ord"), new byte[10]);
-        Files.write(legacy.resolve("parquet-ords-b-city.ord.tmp"), new byte[10]);
-        Files.write(legacy.resolve("unrelated.txt"), new byte[10]);
-
-        UninvertedOrdinalsCache.setOrdsDir(legacy);
-
-        assertFalse(Files.exists(legacy.resolve("parquet-ords-a-city.ord")));
-        assertFalse(Files.exists(legacy.resolve("parquet-ords-b-city.ord.tmp")));
-        assertTrue(Files.exists(legacy.resolve("unrelated.txt")));
-    }
-
-    /**
-     * End to end through {@link UninvertedOrdinalsCache#acquire}: with a permissive percent the
-     * .ord file is built under {@code <shard>/parquet-ords/}; with a zero percent the build is
-     * refused (transient — acquire returns null, nothing latched) and no file is written.
-     */
-    public void testAcquireBuildsUnderShardPathAndHonoursPercentBudget() throws Exception {
-        double before = ParquetDocValuesProducer.uninvertMaxDiskPercent();
-        try {
-            Path allowedShard = createTempDir();
-            ParquetDocValuesProducer.setUninvertMaxDiskPercent(100.0);
-            assertNotNull("permissive budget must build", acquireOnFreshShard(allowedShard));
-            try (var listing = Files.list(allowedShard.resolve("parquet-ords"))) {
-                assertTrue("an .ord file must exist under <shard>/parquet-ords", listing.anyMatch(f -> f.toString().endsWith(".ord")));
-            }
-
-            Path refusedShard = createTempDir();
-            ParquetDocValuesProducer.setUninvertMaxDiskPercent(0.0);
-            assertNull("zero budget must refuse", acquireOnFreshShard(refusedShard));
-            Path refusedOrds = refusedShard.resolve("parquet-ords");
-            if (Files.isDirectory(refusedOrds)) {
-                try (var listing = Files.list(refusedOrds)) {
-                    assertFalse("no .ord file may be written when refused", listing.anyMatch(f -> f.toString().endsWith(".ord")));
-                }
-            }
-
-            // Budget refusal is transient: raising the percent lets the SAME shard build.
-            ParquetDocValuesProducer.setUninvertMaxDiskPercent(100.0);
-            assertNotNull("raised budget must build after a refusal", acquireOnFreshShard(refusedShard));
-        } finally {
-            ParquetDocValuesProducer.setUninvertMaxDiskPercent(before);
-        }
-    }
-
-    /**
-     * Regression: on a tiny shard, a percentage of the store is smaller than one .ord file's
-     * fixed overhead (~1 KiB), which used to refuse every build on small test indices. Any
-     * non-zero percent must admit the build via the budget floor.
-     */
-    public void testSmallShardBuildsUnderDefaultPercentBudget() throws Exception {
-        double before = ParquetDocValuesProducer.uninvertMaxDiskPercent();
-        try {
-            ParquetDocValuesProducer.setUninvertMaxDiskPercent(10.0);
-            Path smallShard = createTempDir();
-            assertNotNull("a tiny shard must not be refused by the percent budget", acquireOnFreshShard(smallShard));
-        } finally {
-            ParquetDocValuesProducer.setUninvertMaxDiskPercent(before);
+        assertNotNull("acquire must build on a fresh shard", acquireOnFreshShard(shardDir));
+        try (var listing = Files.list(shardDir.resolve("parquet-ords"))) {
+            assertTrue("an .ord file must exist under <shard>/parquet-ords", listing.anyMatch(f -> f.toString().endsWith(".ord")));
         }
     }
 

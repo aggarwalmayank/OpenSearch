@@ -363,11 +363,55 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         return in.getSortedDocValues(field);
     }
 
+    @Override
+    public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
+        FieldInfo fi = parquetFieldInfo(field);
+        if (fi != null) {
+            if (cardinalityOf(field).isSingleValued() == false) {
+                // MULTI_VALUE_TODO: dormant until UninvertedOrdinals supports per-document
+                // ordinal lists; until then multi-valued aggregations use the map fallback.
+                FieldInfo asSortedSet = fi.getDocValuesType() == DocValuesType.SORTED_SET
+                    ? fi
+                    : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED_SET, DocValuesSkipIndexType.NONE);
+                SortedSetDocValues sortedSet = producer().getSortedSet(asSortedSet);
+                RowIdResolver multiResolver = newRowIdResolver();
+                return multiResolver == RowIdResolver.IDENTITY
+                    ? sortedSet
+                    : RowIdRemappingDocValues.sortedSet(sortedSet, multiResolver, maxDoc());
+            }
+            // Keyword consumers request SORTED_SET even for single-valued fields, then probe with
+            // DocValues.unwrapSingleton(...); the singleton(...) wrapper below is what makes that
+            // probe succeed and unlock their single-valued fast path.
+            FieldInfo asSorted = fi.getDocValuesType() == DocValuesType.SORTED
+                ? fi
+                : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED, fi.docValuesSkipIndexType());
+            SortedDocValues sorted = withSegmentOrdinals(field, producer().getSorted(asSorted));
+            RowIdResolver resolver = newRowIdResolver();
+            SortedDocValues remapped = resolver == RowIdResolver.IDENTITY
+                ? sorted
+                : RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
+            return DocValues.singleton(remapped);
+        }
+        return in.getSortedSetDocValues(field);
+    }
+
+    private SortedDocValues withSegmentOrdinals(String field, SortedDocValues sorted) throws IOException {
+        if (supportsSegmentOrdinals(field) == false) {
+            return sorted;
+        }
+        if (sorted instanceof ParquetSortedDocValues streaming) {
+            long expectedNonNull = producer().nonNullRowCount(parquetFieldInfo(field));
+            UninvertedOrdinalsCache.Lease lease = acquireUninvertedOrdinalsLease(field, expectedNonNull);
+            if (lease != null) {
+                return new ParquetUninvertedSortedDocValues(lease.ordinals(), streaming, maxDoc());
+            }
+        }
+        return sorted;
+    }
+
     /**
-     * This field's value cardinality — the single read-path decision point for single- vs
-     * multi-valued behaviour. See {@link ValueCardinality} for why it is always single-valued today
-     * and what enabling multi-value requires. Unmapped fields cannot be served from Parquet at all
-     * (they would have no synthetic FieldInfo), so the fallback is the safe shape.
+     * The field's cardinality, per {@link ValueCardinality#of}. Unmapped fields cannot be served
+     * from Parquet at all, so they default to the single-valued shape.
      */
     private ValueCardinality cardinalityOf(String field) {
         MappedFieldType fieldType = mapperService.fieldType(field);
@@ -375,22 +419,9 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     }
 
     /**
-     * Whether this field is eligible for segment-global ordinals.
-     *
-     * <p>Ordinals rank the Lucene sidecar's <b>terms</b>, so correctness needs the sidecar term to
-     * be byte-identical to the Parquet value, and availability needs the field to have postings at
-     * all. The synthetic FieldInfo's {@code SORTED} type (from {@link FieldTypeMapping}) marks the
-     * byte-compatible single-valued types: {@code keyword} (value == term) and {@code ip} (both
-     * sides use {@code InetAddressPoint.encode}). {@code text} is {@code BINARY} — its terms are
-     * analyzer tokens, ranking them would be silently wrong — and multi-valued fields are
-     * {@code SORTED_SET}; both answer false here.
-     *
-     * <p>Note {@code ip} passes this check but can never actually build: ip's "index" is a BKD
-     * point tree, not postings, so the sidecar has no terms for it and
-     * {@link UninvertedOrdinalsCache#acquire} refuses on {@code terms == null}. It degrades to the
-     * streaming path (aggregations run in map execution via the automatic fallback). Real ip
-     * ordinals need an alternative source — sidecar postings/doc-values for ip, or a
-     * Parquet-column-sort builder.
+     * Whether this field is eligible for segment ordinals: true when the synthetic FieldInfo is
+     * {@code SORTED} — keyword and ip, whose sidecar terms are byte-identical to the Parquet
+     * values, which is what makes ranking terms equivalent to ranking values.
      */
     private boolean supportsSegmentOrdinals(String field) {
         FieldInfo fi = parquetFieldInfo(field);
@@ -413,57 +444,6 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             uninvertedOrdinalsLeases.put(field, lease);
         }
         return lease;
-    }
-
-    private SortedDocValues withSegmentOrdinals(String field, SortedDocValues sorted) throws IOException {
-        if (supportsSegmentOrdinals(field) == false) {
-            return sorted;
-        }
-        if (sorted instanceof ParquetSortedDocValues streaming) {
-            long expectedNonNull = producer().nonNullRowCount(parquetFieldInfo(field));
-            UninvertedOrdinalsCache.Lease lease = acquireUninvertedOrdinalsLease(field, expectedNonNull);
-            if (lease != null) {
-                return new ParquetUninvertedSortedDocValues(lease.ordinals(), streaming, maxDoc());
-            }
-        }
-        return sorted;
-    }
-
-    @Override
-    public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
-        FieldInfo fi = parquetFieldInfo(field);
-        if (fi != null) {
-            if (cardinalityOf(field).isSingleValued() == false) {
-                // MULTI_VALUE_TODO(step 4): repeated keyword column — serve the multi-valued
-                // iterator directly. ParquetSortedSetDocValues already implements the SORTED_SET
-                // contract (per-doc sort + dedup); it needs list-shaped ordinals from
-                // UninvertedOrdinals (step 3) before global-ordinal consumers can use it.
-                FieldInfo asSortedSet = fi.getDocValuesType() == DocValuesType.SORTED_SET
-                    ? fi
-                    : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED_SET, DocValuesSkipIndexType.NONE);
-                SortedSetDocValues sortedSet = producer().getSortedSet(asSortedSet);
-                RowIdResolver multiResolver = newRowIdResolver();
-                return multiResolver == RowIdResolver.IDENTITY
-                    ? sortedSet
-                    : RowIdRemappingDocValues.sortedSet(sortedSet, multiResolver, maxDoc());
-            }
-            // Single-valued (the only shape the write path can produce today). OpenSearch keyword
-            // value sources request SORTED_SET even for single-valued fields, then call
-            // DocValues.unwrapSingleton(...) to take a leaner collector. So serve the single-valued
-            // ordinal iterator and wrap it with DocValues.singleton(...): the result is a real
-            // SingletonSortedSetDocValues that unwrapSingleton(...) detects, giving the aggregator
-            // its single-valued fast path over genuine segment ordinals.
-            FieldInfo asSorted = fi.getDocValuesType() == DocValuesType.SORTED
-                ? fi
-                : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED, fi.docValuesSkipIndexType());
-            SortedDocValues sorted = withSegmentOrdinals(field, producer().getSorted(asSorted));
-            RowIdResolver resolver = newRowIdResolver();
-            SortedDocValues remapped = resolver == RowIdResolver.IDENTITY
-                ? sorted
-                : RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
-            return DocValues.singleton(remapped);
-        }
-        return in.getSortedSetDocValues(field);
     }
 
     @Override

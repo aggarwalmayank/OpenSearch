@@ -15,59 +15,370 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.util.StringHelper;
+import org.opensearch.common.unit.TimeValue;
 
 import java.io.IOException;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
+import java.nio.file.attribute.FileTime;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.stream.Stream;
 
 /**
- * Node-level cache of {@link UninvertedOrdinals}, keyed by (segment core key, field). Builds are
- * serialized node-wide; entries close with their segment core; the on-disk file is keyed by the
- * segment's stable id and survives restarts, so a re-opened segment maps it instead of rebuilding.
+ * Node-level cache of {@link UninvertedOrdinals}, keyed by (segment core segmentCoreKey, field). Builds of
+ * different files run in parallel (bounded by build permits); mutations of one file serialize on
+ * its per-file lock; entries close with their segment core. The on-disk file is keyed by the
+ * segment's stable id and survives restarts; idle files are deleted by the periodic TTL sweep.
  */
 public final class UninvertedOrdinalsCache {
 
     private static final Logger LOGGER = LogManager.getLogger(UninvertedOrdinalsCache.class);
-    private static final double EVICTION_WATERMARK_FRACTION = 0.90d;
-    /** Budget floor: a non-zero percent always admits at least this much (see enforceDiskBudget). */
-    static final long MIN_BUDGET_BYTES = 64L * 1024 * 1024;
 
     /** Marks a (segment, field) whose ordinals failed coverage verification — do not retry. */
     private static final Map<Object, Set<String>> INELIGIBLE = new ConcurrentHashMap<>();
-    private static final Map<Object, Map<String, CacheEntry>> CACHE = new ConcurrentHashMap<>();
-    private static final Object BUILD_LOCK = new Object();
 
-    /** Directories already created and swept of stale .tmp files this process lifetime. */
-    private static final Set<Path> PREPARED_DIRS = ConcurrentHashMap.newKeySet();
+    /** Loaded ordinals by segment core segmentCoreKey, then field name; entries are removed when the segment core closes. */
+    private static final Map<Object, Map<String, FieldOrdinalsEntry>> ORDINALS_BY_SEGMENT = new ConcurrentHashMap<>();
+
+    /**
+     * One lock per ord FILE: every mutation of a file (build, load, delete) runs under its lock,
+     * so builds of different fields proceed in parallel while two threads can never build,
+     * or build-vs-sweep-delete, the same file concurrently. Entries are removed with the
+     * owning segment core.
+     */
+    private static final Map<String, Object> FILE_LOCKS = new ConcurrentHashMap<>();
+
+    /**
+     * Bounds concurrent FROM-SCRATCH builds node-wide: each holds a transient packed buffer of
+     * {@code maxDoc × bits} heap (~287 MB at 100M docs), so parallelism must be capped. Loads of
+     * existing files and cache hits never take a permit.
+     */
+    private static final ResizableSemaphore BUILD_PERMITS = new ResizableSemaphore(2);
+
+    /** Idle time after which an unused ord file is deleted; {@code 0} = keep forever. */
+    private static volatile long ttlMillis = TimeValue.timeValueDays(7).millis();
+
+    /** Node data roots, for the sweeper to find every shard's ords dir. Set by the plugin. */
+    private static volatile Path[] dataRoots = new Path[0];
+
+    /**
+     * How often an in-use file's last-modified time is refreshed to record "last used" on disk
+     * (for the sweeper's cold-file phase, which judges idleness by the file's last-modified time
+     * after the in-memory clock is lost to a restart). The on-disk record may lag true last use
+     * by at most this much — harmless against a TTL measured in days, and it caps the cost at
+     * one metadata write per file per interval instead of one per query.
+     */
+    private static final long LAST_USED_PERSIST_INTERVAL_MILLIS = TimeValue.timeValueMinutes(5).millis();
+
     private static volatile boolean shuttingDown = false;
-
-    /** Name of the per-shard ord-file directory, a sibling of the shard's store directory. */
-    static final String ORDS_DIR_NAME = "parquet-ords";
 
     private UninvertedOrdinalsCache() {}
 
-    private static final class CacheEntry {
+    /**
+     * Called once at plugin init: begins a node lifecycle by re-arming the cache (the class is
+     * static and outlives the node in same-JVM restarts, notably tests, where a previous node's
+     * {@link #shutdown()} would otherwise keep refusing builds).
+     */
+    public static void start() {
+        shuttingDown = false;
+    }
+
+    /** Called at plugin close: aborts in-flight builds so node shutdown is not held hostage. */
+    public static void shutdown() {
+        shuttingDown = true;
+    }
+
+    /** Idle-eviction TTL; {@code TimeValue.ZERO} disables eviction (files kept forever). */
+    public static void setTtl(TimeValue ttl) {
+        ttlMillis = ttl.millis();
+    }
+
+    /** Cap on concurrent from-scratch builds (dynamic cluster setting). */
+    public static void setMaxConcurrentBuilds(int max) {
+        BUILD_PERMITS.resize(max);
+    }
+
+    /** Node data roots so the sweeper can find every shard's ords dir, incl. never-queried ones. */
+    public static void setDataRoots(Path[] roots) {
+        // Null can only mean the caller forgot to pass the node's data paths — fail at startup
+        // rather than accept it and silently disable the cold-file sweep.
+        dataRoots = Objects.requireNonNull(roots, "data roots must not be null").clone();
+    }
+
+    /**
+     * Acquires the uninverted ordinals for {@code field}, building or re-mapping on first use.
+     * Returns {@code null} when the segment lacks a core cache identity or a terms index.
+     */
+    static Lease acquire(LeafReader leaf, SegmentInfo segmentInfo, String field, long expectedNonNullDocs) throws IOException {
+        IndexReader.CacheHelper segmentCore = leaf.getCoreCacheHelper();
+        Terms terms = leaf.terms(field);
+        if (segmentCore == null || terms == null) {
+            return null;
+        }
+        Object segmentCoreKey = segmentCore.getKey();
+        if (INELIGIBLE.getOrDefault(segmentCoreKey, Set.of()).contains(field)) {
+            return null;
+        }
+        Map<String, FieldOrdinalsEntry> perSegment = ORDINALS_BY_SEGMENT.computeIfAbsent(segmentCoreKey, k -> {
+            segmentCore.addClosedListener(closedKey -> {
+                // Core close happens after Lucene retires the reader, so no live leases remain.
+                INELIGIBLE.remove(closedKey);
+                Map<String, FieldOrdinalsEntry> removed = ORDINALS_BY_SEGMENT.remove(closedKey);
+                if (removed != null) {
+                    for (FieldOrdinalsEntry entry : removed.values()) {
+                        FILE_LOCKS.remove(entry.fileName());
+                        try {
+                            entry.ords.close();
+                        } catch (IOException e) {
+                            // Segment is going away; nothing actionable.
+                        }
+                    }
+                }
+            });
+            return new ConcurrentHashMap<>();
+        });
+
+        Lease lease = leaseExistingEntry(perSegment, field);
+        if (lease != null) {
+            return lease;
+        }
+        String fileKey = StringHelper.idToString(segmentInfo.getId()) + "-" + field;
+        synchronized (fileLock(OrdFilePaths.ordFileName(fileKey))) {
+            // Re-check under the lock: another query may have built the entry while we waited.
+            lease = leaseExistingEntry(perSegment, field);
+            if (lease != null) {
+                return lease;
+            }
+            return loadOrBuildOrdinals(perSegment, segmentInfo, segmentCoreKey, field, fileKey, terms, leaf.maxDoc(), expectedNonNullDocs);
+        }
+    }
+
+    /**
+     * Leases the field's existing entry; {@code null} when the field has none. An entry the
+     * sweeper evicted between our map read and the lease attempt is unlinked (only if still
+     * mapped, never displacing a newer entry) so the caller can proceed to build fresh.
+     */
+    private static Lease leaseExistingEntry(Map<String, FieldOrdinalsEntry> perSegment, String field) {
+        FieldOrdinalsEntry existing = perSegment.get(field);
+        if (existing == null) {
+            return null;
+        }
+        Lease lease = existing.tryAcquire();
+        if (lease != null) {
+            existing.persistLastUsedTimeIfDue(System.currentTimeMillis());
+            return lease;
+        }
+        perSegment.remove(field, existing);
+        return null;
+    }
+
+    /**
+     * Loads the ord file, or builds it from postings under a build permit, then caches the entry
+     * and returns its first lease. Must run under the file's lock. Returns {@code null} on
+     * refusal: permanent refusals (no filesystem dir, failed verification) latch the field
+     * ineligible; an interrupted permit wait does not latch and the next query retries.
+     */
+    private static Lease loadOrBuildOrdinals(
+        Map<String, FieldOrdinalsEntry> perSegment,
+        SegmentInfo segmentInfo,
+        Object segmentCoreKey,
+        String field,
+        String fileKey,
+        Terms terms,
+        int maxDoc,
+        long expectedNonNullDocs
+    ) throws IOException {
+        try {
+            Path ordsDir = OrdFilePaths.resolveOrdsDir(segmentInfo.dir);
+            if (ordsDir == null) {
+                LOGGER.warn(
+                    "refusing uninverted ordinals for field [{}]: segment directory [{}] is not filesystem-backed",
+                    field,
+                    segmentInfo.dir.getClass().getName()
+                );
+                latchIneligible(segmentCoreKey, field);
+                return null;
+            }
+            OrdFilePaths.prepareDir(ordsDir);
+            // Cheap path first: an existing usable file is just memory-mapped — no permit. load()
+            // deletes an invalid leftover (crashed process, stale layout) and returns null, which
+            // sends us to the build path like any other cold field.
+            UninvertedOrdinals built = UninvertedOrdinals.load(ordsDir, fileKey, terms, maxDoc, expectedNonNullDocs);
+            if (built == null) {
+                // From-scratch build: bounded node-wide, each holds a maxDoc×bits buffer.
+                BUILD_PERMITS.acquire();
+                try {
+                    built = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        terms,
+                        maxDoc,
+                        expectedNonNullDocs,
+                        () -> shuttingDown || Thread.currentThread().isInterrupted()
+                    );
+                } finally {
+                    BUILD_PERMITS.release();
+                }
+            }
+            FieldOrdinalsEntry entry = new FieldOrdinalsEntry(built, ordsDir.resolve(OrdFilePaths.ordFileName(fileKey)));
+            Lease lease = entry.tryAcquire();
+            if (lease == null) {
+                throw new IllegalStateException("new uninverted ordinals entry unexpectedly unavailable");
+            }
+            perSegment.put(field, entry);
+            return lease;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.warn("interrupted waiting for a build permit for field [{}]", field);
+            return null; // transient: not latched, the next query retries
+        } catch (IllegalStateException e) {
+            LOGGER.warn("refusing uninverted ordinals for field [{}]: {}", field, e.getMessage());
+            latchIneligible(segmentCoreKey, field);
+            return null;
+        }
+    }
+
+    /** Permanently refuses ordinals for the field on this segment core; cleared when the core closes. */
+    private static void latchIneligible(Object segmentCoreKey, String field) {
+        INELIGIBLE.computeIfAbsent(segmentCoreKey, k -> ConcurrentHashMap.newKeySet()).add(field);
+    }
+
+    /** Runs one TTL eviction pass; scheduled by the plugin every few minutes. */
+    public static void sweepExpiredOrdinals() {
+        sweepExpiredOrdinals(System.currentTimeMillis());
+    }
+
+    /**
+     * Deletes ord files unused for longer than the TTL ({@code 0} = keep forever). In-use files
+     * are protected by the lease refcount ({@link FieldOrdinalsEntry#tryMarkEvicted}); deletions run
+     * under the file's mutation lock so they can never race a concurrent build or load.
+     */
+    // package-private overload for deterministic tests
+    static void sweepExpiredOrdinals(long now) {
+        long ttl = ttlMillis;
+        if (ttl <= 0) {
+            return;
+        }
+        evictIdleEntriesInCache(now, ttl);
+        deleteExpiredFilesOnDisk(now, ttl);
+    }
+
+    /**
+     * Evicts cache entries idle longer than the TTL: close the memory-map, then delete the file.
+     * The in-memory last-used time (refreshed on every lease) is the idleness clock. Entries a
+     * query is using are skipped and retried next pass.
+     */
+    private static void evictIdleEntriesInCache(long now, long ttl) {
+        for (Map<String, FieldOrdinalsEntry> perSegment : ORDINALS_BY_SEGMENT.values()) {
+            for (Map.Entry<String, FieldOrdinalsEntry> fieldEntry : perSegment.entrySet()) {
+                FieldOrdinalsEntry entry = fieldEntry.getValue();
+                if (now - entry.lastUsedMillis() <= ttl) {
+                    continue;
+                }
+                synchronized (fileLock(entry.fileName())) {
+                    if (entry.tryMarkEvicted() == false) {
+                        continue; // a query holds a lease — untouchable, retry next pass
+                    }
+                    perSegment.remove(fieldEntry.getKey(), entry);
+                    try {
+                        entry.ords.close();
+                    } catch (IOException e) {
+                        LOGGER.debug("failed closing evicted ords [{}]: {}", entry.fileName(), e.getMessage());
+                    }
+                    try {
+                        if (Files.deleteIfExists(entry.file)) {
+                            LOGGER.info("evicted idle ord file [{}] (unused for {} ms)", entry.fileName(), now - entry.lastUsedMillis());
+                        }
+                    } catch (IOException e) {
+                        LOGGER.debug("failed deleting evicted ord file [{}]: {}", entry.fileName(), e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Deletes ord files with no cache entry — orphans of merged-away segments and files of
+     * shards never queried since restart — judged by last-modified time. Walks every
+     * {@code <dataRoot>/nodes/0/indices/<indexUuid>/<shard>/parquet-ords}.
+     */
+    private static void deleteExpiredFilesOnDisk(long now, long ttl) {
+        OrdFilePaths.forEachOrdFile(dataRoots, file -> {
+            if (now - OrdFilePaths.lastModifiedMillis(file) <= ttl) {
+                return;
+            }
+            String name = file.getFileName().toString();
+            // Same lock as acquire's build/load: a query loading this file and this delete cannot interleave.
+            synchronized (fileLock(name)) {
+                // Re-check under the lock: a concurrent acquire may have just loaded it.
+                if (isFileCached(name)) {
+                    return;
+                }
+                try {
+                    if (Files.deleteIfExists(file)) {
+                        LOGGER.info("evicted cold ord file [{}] (not used for longer than the ttl)", name);
+                    }
+                } catch (IOException e) {
+                    LOGGER.debug("failed deleting cold ord file [{}]: {}", name, e.getMessage());
+                }
+            }
+        });
+    }
+
+    /** The per-file mutation lock: build, load, and delete of one ord file serialize on this. */
+    private static Object fileLock(String fileName) {
+        return FILE_LOCKS.computeIfAbsent(fileName, k -> new Object());
+    }
+
+    private static boolean isFileCached(String fileName) {
+        for (Map<String, FieldOrdinalsEntry> perSegment : ORDINALS_BY_SEGMENT.values()) {
+            for (FieldOrdinalsEntry entry : perSegment.values()) {
+                if (entry.fileName().equals(fileName)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Request-scoped handle that keeps a cache entry in-use until the reader closes. */
+    static final class Lease implements AutoCloseable {
+        private final FieldOrdinalsEntry entry;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private Lease(FieldOrdinalsEntry entry) {
+            this.entry = entry;
+        }
+
+        UninvertedOrdinals ordinals() {
+            return entry.ords;
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                entry.release();
+            }
+        }
+    }
+
+    private static final class FieldOrdinalsEntry {
         private final UninvertedOrdinals ords;
+        private final Path file;
         private volatile long lastUsedMillis;
+        private volatile long lastTouchMillis;
         private int inUse;
         private boolean evicted;
 
-        private CacheEntry(UninvertedOrdinals ords) {
+        private FieldOrdinalsEntry(UninvertedOrdinals ords, Path file) {
             this.ords = ords;
+            this.file = file;
             this.lastUsedMillis = System.currentTimeMillis();
+            this.lastTouchMillis = this.lastUsedMillis;
         }
 
         private synchronized Lease tryAcquire() {
@@ -95,6 +406,24 @@ public final class UninvertedOrdinalsCache {
             return true;
         }
 
+        /**
+         * Refreshes the file's last-modified time so idleness survives restarts (in-memory
+         * {@code lastUsedMillis} is lost with the process; the sweeper's cold-file phase reads
+         * the file's last-modified time instead).
+         * At most one metadata write per {@link #LAST_USED_PERSIST_INTERVAL_MILLIS}.
+         */
+        private void persistLastUsedTimeIfDue(long now) {
+            if (now - lastTouchMillis < LAST_USED_PERSIST_INTERVAL_MILLIS) {
+                return;
+            }
+            lastTouchMillis = now;
+            try {
+                Files.setLastModifiedTime(file, FileTime.fromMillis(now));
+            } catch (IOException e) {
+                LOGGER.debug("failed touching ord file [{}]: {}", file.getFileName(), e.getMessage());
+            }
+        }
+
         private String fileName() {
             return ords.fileName();
         }
@@ -104,395 +433,24 @@ public final class UninvertedOrdinalsCache {
         }
     }
 
-    private static final class CacheLocation {
-        private final Map<String, CacheEntry> owner;
-        private final String field;
-        private final CacheEntry entry;
+    /** Semaphore whose permit count can follow a dynamic cluster setting. */
+    private static final class ResizableSemaphore extends Semaphore {
+        /** Configured capacity — tracked here because {@link #availablePermits()} only reports
+         * currently-free permits, which is the wrong baseline for resizing mid-build. */
+        private int capacity;
 
-        private CacheLocation(Map<String, CacheEntry> owner, String field, CacheEntry entry) {
-            this.owner = owner;
-            this.field = field;
-            this.entry = entry;
-        }
-    }
-
-    private static final class EvictionCandidate {
-        private final Path path;
-        private final String fileName;
-        private final long sizeInBytes;
-        private final long lastUsedMillis;
-        private final CacheLocation cached;
-
-        private EvictionCandidate(Path path, String fileName, long sizeInBytes, long lastUsedMillis, CacheLocation cached) {
-            this.path = path;
-            this.fileName = fileName;
-            this.sizeInBytes = sizeInBytes;
-            this.lastUsedMillis = lastUsedMillis;
-            this.cached = cached;
-        }
-    }
-
-    /** Request-scoped handle that keeps a cache entry in-use until the reader closes. */
-    static final class Lease implements AutoCloseable {
-        private final CacheEntry entry;
-        private final AtomicBoolean closed = new AtomicBoolean();
-
-        private Lease(CacheEntry entry) {
-            this.entry = entry;
+        ResizableSemaphore(int permits) {
+            super(permits, true); // fair: cold queries acquire build capacity in arrival order
+            this.capacity = permits;
         }
 
-        UninvertedOrdinals ordinals() {
-            return entry.ords;
-        }
-
-        @Override
-        public void close() {
-            if (closed.compareAndSet(false, true)) {
-                entry.release();
+        synchronized void resize(int newSize) {
+            if (newSize > capacity) {
+                release(newSize - capacity);
+            } else if (newSize < capacity) {
+                reducePermits(capacity - newSize);
             }
-        }
-    }
-
-    /**
-     * Called once at plugin init: wipes the pre-move node-global directory (its files are
-     * unreachable derived data; they rebuild on demand at the per-shard location).
-     */
-    public static void setOrdsDir(Path legacyDir) {
-        shuttingDown = false;
-        wipeLegacyDir(legacyDir);
-    }
-
-    /** Called at plugin close: aborts in-flight builds so node shutdown is not held hostage. */
-    public static void shutdown() {
-        shuttingDown = true;
-    }
-
-    /**
-     * The segment's ord-file directory: {@code parquet-ords} beside the shard's store (like the
-     * translog — never inside the store, whose unknown files recovery deletes). {@code null} when
-     * the directory is not filesystem-backed: no shard folder to place or budget files in.
-     */
-    static Path resolveOrdsDir(org.apache.lucene.store.Directory directory) {
-        org.apache.lucene.store.Directory unwrapped = org.apache.lucene.store.FilterDirectory.unwrap(directory);
-        if (unwrapped instanceof org.apache.lucene.store.FSDirectory) {
-            Path storeDir = ((org.apache.lucene.store.FSDirectory) unwrapped).getDirectory();
-            Path shardDir = storeDir.getParent();
-            if (shardDir != null) {
-                return shardDir.resolve(ORDS_DIR_NAME);
-            }
-        }
-        return null;
-    }
-
-    /** Creates the directory and sweeps stale {@code .tmp} files, once per process lifetime. */
-    private static void prepareDir(Path ordsDir) throws IOException {
-        if (PREPARED_DIRS.add(ordsDir) == false) {
-            return;
-        }
-        Files.createDirectories(ordsDir);
-        try (Stream<Path> listing = Files.list(ordsDir)) {
-            for (Path file : (Iterable<Path>) listing::iterator) {
-                if (file.getFileName().toString().endsWith(".tmp")) {
-                    Files.deleteIfExists(file);
-                }
-            }
-        }
-    }
-
-    /**
-     * Builds ordinals, retrying once (after deleting the file) when verification fails on a
-     * PRE-EXISTING file — it may be stale from a crashed process. A failure on a fresh build is
-     * genuine (unindexed stored values) and latches the field ineligible.
-     */
-    private static UninvertedOrdinals buildWithRetry(Path ordsDir, String fileKey, Terms terms, int maxDoc, long expectedNonNullDocs)
-        throws IOException {
-        String fileName = "parquet-ords-" + fileKey + ".ord";
-        boolean preExisting = Files.exists(ordsDir.resolve(fileName));
-        try {
-            return UninvertedOrdinals.build(
-                ordsDir,
-                fileKey,
-                terms,
-                maxDoc,
-                expectedNonNullDocs,
-                () -> shuttingDown || Thread.currentThread().isInterrupted()
-            );
-        } catch (IllegalStateException e) {
-            if (preExisting == false) {
-                throw e;
-            }
-            LOGGER.warn("ord file [{}] failed verification ({}); deleting and rebuilding once", fileName, e.getMessage());
-            Files.deleteIfExists(ordsDir.resolve(fileName));
-            return UninvertedOrdinals.build(
-                ordsDir,
-                fileKey,
-                terms,
-                maxDoc,
-                expectedNonNullDocs,
-                () -> shuttingDown || Thread.currentThread().isInterrupted()
-            );
-        }
-    }
-
-    private static long evictionTargetBytes(long budget) {
-        return Math.min(budget, (long) Math.floor(budget * EVICTION_WATERMARK_FRACTION));
-    }
-
-    private static long fileLastUsedMillis(Path file) {
-        try {
-            return Files.getLastModifiedTime(file).toMillis();
-        } catch (IOException e) {
-            return Long.MAX_VALUE;
-        }
-    }
-
-    /** Removes ord and tmp files from the pre-move node-global directory; nothing reads them now. */
-    private static void wipeLegacyDir(Path dir) {
-        try (Stream<Path> listing = Files.list(dir)) {
-            for (Path file : (Iterable<Path>) listing::iterator) {
-                String name = file.getFileName().toString();
-                if (name.endsWith(".ord") || name.endsWith(".tmp")) {
-                    if (Files.deleteIfExists(file)) {
-                        LOGGER.info("removed legacy ord file [{}] (ord files now live beside each shard's store)", name);
-                    }
-                }
-            }
-        } catch (NoSuchFileException e) {
-            // nothing to migrate
-        } catch (IOException e) {
-            LOGGER.warn("legacy ords directory cleanup failed for [{}]: {}", dir, e.getMessage());
-        }
-    }
-
-    /** Transient refusal: budget can be raised or freed, so it is never latched as INELIGIBLE. */
-    private static final class BudgetExceededException extends IllegalStateException {
-        BudgetExceededException(String message) {
-            super(message);
-        }
-    }
-
-    /**
-     * Keeps a shard's ords directory within {@code max_disk_percent} of that shard's store size.
-     * Over budget: evict least-recently-used unpinned files down to the watermark; if it still
-     * does not fit, refuse the build (transient). No-op when the store size is unknowable.
-     */
-    private static void enforceDiskBudget(Path ordsDir, String fileKey, Terms terms, int maxDoc) throws IOException {
-        String fileName = "parquet-ords-" + fileKey + ".ord";
-        if (Files.exists(ordsDir.resolve(fileName))) {
-            return;
-        }
-        long storeBytes = shardStoreBytes(ordsDir);
-        if (storeBytes < 0) {
-            return; // fallback dir or unreadable store: no meaningful base, do not refuse
-        }
-        double percent = ParquetDocValuesProducer.uninvertMaxDiskPercent();
-        long budget = (long) (storeBytes * percent / 100.0d);
-        if (percent > 0) {
-            // A percentage of a small shard can be less than one .ord file's fixed overhead
-            // (~1 KiB header/trailer/checkpoints), which would refuse every build on small
-            // indices. Floor the budget so any non-zero percent admits at least a few files;
-            // percent == 0 remains an explicit "no ordinals" switch.
-            budget = Math.max(budget, MIN_BUDGET_BYTES);
-        }
-        long estimate = UninvertedOrdinals.estimatedDiskBytes(Math.max(terms.size(), 0), maxDoc);
-        long used = 0;
-        long target = evictionTargetBytes(budget);
-
-        Map<String, CacheLocation> cachedFiles = new HashMap<>();
-        for (Map<String, CacheEntry> perSegment : CACHE.values()) {
-            for (Map.Entry<String, CacheEntry> fieldEntry : perSegment.entrySet()) {
-                CacheEntry entry = fieldEntry.getValue();
-                cachedFiles.put(entry.fileName(), new CacheLocation(perSegment, fieldEntry.getKey(), entry));
-            }
-        }
-
-        List<EvictionCandidate> candidates = new ArrayList<>();
-        try (Stream<Path> listing = Files.list(ordsDir)) {
-            for (Path file : (Iterable<Path>) listing::iterator) {
-                long size = Files.size(file);
-                used += size;
-                String candidateName = file.getFileName().toString();
-                CacheLocation cached = cachedFiles.get(candidateName);
-                long lastUsedMillis = cached != null ? cached.entry.lastUsedMillis() : fileLastUsedMillis(file);
-                candidates.add(new EvictionCandidate(file, candidateName, size, lastUsedMillis, cached));
-            }
-        } catch (NoSuchFileException e) {
-            return;
-        }
-
-        if (used + estimate <= budget) {
-            return;
-        }
-
-        candidates.sort(Comparator.comparingLong(candidate -> candidate.lastUsedMillis));
-        for (EvictionCandidate victim : candidates) {
-            if (used + estimate <= target) {
-                break;
-            }
-            if (victim.cached != null) {
-                if (victim.cached.entry.tryMarkEvicted() == false) {
-                    continue;
-                }
-                victim.cached.owner.remove(victim.cached.field, victim.cached.entry);
-                try {
-                    victim.cached.entry.ords.close();
-                } catch (IOException e) {
-                    LOGGER.debug("failed closing evicted ords [{}]: {}", victim.fileName, e.getMessage());
-                }
-            }
-            try {
-                if (Files.deleteIfExists(victim.path)) {
-                    used -= victim.sizeInBytes;
-                    LOGGER.info("reclaimed ord file [{}] to satisfy disk budget", victim.fileName);
-                }
-            } catch (IOException e) {
-                LOGGER.debug("failed reclaiming ord file [{}]: {}", victim.fileName, e.getMessage());
-            }
-        }
-
-        if (used + estimate > budget) {
-            throw new BudgetExceededException(
-                "uninverted ordinals disk budget exceeded for shard: "
-                    + used
-                    + "B used + "
-                    + estimate
-                    + "B needed > "
-                    + budget
-                    + "B ("
-                    + ParquetDocValuesProducer.uninvertMaxDiskPercent()
-                    + "% of "
-                    + storeBytes
-                    + "B shard store; parquet.docvalues.uninvert.max_disk_percent)"
-            );
-        }
-    }
-
-    /**
-     * Shard store bytes: everything under the ords dir's parent except the ords dir and the
-     * translog. Returns {@code -1} when unknowable (no parent, or walk failure) — callers treat
-     * that as "budget not enforceable".
-     */
-    // package-private for tests
-    static long shardStoreBytes(Path ordsDir) {
-        Path shardDir = ordsDir.getParent();
-        if (shardDir == null || Files.isDirectory(shardDir) == false) {
-            return -1;
-        }
-        long[] total = { 0 };
-        try {
-            Files.walkFileTree(shardDir, new SimpleFileVisitor<>() {
-                @Override
-                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                    if (dir.equals(ordsDir) || dir.getFileName().toString().equals("translog")) {
-                        return FileVisitResult.SKIP_SUBTREE;
-                    }
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    total[0] += attrs.size();
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                    return FileVisitResult.CONTINUE; // file vanished mid-walk (merge, delete): skip
-                }
-            });
-        } catch (IOException e) {
-            LOGGER.debug("failed sizing shard store beside [{}]: {}", ordsDir, e.getMessage());
-            return -1;
-        }
-        return total[0];
-    }
-
-    /**
-     * Acquires the uninverted ordinals for {@code field}, building or re-mapping on first use.
-     * Returns {@code null} when the segment lacks a core cache identity or a terms index.
-     */
-    static Lease acquire(LeafReader leaf, SegmentInfo segmentInfo, String field, long expectedNonNullDocs) throws IOException {
-        IndexReader.CacheHelper helper = leaf.getCoreCacheHelper();
-        Terms terms = leaf.terms(field);
-        if (helper == null || terms == null) {
-            return null;
-        }
-        Object key = helper.getKey();
-        Set<String> ineligible = INELIGIBLE.get(key);
-        if (ineligible != null && ineligible.contains(field)) {
-            return null;
-        }
-        Map<String, CacheEntry> perSegment = CACHE.computeIfAbsent(key, k -> {
-            helper.addClosedListener(closedKey -> {
-                // Core close happens after Lucene retires the reader, so no live leases remain.
-                INELIGIBLE.remove(closedKey);
-                Map<String, CacheEntry> removed = CACHE.remove(closedKey);
-                if (removed != null) {
-                    for (CacheEntry entry : removed.values()) {
-                        try {
-                            entry.ords.close();
-                        } catch (IOException e) {
-                            // Segment is going away; nothing actionable.
-                        }
-                    }
-                }
-            });
-            return new ConcurrentHashMap<>();
-        });
-
-        for (;;) {
-            CacheEntry cached = perSegment.get(field);
-            if (cached != null) {
-                Lease lease = cached.tryAcquire();
-                if (lease != null) {
-                    return lease;
-                }
-                perSegment.remove(field, cached);
-                continue;
-            }
-            synchronized (BUILD_LOCK) {
-                cached = perSegment.get(field);
-                if (cached != null) {
-                    Lease lease = cached.tryAcquire();
-                    if (lease != null) {
-                        return lease;
-                    }
-                    perSegment.remove(field, cached);
-                    continue;
-                }
-                String fileKey = StringHelper.idToString(segmentInfo.getId()) + "-" + field;
-                try {
-                    Path ordsDir = resolveOrdsDir(segmentInfo.dir);
-                    if (ordsDir == null) {
-                        // No filesystem shard folder: permanent for this segment, latch like a
-                        // coverage failure; the field is served by the streaming path.
-                        LOGGER.warn(
-                            "refusing uninverted ordinals for field [{}]: segment directory [{}] is not filesystem-backed",
-                            field,
-                            segmentInfo.dir.getClass().getName()
-                        );
-                        INELIGIBLE.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(field);
-                        return null;
-                    }
-                    prepareDir(ordsDir);
-                    enforceDiskBudget(ordsDir, fileKey, terms, leaf.maxDoc());
-                    UninvertedOrdinals built = buildWithRetry(ordsDir, fileKey, terms, leaf.maxDoc(), expectedNonNullDocs);
-                    CacheEntry entry = new CacheEntry(built);
-                    Lease lease = entry.tryAcquire();
-                    if (lease == null) {
-                        throw new IllegalStateException("new uninverted ordinals entry unexpectedly unavailable");
-                    }
-                    perSegment.put(field, entry);
-                    return lease;
-                } catch (BudgetExceededException e) {
-                    LOGGER.warn("refusing uninverted ordinals for field [{}]: {}", field, e.getMessage());
-                    return null;
-                } catch (IllegalStateException e) {
-                    LOGGER.warn("refusing uninverted ordinals for field [{}]: {}", field, e.getMessage());
-                    INELIGIBLE.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(field);
-                    return null;
-                }
-            }
+            capacity = newSize;
         }
     }
 }

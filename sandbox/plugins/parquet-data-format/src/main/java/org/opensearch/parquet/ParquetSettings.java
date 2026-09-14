@@ -17,6 +17,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.mapper.Mapper;
@@ -248,17 +249,29 @@ public final class ParquetSettings {
     );
 
     /**
-     * Disk budget for a shard's uninverted-ordinal (.ord) files, as a percentage of that shard's
-     * on-disk store size (Lucene sidecar + Parquet data, excluding the ord files themselves and
-     * the translog). The budget scales with the data: a shard holding 30 GiB may use up to
-     * 3 GiB of ord files at the default. When a new build would exceed it, unreferenced ord
-     * files of that shard are reclaimed oldest-first; if it still does not fit, the tier is
-     * refused for that field (consumers fall back to the streaming path).
+     * Idle time after which an unused uninverted-ordinal (.ord) file is deleted by the periodic
+     * sweeper. Files in active use are never deleted (protected by the lease refcount), and any
+     * use refreshes the clock, so regularly queried fields never expire. {@code 0} disables
+     * eviction entirely: files are kept forever and removed only with their shard.
      */
-    public static final Setting<Double> DOCVALUES_UNINVERT_MAX_DISK_PERCENT = Setting.doubleSetting(
-        "parquet.docvalues.uninvert.max_disk_percent",
-        10.0,
-        0.0,
+    public static final Setting<TimeValue> DOCVALUES_UNINVERT_TTL = Setting.timeSetting(
+        "parquet.docvalues.uninvert.ttl",
+        TimeValue.timeValueDays(7),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Maximum concurrent from-scratch uninverted-ordinal builds node-wide. Each in-flight build
+     * holds a transient packed buffer of {@code maxDoc × bits} heap (~287 MB on a 100M-doc
+     * segment), so parallelism is capped. Loads of existing .ord files and cache hits are not
+     * limited by this.
+     */
+    public static final Setting<Integer> DOCVALUES_UNINVERT_MAX_CONCURRENT_BUILDS = Setting.intSetting(
+        "parquet.docvalues.uninvert.max_concurrent_builds",
+        2,
+        1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -1009,7 +1022,8 @@ public final class ParquetSettings {
             DOCVALUES_INITIAL_BATCH_SIZE,
             DOCVALUES_DIAGNOSTICS,
             DOCVALUES_CHECKPOINT_INTERVAL,
-            DOCVALUES_UNINVERT_MAX_DISK_PERCENT,
+            DOCVALUES_UNINVERT_TTL,
+            DOCVALUES_UNINVERT_MAX_CONCURRENT_BUILDS,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,
             WRITE_POOL_MAX,
