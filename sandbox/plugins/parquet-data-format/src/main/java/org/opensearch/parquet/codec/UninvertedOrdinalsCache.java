@@ -23,7 +23,6 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,7 +38,6 @@ public final class UninvertedOrdinalsCache {
     private static final Logger LOGGER = LogManager.getLogger(UninvertedOrdinalsCache.class);
 
     /** Marks a (segment, field) whose ordinals failed coverage verification — do not retry. */
-    private static final Map<Object, Set<String>> INELIGIBLE = new ConcurrentHashMap<>();
 
     /** Loaded ordinals by segment core segmentCoreKey, then field name; entries are removed when the segment core closes. */
     private static final Map<Object, Map<String, FieldOrdinalsEntry>> ORDINALS_BY_SEGMENT = new ConcurrentHashMap<>();
@@ -120,13 +118,9 @@ public final class UninvertedOrdinalsCache {
             return null;
         }
         Object segmentCoreKey = segmentCore.getKey();
-        if (INELIGIBLE.getOrDefault(segmentCoreKey, Set.of()).contains(field)) {
-            return null;
-        }
         Map<String, FieldOrdinalsEntry> perSegment = ORDINALS_BY_SEGMENT.computeIfAbsent(segmentCoreKey, k -> {
             segmentCore.addClosedListener(closedKey -> {
                 // Core close happens after Lucene retires the reader, so no live leases remain.
-                INELIGIBLE.remove(closedKey);
                 Map<String, FieldOrdinalsEntry> removed = ORDINALS_BY_SEGMENT.remove(closedKey);
                 if (removed != null) {
                     for (FieldOrdinalsEntry entry : removed.values()) {
@@ -178,9 +172,10 @@ public final class UninvertedOrdinalsCache {
 
     /**
      * Loads the ord file, or builds it from postings under a build permit, then caches the entry
-     * and returns its first lease. Must run under the file's lock. Returns {@code null} on
-     * refusal: permanent refusals (no filesystem dir, failed verification) latch the field
-     * ineligible; an interrupted permit wait does not latch and the next query retries.
+     * and returns its first lease. Must run under the file's lock. Returns {@code null} only when
+     * the segment directory is not filesystem-backed (ordinals unavailable in this environment).
+     * Verification failures propagate and fail the query: a file that cannot be built correctly
+     * is an integrity problem to surface, not a condition to hide.
      */
     private static Lease loadOrBuildOrdinals(
         Map<String, FieldOrdinalsEntry> perSegment,
@@ -200,7 +195,6 @@ public final class UninvertedOrdinalsCache {
                     field,
                     segmentInfo.dir.getClass().getName()
                 );
-                latchIneligible(segmentCoreKey, field);
                 return null;
             }
             OrdFilePaths.prepareDir(ordsDir);
@@ -233,18 +227,8 @@ public final class UninvertedOrdinalsCache {
             return lease;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            LOGGER.warn("interrupted waiting for a build permit for field [{}]", field);
-            return null; // transient: not latched, the next query retries
-        } catch (IllegalStateException e) {
-            LOGGER.warn("refusing uninverted ordinals for field [{}]: {}", field, e.getMessage());
-            latchIneligible(segmentCoreKey, field);
-            return null;
+            throw new IOException("interrupted waiting for a build permit for field [" + field + "]", e);
         }
-    }
-
-    /** Permanently refuses ordinals for the field on this segment core; cleared when the core closes. */
-    private static void latchIneligible(Object segmentCoreKey, String field) {
-        INELIGIBLE.computeIfAbsent(segmentCoreKey, k -> ConcurrentHashMap.newKeySet()).add(field);
     }
 
     /** Runs one TTL eviction pass; scheduled by the plugin every few minutes. */
