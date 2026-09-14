@@ -8,6 +8,8 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.StoredFieldsReader;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
@@ -82,6 +84,8 @@ import java.util.Map;
  * layer still synthesizes {@code _source} from doc values on top of it.
  */
 public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeafReader {
+
+    private static final Logger LOGGER = LogManager.getLogger(ParquetDocValuesLeafReader.class);
 
     private final MapperService mapperService;
 
@@ -448,6 +452,7 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         lease = UninvertedOrdinalsCache.acquire(in, segmentReadState.segmentInfo, field, expectedNonNullDocs);
         if (lease != null) {
             uninvertedOrdinalsLeases.put(field, lease);
+            LOGGER.debug("reader {} acquired ordinals lease for [{}]", System.identityHashCode(this), field);
         }
         return lease;
     }
@@ -480,6 +485,7 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * therefore calls this method explicitly before closing its non-closing delegate.
      */
     synchronized void closeParquetResources() throws IOException {
+        LOGGER.debug("reader {} closing, releasing {} ordinals lease(s)", System.identityHashCode(this), uninvertedOrdinalsLeases.size());
         for (UninvertedOrdinalsCache.Lease lease : uninvertedOrdinalsLeases.values()) {
             lease.close();
         }
