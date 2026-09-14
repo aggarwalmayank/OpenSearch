@@ -263,6 +263,17 @@ public final class ParquetSettings {
     );
 
     /**
+     * How often the sweeper checks for expired uninverted-ordinal files. Node-scoped and
+     * startup-only; the default suits production, shorter values make TTL tests faster.
+     */
+    public static final Setting<TimeValue> DOCVALUES_UNINVERT_SWEEP_INTERVAL = Setting.timeSetting(
+        "parquet.docvalues.uninvert.sweep_interval",
+        TimeValue.timeValueMinutes(5),
+        TimeValue.timeValueSeconds(1),
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Maximum concurrent from-scratch uninverted-ordinal builds node-wide. Each in-flight build
      * holds a transient packed buffer of {@code maxDoc × bits} heap (~287 MB on a 100M-doc
      * segment), so parallelism is capped. Loads of existing .ord files and cache hits are not
@@ -1023,6 +1034,7 @@ public final class ParquetSettings {
             DOCVALUES_DIAGNOSTICS,
             DOCVALUES_CHECKPOINT_INTERVAL,
             DOCVALUES_UNINVERT_TTL,
+            DOCVALUES_UNINVERT_SWEEP_INTERVAL,
             DOCVALUES_UNINVERT_MAX_CONCURRENT_BUILDS,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,

@@ -377,6 +377,7 @@ public final class UninvertedOrdinalsCache {
             }
             inUse++;
             lastUsedMillis = System.currentTimeMillis();
+            LOGGER.debug("lease acquired [{}] inUse={} thread={}", ords.fileName(), inUse, Thread.currentThread().getName());
             return new Lease(this);
         }
 
@@ -386,6 +387,7 @@ public final class UninvertedOrdinalsCache {
             }
             inUse--;
             lastUsedMillis = System.currentTimeMillis();
+            LOGGER.debug("lease released [{}] inUse={} thread={}", ords.fileName(), inUse, Thread.currentThread().getName());
         }
 
         private synchronized int leasesHeld() {

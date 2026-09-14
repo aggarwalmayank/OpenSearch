@@ -21,7 +21,6 @@ import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -159,7 +158,7 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
         // TTL sweeper: fixed cadence, reads the current (dynamic) ttl each pass.
         this.ordSweeper = threadPool.scheduleWithFixedDelay(
             UninvertedOrdinalsCache::sweepExpiredOrdinals,
-            TimeValue.timeValueMinutes(5),
+            ParquetSettings.DOCVALUES_UNINVERT_SWEEP_INTERVAL.get(this.settings),
             ThreadPool.Names.GENERIC
         );
         clusterService.getClusterSettings()
