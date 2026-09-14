@@ -265,7 +265,13 @@ public final class UninvertedOrdinalsCache {
                 }
                 synchronized (fileLock(entry.fileName())) {
                     if (entry.tryMarkEvicted() == false) {
-                        continue; // a query holds a lease — untouchable, retry next pass
+                        int held = entry.leasesHeld();
+                        if (held > 0) {
+                            // Legitimate for a long-running query; repeated across passes it
+                            // means a lease was never released and the entry can never evict.
+                            LOGGER.warn("ord file [{}] is idle past the ttl but held by {} unreleased lease(s)", entry.fileName(), held);
+                        }
+                        continue;
                     }
                     perSegment.remove(fieldEntry.getKey(), entry);
                     try {
@@ -380,6 +386,10 @@ public final class UninvertedOrdinalsCache {
             }
             inUse--;
             lastUsedMillis = System.currentTimeMillis();
+        }
+
+        private synchronized int leasesHeld() {
+            return inUse;
         }
 
         private synchronized boolean tryMarkEvicted() {
