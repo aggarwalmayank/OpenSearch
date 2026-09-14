@@ -401,6 +401,12 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         }
         if (sorted instanceof ParquetSortedDocValues streaming) {
             long expectedNonNull = producer().nonNullRowCount(parquetFieldInfo(field));
+            if (expectedNonNull == 0) {
+                // No document in this segment has a value: empty doc values ARE the correct
+                // ordinals view (zero terms, no matching docs) — nothing exists to uninvert,
+                // and the streaming tier would fail the aggregation at getValueCount.
+                return DocValues.emptySorted();
+            }
             UninvertedOrdinalsCache.Lease lease = acquireUninvertedOrdinalsLease(field, expectedNonNull);
             if (lease != null) {
                 return new ParquetUninvertedSortedDocValues(lease.ordinals(), streaming, maxDoc());
