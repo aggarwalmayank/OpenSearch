@@ -8,8 +8,6 @@
 
 package org.opensearch.parquet.codec;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.StoredFieldsReader;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
@@ -85,8 +83,6 @@ import java.util.Map;
  */
 public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeafReader {
 
-    private static final Logger LOGGER = LogManager.getLogger(ParquetDocValuesLeafReader.class);
-
     private final MapperService mapperService;
 
     /** Lazily constructed Parquet producer for this segment; null until first DV access. */
@@ -98,9 +94,6 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     /** Field name -> synthetic FieldInfo for Parquet-resident DV fields served by this reader. */
     private final Map<String, FieldInfo> parquetFields;
-
-    /** Request-scoped uninverted-ordinal leases keyed by field, released when this reader closes. */
-    private final Map<String, UninvertedOrdinalsCache.Lease> uninvertedOrdinalsLeases = new HashMap<>();
 
     /** The segment read state used to build the producer (captured at construction). */
     private final SegmentReadState segmentReadState;
@@ -411,9 +404,11 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
                 // and the streaming tier would fail the aggregation at getValueCount.
                 return DocValues.emptySorted();
             }
-            UninvertedOrdinalsCache.Lease lease = acquireUninvertedOrdinalsLease(field, expectedNonNull);
+            UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(in, segmentReadState.segmentInfo, field, expectedNonNull);
             if (lease != null) {
-                return new ParquetUninvertedSortedDocValues(lease.ordinals(), streaming, maxDoc());
+                ParquetUninvertedSortedDocValues withOrdinals = new ParquetUninvertedSortedDocValues(lease.ordinals(), streaming, maxDoc());
+                UninvertedOrdinalsCache.releaseWhenUnreachable(withOrdinals, lease);
+                return withOrdinals;
             }
         }
         return sorted;
@@ -436,25 +431,6 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     private boolean supportsSegmentOrdinals(String field) {
         FieldInfo fi = parquetFieldInfo(field);
         return fi != null && fi.getDocValuesType() == DocValuesType.SORTED;
-    }
-
-    /**
-     * Acquires (building on first use) the request-scoped lease on this field's disk-backed
-     * uninverted ordinals, memoized so repeated accessor calls within one search share one lease.
-     * Released in {@link #closeParquetResources()}.
-     */
-    private synchronized UninvertedOrdinalsCache.Lease acquireUninvertedOrdinalsLease(String field, long expectedNonNullDocs)
-        throws IOException {
-        UninvertedOrdinalsCache.Lease lease = uninvertedOrdinalsLeases.get(field);
-        if (lease != null) {
-            return lease;
-        }
-        lease = UninvertedOrdinalsCache.acquire(in, segmentReadState.segmentInfo, field, expectedNonNullDocs);
-        if (lease != null) {
-            uninvertedOrdinalsLeases.put(field, lease);
-            LOGGER.debug("reader {} acquired ordinals lease for [{}]", System.identityHashCode(this), field);
-        }
-        return lease;
     }
 
     @Override
@@ -485,12 +461,6 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      * therefore calls this method explicitly before closing its non-closing delegate.
      */
     synchronized void closeParquetResources() throws IOException {
-        LOGGER.debug("reader {} closing, releasing {} ordinals lease(s)", System.identityHashCode(this), uninvertedOrdinalsLeases.size());
-        for (UninvertedOrdinalsCache.Lease lease : uninvertedOrdinalsLeases.values()) {
-            lease.close();
-        }
-        uninvertedOrdinalsLeases.clear();
-
         IOException first = null;
         try {
             if (producer != null) {

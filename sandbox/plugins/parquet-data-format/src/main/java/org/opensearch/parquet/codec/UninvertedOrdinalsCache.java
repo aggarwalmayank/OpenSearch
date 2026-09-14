@@ -18,6 +18,7 @@ import org.apache.lucene.util.StringHelper;
 import org.opensearch.common.unit.TimeValue;
 
 import java.io.IOException;
+import java.lang.ref.Cleaner;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -38,6 +39,9 @@ public final class UninvertedOrdinalsCache {
     private static final Logger LOGGER = LogManager.getLogger(UninvertedOrdinalsCache.class);
 
     /** Marks a (segment, field) whose ordinals failed coverage verification — do not retry. */
+
+    /** Runs lease releases when their holders are garbage-collected; see releaseWhenUnreachable. */
+    private static final Cleaner UNREACHABLE_LEASE_CLEANER = Cleaner.create();
 
     /** Loaded ordinals by segment core segmentCoreKey, then field name; entries are removed when the segment core closes. */
     private static final Map<Object, Map<String, FieldOrdinalsEntry>> ORDINALS_BY_SEGMENT = new ConcurrentHashMap<>();
@@ -105,6 +109,16 @@ public final class UninvertedOrdinalsCache {
         // Null can only mean the caller forgot to pass the node's data paths — fail at startup
         // rather than accept it and silently disable the cold-file sweep.
         dataRoots = Objects.requireNonNull(roots, "data roots must not be null").clone();
+    }
+
+    /**
+     * Releases {@code lease} when {@code holder} is garbage-collected — i.e. when the query
+     * reading through it has let go of it. Reader close is not a reliable release signal:
+     * OpenSearch's fielddata cache retains leaf readers and reads through them after close.
+     */
+    static void releaseWhenUnreachable(Object holder, Lease lease) {
+        // The action must not reference holder, or it would never become collectable.
+        UNREACHABLE_LEASE_CLEANER.register(holder, lease::close);
     }
 
     /**
