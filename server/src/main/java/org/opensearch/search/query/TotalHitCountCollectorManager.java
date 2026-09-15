@@ -34,23 +34,31 @@ public class TotalHitCountCollectorManager
         CollectorManager<TotalHitCountCollector, ReduceableSearchResult>,
         EarlyTerminatingListener {
 
-    private static final TotalHitCountCollector EMPTY_COLLECTOR = new TotalHitCountCollector() {
-        @Override
-        public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
-            return new LeafCollector() {
-                @Override
-                public void setScorer(Scorable scorer) throws IOException {}
+    /**
+     * A collector that ignores every document. One instance per search: the searcher stores the
+     * per-query {@link org.apache.lucene.search.Weight} into any collector via
+     * {@code setWeight(...)}, so a shared instance would keep the last query's entire search
+     * context reachable for the lifetime of the JVM.
+     */
+    private static TotalHitCountCollector createEmptyCollector() {
+        return new TotalHitCountCollector() {
+            @Override
+            public LeafCollector getLeafCollector(LeafReaderContext context) throws IOException {
+                return new LeafCollector() {
+                    @Override
+                    public void setScorer(Scorable scorer) throws IOException {}
 
-                @Override
-                public void collect(int doc) throws IOException {}
-            };
-        }
+                    @Override
+                    public void collect(int doc) throws IOException {}
+                };
+            }
 
-        @Override
-        public ScoreMode scoreMode() {
-            return ScoreMode.COMPLETE_NO_SCORES;
-        }
-    };
+            @Override
+            public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+            }
+        };
+    }
 
     private final Sort sort;
     private Integer terminatedAfter;
@@ -101,7 +109,7 @@ public class TotalHitCountCollectorManager
 
         @Override
         public TotalHitCountCollector newCollector() throws IOException {
-            return EMPTY_COLLECTOR;
+            return createEmptyCollector();
         }
 
         @Override
