@@ -199,6 +199,112 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         }
     }
 
+    public void testBitFlipInsideOrdinalStreamIsRejectedAndWarned() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "bit-flip";
+        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            addDoc(writer, "beta");
+            addDoc(writer, "gamma");
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 3, () -> false)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+
+                // Flip one bit in the ordinal stream body: header fields stay plausible, only the CRC can catch it.
+                try (RandomAccessFile raf = new RandomAccessFile(ordFile.toFile(), "rw")) {
+                    long bodyOffset = 40; // inside the ordinal stream (fixed header is 37 bytes)
+                    raf.seek(bodyOffset);
+                    int b = raf.read();
+                    raf.seek(bodyOffset);
+                    raf.write(b ^ 0x01);
+                }
+
+                assertNull(
+                    "a bit flip inside the body must be rejected by the checksum",
+                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), 3)
+                );
+                assertFalse("the corrupt file must be deleted so a rebuild can replace it", Files.exists(ordFile));
+            }
+        }
+    }
+
+    public void testTruncatedFileIsRejected() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "truncated";
+        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            addDoc(writer, "beta");
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+
+                try (RandomAccessFile raf = new RandomAccessFile(ordFile.toFile(), "rw")) {
+                    raf.setLength(raf.length() - 5);
+                }
+
+                assertNull("a truncated file must be rejected", UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), 2));
+                assertFalse(Files.exists(ordFile));
+            }
+        }
+    }
+
+    public void testVersion1FileIsRejectedIntoTheRebuildPath() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "old-version";
+        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            addDoc(writer, "beta");
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+
+                // Rewrite the version field to 1: pre-checksum files must be rejected, not misread.
+                try (RandomAccessFile raf = new RandomAccessFile(ordFile.toFile(), "rw")) {
+                    raf.seek(4); // magic
+                    byte[] v1 = { 1, 0, 0, 0 }; // little-endian int 1
+                    raf.write(v1);
+                }
+
+                assertNull(
+                    "a version-1 file must be rejected into the rebuild path",
+                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), 2)
+                );
+                assertFalse(Files.exists(ordFile));
+
+                try (UninvertedOrdinals rebuilt = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                    assertEquals("beta", rebuilt.term(1).utf8ToString());
+                }
+            }
+        }
+    }
+
     private static Terms countingTerms(Terms delegate, AtomicInteger iteratorCalls) {
         return new FilterLeafReader.FilterTerms(delegate) {
             @Override

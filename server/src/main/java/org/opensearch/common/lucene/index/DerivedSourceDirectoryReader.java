@@ -53,7 +53,12 @@ public class DerivedSourceDirectoryReader extends FilterDirectoryReader {
         return new DerivedSourceDirectoryReader(in, new SubReaderWrapper() {
             @Override
             public LeafReader wrap(LeafReader reader) {
-                return new DerivedSourceLeafReader(reader, docID -> sourceProvider.apply(reader, docID));
+                // Deriving one document's source reads a single value per field; readers that build
+                // whole-segment acceleration on first doc-values access offer a cheaper view for that.
+                LeafReader valuesReader = reader instanceof PerDocumentValuesProvider
+                    ? ((PerDocumentValuesProvider) reader).perDocumentValuesReader()
+                    : reader;
+                return new DerivedSourceLeafReader(reader, docID -> sourceProvider.apply(valuesReader, docID));
             }
         }, sourceProvider);
     }

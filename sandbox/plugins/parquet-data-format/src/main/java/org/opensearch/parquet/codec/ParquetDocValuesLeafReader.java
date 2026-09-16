@@ -30,6 +30,7 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.IOContext;
 import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.lucene.index.PerDocumentValuesProvider;
 import org.opensearch.common.lucene.index.SequentialStoredFieldsLeafReader;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -81,7 +82,7 @@ import java.util.Map;
  * passes the underlying segment's stored-fields reader straight through, and the derived-source
  * layer still synthesizes {@code _source} from doc values on top of it.
  */
-public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeafReader {
+public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeafReader implements PerDocumentValuesProvider {
 
     private final MapperService mapperService;
 
@@ -351,10 +352,15 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     @Override
     public SortedDocValues getSortedDocValues(String field) throws IOException {
+        return sortedDocValues(field, true);
+    }
+
+    private SortedDocValues sortedDocValues(String field, boolean buildOrdinals) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null && fi.getDocValuesType() == DocValuesType.SORTED) {
             RowIdResolver resolver = newRowIdResolver();
-            SortedDocValues sorted = withSegmentOrdinals(field, producer().getSorted(fi));
+            SortedDocValues plain = producer().getSorted(fi);
+            SortedDocValues sorted = buildOrdinals ? withSegmentOrdinals(field, plain) : plain;
             return resolver == RowIdResolver.IDENTITY ? sorted : RowIdRemappingDocValues.sorted(sorted, resolver, maxDoc());
         }
         return in.getSortedDocValues(field);
@@ -362,6 +368,10 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     @Override
     public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
+        return sortedSetDocValues(field, true);
+    }
+
+    private SortedSetDocValues sortedSetDocValues(String field, boolean buildOrdinals) throws IOException {
         FieldInfo fi = parquetFieldInfo(field);
         if (fi != null) {
             if (cardinalityOf(field).isSingleValued() == false) {
@@ -382,7 +392,8 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             FieldInfo asSorted = fi.getDocValuesType() == DocValuesType.SORTED
                 ? fi
                 : newDocValuesFieldInfo(field, fi.number, DocValuesType.SORTED, fi.docValuesSkipIndexType());
-            SortedDocValues sorted = withSegmentOrdinals(field, producer().getSorted(asSorted));
+            SortedDocValues plain = producer().getSorted(asSorted);
+            SortedDocValues sorted = buildOrdinals ? withSegmentOrdinals(field, plain) : plain;
             RowIdResolver resolver = newRowIdResolver();
             SortedDocValues remapped = resolver == RowIdResolver.IDENTITY
                 ? sorted
@@ -390,6 +401,31 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             return DocValues.singleton(remapped);
         }
         return in.getSortedSetDocValues(field);
+    }
+
+    @Override
+    public LeafReader perDocumentValuesReader() {
+        return new FilterLeafReader(this) {
+            @Override
+            public SortedDocValues getSortedDocValues(String field) throws IOException {
+                return sortedDocValues(field, false);
+            }
+
+            @Override
+            public SortedSetDocValues getSortedSetDocValues(String field) throws IOException {
+                return sortedSetDocValues(field, false);
+            }
+
+            @Override
+            public CacheHelper getCoreCacheHelper() {
+                return ParquetDocValuesLeafReader.this.getCoreCacheHelper();
+            }
+
+            @Override
+            public CacheHelper getReaderCacheHelper() {
+                return ParquetDocValuesLeafReader.this.getReaderCacheHelper();
+            }
+        };
     }
 
     private SortedDocValues withSegmentOrdinals(String field, SortedDocValues sorted) throws IOException {

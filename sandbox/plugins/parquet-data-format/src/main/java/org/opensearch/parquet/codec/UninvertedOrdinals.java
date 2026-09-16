@@ -8,12 +8,15 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.lucene90.IndexedDISI;
 import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -49,15 +52,20 @@ import java.util.function.BooleanSupplier;
  */
 public final class UninvertedOrdinals implements Closeable {
 
+    private static final Logger LOGGER = LogManager.getLogger(UninvertedOrdinals.class);
+
     private static final int ORD_FILE_MAGIC = 0x504F5244; // "PORD"
-    private static final int ORD_FILE_VERSION = 1;
+    // Version 2 appended a CRC32 of the whole file after the footer magic.
+    private static final int ORD_FILE_VERSION = 2;
     private static final int ORD_FILE_FOOTER_MAGIC = 0x504F5246; // "PORF"
+    private static final int CHECKSUM_BYTES = Long.BYTES;
 
     private static final int BLOCK_SHIFT = 16;
     private static final int BLOCK_SIZE = 1 << BLOCK_SHIFT; // 65536 entries per block (Lucene default)
     private static final byte DENSE_RANK_POWER = 9; // IndexedDISI dense-rank granularity (Lucene default)
-    // Section-offsets block: blockIndexStart, checkpointStart, disiStart, disiLength (4 longs) + jumpTableEntryCount, footerMagic (2 ints).
-    private static final int SECTION_OFFSETS_BYTES = 8 * 4 + 4 * 2;
+    // Section-offsets block: blockIndexStart, checkpointStart, disiStart, disiLength (4 longs) + jumpTableEntryCount, footerMagic (2 ints)
+    // + CRC32 (1 long).
+    private static final int SECTION_OFFSETS_BYTES = 8 * 4 + 4 * 2 + CHECKSUM_BYTES;
 
     private final Directory directory;
     private final IndexInput input;
@@ -141,6 +149,9 @@ public final class UninvertedOrdinals implements Closeable {
                 directory.close();
                 return null;
             } catch (InvalidOrdFileException e) {
+                // The rebuild self-heals, but without this log repeated corruption (a failing
+                // disk, a misbehaving backup tool) would stay invisible.
+                LOGGER.warn("deleting invalid ord file [{}] so it can be rebuilt: {}", fileName, e.getMessage());
                 deleteInvalidOrdFileIfPresent(directory, fileName);
                 directory.close();
                 return null;
@@ -527,6 +538,7 @@ public final class UninvertedOrdinals implements Closeable {
         out.writeLong(disiLength);
         out.writeInt(jumpTableEntryCount);
         out.writeInt(ORD_FILE_FOOTER_MAGIC);
+        out.writeLong(out.getChecksum());
     }
 
     private static OrdFileMetadata readOrdFileMetadata(IndexInput input) throws IOException {
@@ -575,6 +587,7 @@ public final class UninvertedOrdinals implements Closeable {
         try {
             OrdFileMetadata metadata = readOrdFileMetadata(input);
             validateMetadata(metadata, fileName, expectedMaxDoc, expectedTermCount, expectedNonNullDocs);
+            verifyChecksum(directory, fileName);
 
             boolean dense = metadata.dense();
             int numPresent = (int) metadata.assignedDocs();
@@ -661,6 +674,27 @@ public final class UninvertedOrdinals implements Closeable {
         }
         if (metadata.blockShift() != BLOCK_SHIFT) {
             throw new InvalidOrdFileException("ord file block layout mismatch");
+        }
+    }
+
+    /**
+     * Verifies the CRC32 stored as the file's final 8 bytes against every byte before it. Runs
+     * once per load; the sequential read doubles as page-cache warm-up for the mmap that follows.
+     */
+    private static void verifyChecksum(Directory directory, String fileName) throws IOException {
+        try (ChecksumIndexInput in = directory.openChecksumInput(fileName)) {
+            long checksummedBytes = in.length() - CHECKSUM_BYTES;
+            if (checksummedBytes < 0) {
+                throw new InvalidOrdFileException("ord file too short for a checksum");
+            }
+            in.skipBytes(checksummedBytes);
+            long actual = in.getChecksum();
+            long stored = in.readLong();
+            if (actual != stored) {
+                throw new InvalidOrdFileException(
+                    "ord file checksum mismatch: stored=" + Long.toHexString(stored) + " actual=" + Long.toHexString(actual)
+                );
+            }
         }
     }
 
