@@ -27,7 +27,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use arrow::array::Array;
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+    StringViewArray,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -47,6 +50,7 @@ use once_cell::sync::Lazy;
 use opensearch_tiered_storage::tiered_object_store::MetadataCachingStore;
 use parking_lot::Mutex;
 use parquet::arrow::{parquet_to_arrow_schema_by_columns, ProjectionMask};
+use parquet::basic::Type as PhysicalType;
 use tokio::runtime::Runtime;
 
 use crate::cache::page_index::load_scoped_page_index_cols;
@@ -62,8 +66,9 @@ use datafusion::datasource::physical_plan::parquet::ParquetFileReaderFactory;
 const BATCH_SIZE_HARD_LIMIT: usize = 8_192;
 
 /// Status codes returned to Java. A negative return is an error-message pointer produced by
-/// `ffm_safe`, so only non-negative values are status; 1 is unused. Mirrors `ParquetCodecBridge`.
+/// `ffm_safe`, so only non-negative values are status. Mirrors `ParquetCodecBridge`.
 const RC_OK: i64 = 0;
+const RC_OVERFLOW: i64 = 1;
 const RC_EOF: i64 = 2;
 
 /// Store pointer meaning "read from the local filesystem", which is every hot shard. Mirrors
@@ -108,6 +113,8 @@ struct DocValuesCursor {
     reader: ParquetForwardBatchReader,
     /// Retained so a reset can rebuild the reader without re-resolving metadata or the page index.
     factory: ParquetForwardBatchReaderFactory,
+    physical_type: PhysicalType,
+    repeated: bool,
     row_count: i64,
     initial_batch_size: usize,
     /// Ceiling the window grows to, captured at open from
@@ -116,6 +123,8 @@ struct DocValuesCursor {
     max_batch_size: usize,
     batch_size: usize,
     has_decoded_batch: bool,
+    /// Batch staged across an overflow retry so variable-width values are never decoded twice.
+    pending_batch: Option<(i64, RecordBatch)>,
     /// The batch Java last borrowed from, held so the exported pointers stay valid. Released on the
     /// next batch call, on reset, or when close drops the cursor.
     borrowed_batch: Option<RecordBatch>,
@@ -203,6 +212,9 @@ impl DocValuesCursor {
                 )));
             }
         };
+        let descriptor = schema.column(leaf_idx);
+        let physical_type = descriptor.physical_type();
+        let repeated = descriptor.max_rep_level() > 0;
         // Reject on the Arrow type the reader will produce, not the Parquet physical type: an INT64
         // decimal is a valid physical type but decodes to `Decimal128`, which cannot be borrowed.
         // Converted with the same projection and key-value metadata the reader uses, so the two
@@ -213,7 +225,16 @@ impl DocValuesCursor {
             footer.file_metadata().key_value_metadata(),
         )?;
         let data_type = leaf_schema.field(0).data_type();
-        if BorrowKind::for_arrow(data_type).is_none() {
+        let is_binary = matches!(
+            data_type,
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+        );
+        if BorrowKind::for_arrow(data_type).is_none() && !is_binary {
             return Err(DataFusionError::NotImplemented(format!(
                 "unsupported type {data_type} for column '{column}'"
             )));
@@ -262,11 +283,14 @@ impl DocValuesCursor {
         Ok(Self {
             reader,
             factory,
+            physical_type,
+            repeated,
             row_count,
             initial_batch_size: batch_size,
             max_batch_size,
             batch_size,
             has_decoded_batch: false,
+            pending_batch: None,
             borrowed_batch: None,
             stats,
             reservation,
@@ -354,6 +378,164 @@ fn at_eof(
         )));
     }
     Ok(false)
+}
+
+/// Each batch output is valid for exactly one (repeated, binary) column shape.
+fn check_column_shape(
+    cursor: &DocValuesCursor,
+    want_repeated: bool,
+    want_binary: bool,
+    fn_name: &str,
+) -> Result<(), String> {
+    let is_binary = cursor.physical_type == PhysicalType::BYTE_ARRAY;
+    if cursor.repeated != want_repeated || is_binary != want_binary {
+        return Err(format!(
+            "{fn_name}: column is repeated={}, binary={is_binary}; use the batch output matching that shape",
+            cursor.repeated
+        ));
+    }
+    Ok(())
+}
+
+/// Takes the batch staged by a previous overflow probe for `target_row`, or decodes a new one.
+/// Staging guarantees variable-width values are never decompressed or decoded twice across the
+/// caller's grow-and-retry.
+fn take_pending_or_decode(
+    cursor: &mut DocValuesCursor,
+    target_row: i64,
+    fn_name: &str,
+) -> Result<RecordBatch, String> {
+    match cursor.pending_batch.take() {
+        Some((pending_target, batch)) if pending_target == target_row => Ok(batch),
+        Some(pending) => {
+            cursor.pending_batch = Some(pending);
+            Err(format!(
+                "{fn_name}: row {target_row} requested while another batch awaits retry"
+            ))
+        }
+        None => cursor.next_batch(target_row).map_err(|e| e.to_string()),
+    }
+}
+
+/// Stages `batch` for the caller's retry and reports the overflow.
+fn stage_overflow(cursor: &mut DocValuesCursor, target_row: i64, batch: RecordBatch) -> i64 {
+    cursor.pending_batch = Some((target_row, batch));
+    RC_OVERFLOW
+}
+
+unsafe fn write_presence(array: &dyn Array, out_presence_bitset: *mut i64) {
+    let rows = array.len();
+    let words = rows.div_ceil(64);
+    if array.null_count() == 0 {
+        // Every word is fully overwritten below; no zero-fill needed.
+        for word in 0..words {
+            let remaining = rows - word * 64;
+            *out_presence_bitset.add(word) = if remaining >= 64 {
+                -1
+            } else {
+                ((1u64 << remaining) - 1) as i64
+            };
+        }
+        return;
+    }
+    std::ptr::write_bytes(
+        out_presence_bitset as *mut u8,
+        0,
+        words * std::mem::size_of::<i64>(),
+    );
+
+    if array.offset() == 0 {
+        if let Some(nulls) = array.nulls() {
+            if nulls.inner().offset() == 0 {
+                let bytes = rows.div_ceil(8);
+                std::ptr::copy_nonoverlapping(
+                    nulls.inner().values().as_ptr(),
+                    out_presence_bitset as *mut u8,
+                    bytes,
+                );
+                if rows % 64 != 0 {
+                    *out_presence_bitset.add(words - 1) &= ((1u64 << (rows % 64)) - 1) as i64;
+                }
+                return;
+            }
+        }
+    }
+
+    for idx in 0..rows {
+        if array.is_valid(idx) {
+            *out_presence_bitset.add(idx / 64) |= 1i64 << (idx % 64);
+        }
+    }
+}
+
+fn binary_value_at(array: &dyn Array, index: usize) -> Result<&[u8], String> {
+    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(array.value(index));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(array.value(index));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok(array.value(index));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(array.value(index).as_bytes());
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(array.value(index).as_bytes());
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(array.value(index).as_bytes());
+    }
+    Err(format!(
+        "df_docvalues: expected binary or string Arrow array, got {}",
+        array.data_type()
+    ))
+}
+
+fn binary_value_bytes(array: &dyn Array) -> Result<usize, String> {
+    let mut bytes = 0usize;
+    for index in 0..array.len() {
+        if array.is_valid(index) {
+            bytes = bytes
+                .checked_add(binary_value_at(array, index)?.len())
+                .ok_or_else(|| "df_docvalues: binary output length overflow".to_string())?;
+        }
+    }
+    if bytes > i32::MAX as usize {
+        return Err(format!(
+            "df_docvalues: binary batch requires {bytes} bytes, exceeding i32 offsets"
+        ));
+    }
+    Ok(bytes)
+}
+
+unsafe fn copy_binary_array_out(
+    array: &dyn Array,
+    out_value_buf: *mut u8,
+    out_byte_offsets: *mut i32,
+    out_presence_bitset: *mut i64,
+) -> Result<(), String> {
+    write_presence(array, out_presence_bitset);
+    copy_binary_values_out(array, out_value_buf, out_byte_offsets)
+}
+
+unsafe fn copy_binary_values_out(
+    array: &dyn Array,
+    out_value_buf: *mut u8,
+    out_byte_offsets: *mut i32,
+) -> Result<(), String> {
+    *out_byte_offsets = 0;
+    let mut offset = 0usize;
+    for index in 0..array.len() {
+        if array.is_valid(index) {
+            let value = binary_value_at(array, index)?;
+            std::ptr::copy_nonoverlapping(value.as_ptr(), out_value_buf.add(offset), value.len());
+            offset += value.len();
+        }
+        *out_byte_offsets.add(index + 1) = offset as i32;
+    }
+    Ok(())
 }
 
 /// Writes `value` through a nullable out-parameter.
@@ -675,6 +857,7 @@ pub unsafe extern "C" fn parquet_df_reset_iter(handle: i64) -> i64 {
     cursor.reader = cursor.factory.open().map_err(|e| format!("{FN}: {e}"))?;
     cursor.batch_size = cursor.initial_batch_size;
     cursor.has_decoded_batch = false;
+    cursor.pending_batch = None;
     cursor.borrowed_batch = None;
     // The batch is gone, so its bytes must leave the pool with it.
     cursor.reservation.resize(0);
@@ -701,6 +884,7 @@ pub unsafe extern "C" fn parquet_df_next_batch(
     static FN: &str = "parquet_df_next_batch";
     let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
     let mut cursor = cursor.lock();
+    check_column_shape(&cursor, false, false, FN)?;
 
     // Released here rather than on success, so no early return below leaves buffers held. Java
     // clears its resident batch before calling. The reservation follows the batch.
@@ -737,6 +921,59 @@ pub unsafe extern "C" fn parquet_df_next_batch(
     write_out(out_value_kind, borrow.kind);
     write_out(out_value_bit_offset, borrow.value_bit_offset as i64);
     cursor.borrowed_batch = Some(batch);
+    Ok(RC_OK)
+}
+
+/// Binary counterpart of [`parquet_df_next_batch`]. A decoded batch is staged
+/// across an overflow retry so variable-width values are never decompressed or
+/// decoded twice.
+#[ffm_safe]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn parquet_df_next_binary_batch(
+    handle: i64,
+    target_row: i64,
+    out_first_row: *mut i64,
+    out_last_row: *mut i64,
+    out_value_buf: *mut u8,
+    out_value_buf_cap: i64,
+    out_value_actual_len: *mut i64,
+    out_byte_offsets: *mut i32,
+    out_byte_offsets_cap: i64,
+    out_presence_bitset: *mut i64,
+    out_presence_bits_cap: i64,
+) -> i64 {
+    const FN: &str = "parquet_df_next_binary_batch";
+    let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
+    let mut cursor = cursor.lock();
+    check_column_shape(&cursor, false, true, FN)?;
+    if at_eof(&cursor, target_row, FN).map_err(|e| e.to_string())? {
+        return Ok(RC_EOF);
+    }
+
+    let batch = take_pending_or_decode(&mut cursor, target_row, FN)?;
+    let rows = batch.num_rows();
+    let array = batch.column(0).as_ref();
+    let value_bytes = binary_value_bytes(array)?;
+    let presence_words = rows.div_ceil(64);
+
+    write_out(out_first_row, target_row);
+    write_out(out_last_row, target_row + rows as i64 - 1);
+    write_out(out_value_actual_len, value_bytes as i64);
+
+    if out_value_buf.is_null()
+        || out_byte_offsets.is_null()
+        || out_presence_bitset.is_null()
+        || out_value_buf_cap < value_bytes as i64
+        || out_byte_offsets_cap < rows as i64 + 1
+        || out_presence_bits_cap < presence_words as i64
+    {
+        return Ok(stage_overflow(&mut cursor, target_row, batch));
+    }
+
+    copy_binary_array_out(array, out_value_buf, out_byte_offsets, out_presence_bitset)?;
+    // The batch is fully copied out; nothing native stays resident, so release its budget charge.
+    cursor.reservation.resize(0);
     Ok(RC_OK)
 }
 
