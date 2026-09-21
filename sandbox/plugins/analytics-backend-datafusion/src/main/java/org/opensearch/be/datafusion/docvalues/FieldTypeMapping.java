@@ -17,13 +17,14 @@ import java.util.Map;
  * Maps an OpenSearch field mapping type to the Lucene DocValues type the codec serves for it.
  *
  * <p>The recorded DV type is the <em>single-valued</em> form; the matching repeated form
- * ({@code SORTED_NUMERIC} for numerics) is selected when a multi-valued iterator is requested.
+ * ({@code SORTED_NUMERIC} for numerics, {@code SORTED_SET} for keyword/ip) is selected when a
+ * multi-valued iterator is requested.
  * The Parquet physical type is not modeled here: the native cursor reads it from the Parquet
  * schema at open time.
  *
- * <p>Single-valued numeric fields (including half_float, scaled_float, and unsigned_long) and
- * boolean are mapped today. The binary/keyword/text/ip family is not supported in this numeric
- * borrow path.
+ * <p>Single-valued numeric fields (including half_float, scaled_float, and unsigned_long),
+ * boolean, keyword, and ip are mapped today. The text/binary family (BINARY doc values) is not
+ * supported.
  */
 public final class FieldTypeMapping {
 
@@ -55,7 +56,12 @@ public final class FieldTypeMapping {
         // factor above this codec, so the raw scaled long is the correct thing to return.
         Map.entry("scaled_float", new Mapping(DocValuesType.NUMERIC, DocValuesType.SORTED_NUMERIC)),
         // Arrow Float16, re-encoded to Lucene's sortable short by DecodedBatch.KIND_HALF_FLOAT.
-        Map.entry("half_float", new Mapping(DocValuesType.NUMERIC, DocValuesType.SORTED_NUMERIC))
+        Map.entry("half_float", new Mapping(DocValuesType.NUMERIC, DocValuesType.SORTED_NUMERIC)),
+        // Keyword and ip are served as SORTED (single-valued) wrapped to SORTED_SET on request:
+        // the server-side accessors always ask for SortedSetDocValues, so the multi-valued form
+        // must validate even while only single-valued columns are readable.
+        Map.entry("keyword", new Mapping(DocValuesType.SORTED, DocValuesType.SORTED_SET)),
+        Map.entry("ip", new Mapping(DocValuesType.SORTED, DocValuesType.SORTED_SET))
     );
 
     private FieldTypeMapping() {}

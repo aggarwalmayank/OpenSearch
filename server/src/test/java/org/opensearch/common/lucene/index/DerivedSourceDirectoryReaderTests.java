@@ -12,6 +12,8 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
@@ -186,6 +188,96 @@ public class DerivedSourceDirectoryReaderTests extends OpenSearchTestCase {
 
         assertEquals("Should have processed all documents", numDocs, processedDocs);
         IOUtils.close(derivedReader, multiReader, multiWriter, multiDir);
+    }
+
+    public void testSourceProviderReadsThroughThePerDocumentValuesView() throws IOException {
+        DirectoryReader providing = new ProvidingDirectoryReader(directoryReader);
+        LeafReader[] received = new LeafReader[1];
+        DerivedSourceDirectoryReader derived = DerivedSourceDirectoryReader.wrap(providing, (leafReader, docId) -> {
+            received[0] = leafReader;
+            return new BytesArray(TEST_SOURCE);
+        });
+        readSourceOfDocZero(derived);
+        assertTrue("source derivation must read through the reader's per-document view", received[0] instanceof DirectView);
+    }
+
+    public void testSourceProviderReadsThePlainLeafWhenNoViewIsOffered() throws IOException {
+        LeafReader[] received = new LeafReader[1];
+        DerivedSourceDirectoryReader derived = DerivedSourceDirectoryReader.wrap(directoryReader, (leafReader, docId) -> {
+            received[0] = leafReader;
+            return new BytesArray(TEST_SOURCE);
+        });
+        readSourceOfDocZero(derived);
+        assertNotNull(received[0]);
+        assertFalse("a reader that offers no view must be read as-is", received[0] instanceof DirectView);
+    }
+
+    private static void readSourceOfDocZero(DirectoryReader derived) throws IOException {
+        derived.leaves().get(0).reader().storedFields().document(0, new StoredFieldVisitor() {
+            @Override
+            public Status needsField(FieldInfo fieldInfo) {
+                return fieldInfo.name.equals("_source") ? Status.YES : Status.NO;
+            }
+        });
+    }
+
+    /** Directory reader whose leaves offer a per-document values view, tagged by type for assertions. */
+    private static final class ProvidingDirectoryReader extends FilterDirectoryReader {
+        ProvidingDirectoryReader(DirectoryReader in) throws IOException {
+            super(in, new SubReaderWrapper() {
+                @Override
+                public LeafReader wrap(LeafReader reader) {
+                    return new ProvidingLeaf(reader);
+                }
+            });
+        }
+
+        @Override
+        protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
+            return new ProvidingDirectoryReader(in);
+        }
+
+        @Override
+        public CacheHelper getReaderCacheHelper() {
+            return in.getReaderCacheHelper();
+        }
+    }
+
+    private static final class ProvidingLeaf extends FilterLeafReader implements PerDocumentValuesProvider {
+        ProvidingLeaf(LeafReader in) {
+            super(in);
+        }
+
+        @Override
+        public LeafReader perDocumentValuesReader() {
+            return new DirectView(in);
+        }
+
+        @Override
+        public CacheHelper getCoreCacheHelper() {
+            return in.getCoreCacheHelper();
+        }
+
+        @Override
+        public CacheHelper getReaderCacheHelper() {
+            return in.getReaderCacheHelper();
+        }
+    }
+
+    private static final class DirectView extends FilterLeafReader {
+        DirectView(LeafReader in) {
+            super(in);
+        }
+
+        @Override
+        public CacheHelper getCoreCacheHelper() {
+            return in.getCoreCacheHelper();
+        }
+
+        @Override
+        public CacheHelper getReaderCacheHelper() {
+            return in.getReaderCacheHelper();
+        }
     }
 
 }

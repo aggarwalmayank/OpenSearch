@@ -31,7 +31,9 @@ public final class ParquetCodecBridge {
     private static final MethodHandle CLOSE_CURSOR;
     private static final MethodHandle RESET_CURSOR;
     private static final MethodHandle NEXT_BATCH;
+    private static final MethodHandle NEXT_BINARY_BATCH;
     private static final MethodHandle FILE_METADATA;
+    private static final MethodHandle COLUMN_NON_NULL_COUNT;
 
     /** Status returned by {@link #nextBatch} when a batch was produced. */
     /**
@@ -42,6 +44,11 @@ public final class ParquetCodecBridge {
     public static final long FORMAT_VERSION_UNKNOWN = 0L;
 
     public static final long RC_OK = 0L;
+    /**
+     * Status returned by {@link #nextBinaryBatch} when the caller's buffers are too small; the needed
+     * value-byte length is in {@code outValueActualLen} and the decoded batch is staged for the retry.
+     */
+    public static final long RC_OVERFLOW = 1L;
     /** Status returned by {@link #nextBatch} when the cursor is exhausted. A {@code < 0} return is an error pointer. */
     public static final long RC_EOF = 2L;
 
@@ -84,6 +91,23 @@ public final class ParquetCodecBridge {
                 ValueLayout.ADDRESS     // out_value_bit_offset
             )
         );
+        NEXT_BINARY_BATCH = linker.downcallHandle(
+            lib.find("parquet_df_next_binary_batch").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,  // handle
+                ValueLayout.JAVA_LONG,  // target_row
+                ValueLayout.ADDRESS,    // out_first_row
+                ValueLayout.ADDRESS,    // out_last_row
+                ValueLayout.ADDRESS,    // out_value_buf
+                ValueLayout.JAVA_LONG,  // out_value_buf_cap
+                ValueLayout.ADDRESS,    // out_value_actual_len
+                ValueLayout.ADDRESS,    // out_byte_offsets
+                ValueLayout.JAVA_LONG,  // out_byte_offsets_cap
+                ValueLayout.ADDRESS,    // out_presence_bitset
+                ValueLayout.JAVA_LONG   // out_presence_bits_cap
+            )
+        );
         FILE_METADATA = linker.downcallHandle(
             lib.find("parquet_df_file_metadata").orElseThrow(),
             FunctionDescriptor.of(
@@ -93,6 +117,18 @@ public final class ParquetCodecBridge {
                 ValueLayout.JAVA_LONG,  // store_ptr
                 ValueLayout.ADDRESS,    // out_num_rows
                 ValueLayout.ADDRESS     // out_format_version
+            )
+        );
+        COLUMN_NON_NULL_COUNT = linker.downcallHandle(
+            lib.find("parquet_df_column_non_null_count").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,    // file_ptr
+                ValueLayout.JAVA_LONG,  // file_len
+                ValueLayout.ADDRESS,    // column_ptr
+                ValueLayout.JAVA_LONG,  // column_len
+                ValueLayout.JAVA_LONG,  // store_ptr
+                ValueLayout.ADDRESS     // out_count
             )
         );
     }
@@ -126,6 +162,22 @@ public final class ParquetCodecBridge {
             var formatVersionOut = call.longOut();
             call.invokeIO(FILE_METADATA, f.segment(), f.len(), storePtr, numRowsOut, formatVersionOut);
             return new FileMetadata(numRowsOut.get(ValueLayout.JAVA_LONG, 0), formatVersionOut.get(ValueLayout.JAVA_LONG, 0));
+        }
+    }
+
+    /**
+     * Rows with a non-null value in {@code column}, summed over the footer's row-group column
+     * chunks; {@code -1} when any chunk lacks the statistic, read through {@code storePtr}.
+     *
+     * @param storePtr native object store to read through, or {@code 0} for a local file
+     */
+    public static long columnNonNullCount(String file, String column, long storePtr) throws IOException {
+        try (var call = new NativeCall()) {
+            var f = call.str(file);
+            var c = call.str(column);
+            var countOut = call.longOut();
+            call.invokeIO(COLUMN_NON_NULL_COUNT, f.segment(), f.len(), c.segment(), c.len(), storePtr, countOut);
+            return countOut.get(ValueLayout.JAVA_LONG, 0);
         }
     }
 
@@ -195,6 +247,41 @@ public final class ParquetCodecBridge {
                 outValidityBitOffset,
                 outValueKind,
                 outValueBitOffset
+            );
+        }
+    }
+
+    /**
+     * Copies the batch containing {@code targetRow} into the caller's buffers. Returns {@link #RC_OK},
+     * {@link #RC_OVERFLOW}, or {@link #RC_EOF}; a {@code < 0} return is decoded into an {@link IOException}.
+     */
+    public static long nextBinaryBatch(
+        long handle,
+        long targetRow,
+        MemorySegment outFirstRow,
+        MemorySegment outLastRow,
+        MemorySegment outValueBuf,
+        long outValueBufCap,
+        MemorySegment outValueActualLen,
+        MemorySegment outByteOffsets,
+        long outByteOffsetsCap,
+        MemorySegment outPresenceBits,
+        long outPresenceBitsCap
+    ) throws IOException {
+        try (var call = new NativeCall()) {
+            return call.invokeIO(
+                NEXT_BINARY_BATCH,
+                handle,
+                targetRow,
+                outFirstRow,
+                outLastRow,
+                outValueBuf,
+                outValueBufCap,
+                outValueActualLen,
+                outByteOffsets,
+                outByteOffsetsCap,
+                outPresenceBits,
+                outPresenceBitsCap
             );
         }
     }

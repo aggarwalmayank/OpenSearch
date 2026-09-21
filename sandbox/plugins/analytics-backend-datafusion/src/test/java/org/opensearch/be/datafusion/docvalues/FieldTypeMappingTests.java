@@ -64,13 +64,26 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
     }
 
     /**
-     * Still deliberately out: the binary/keyword/text/ip family has no variable-width borrow path in the
-     * native cursor, so admitting one would fail at read time rather than at index create.
+     * Still deliberately out: text and binary resolve to BINARY doc values, which have no serving
+     * path in this codec; admitting one would fail at read time rather than at index create.
      */
     public void testTypesWithoutAVerifiedDecodeAreNotSupported() {
-        for (String type : new String[] { "keyword", "text", "ip", "binary" }) {
+        for (String type : new String[] { "text", "binary" }) {
             assertFalse(type + " must not be supported yet", FieldTypeMapping.isSupported(type));
             expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.forType(type));
+        }
+    }
+
+    /** Keyword and ip resolve to SORTED, with SORTED_SET as the multi-valued form the server requests. */
+    public void testKeywordAndIpResolveToSorted() {
+        for (String type : new String[] { "keyword", "ip" }) {
+            assertTrue(type + " must be supported", FieldTypeMapping.isSupported(type));
+            FieldTypeMapping.Mapping mapping = FieldTypeMapping.forType(type);
+            assertEquals(DocValuesType.SORTED, mapping.singleValued());
+            assertEquals(DocValuesType.SORTED_SET, mapping.multiValued());
+            FieldTypeMapping.validate("city", type, DocValuesType.SORTED);
+            FieldTypeMapping.validate("city", type, DocValuesType.SORTED_SET);
+            expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.validate("city", type, DocValuesType.NUMERIC));
         }
     }
 
@@ -94,9 +107,9 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
     public void testValidateRejectsAnUnsupportedMappingType() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> FieldTypeMapping.validate("title", "keyword", DocValuesType.SORTED_SET)
+            () -> FieldTypeMapping.validate("title", "text", DocValuesType.SORTED_SET)
         );
-        assertTrue(e.getMessage(), e.getMessage().contains("keyword"));
+        assertTrue(e.getMessage(), e.getMessage().contains("text"));
     }
 
     /** A supported mapping type still must not be served as a DocValues type it does not resolve to. */

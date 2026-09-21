@@ -24,6 +24,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
@@ -34,25 +35,40 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 /**
- * Read-only {@link DocValuesProducer} that serves single-valued numeric doc values from a Parquet
- * file through Lucene's DocValues iterator API.
+ * Read-only {@link DocValuesProducer} that serves single-valued numeric and keyword/ip sorted doc
+ * values from a Parquet file through Lucene's DocValues iterator API.
  *
  * <p>The constructor resolves the backing file and sanity-checks its row count against the segment's
  * {@code maxDoc}, but opens no cursor. It also captures the store those bytes come from: a hot shard's
  * Parquet files are on local disk, while a shard tiered to warm keeps them only in the remote object
  * store, reachable through the native store the engine stamped on the segment.
  *
- * <p>Each {@code getNumeric}/{@code getSortedNumeric} opens its own
+ * <p>Each {@code getNumeric}/{@code getSortedNumeric}/{@code getSorted} opens its own
  * dedicated {@link ParquetColumnReader}: a native cursor is forward-only, so one shared across
  * concurrent segment-search slices would be driven backwards by one slice while another advances it.
- * A reader per iterator keeps each slice's scan independent. {@link #close()} releases every reader
- * and is idempotent.
+ * A sorted iterator opens its cursor lazily on the first value request. {@link #close()} releases
+ * every reader and is idempotent; a shared-registry producer tracks readers weakly instead of
+ * pinning them, with close() as the backstop.
  */
 public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     private static final Logger logger = LogManager.getLogger(ParquetDocValuesProducer.class);
+
+    private static volatile int checkpointInterval = 128;
+
+    /** For newly built .ord files only; existing files keep the interval recorded in them. */
+    public static void setCheckpointInterval(int interval) {
+        checkpointInterval = interval;
+    }
+
+    /** Checkpoint interval stamped into newly built .ord files. */
+    static int checkpointInterval() {
+        return checkpointInterval;
+    }
 
     /** Oldest stamped format version this codec can decode, long-encoded as {@code major*1_000_000 + minor*1_000 + patch}. */
     static final long MIN_SUPPORTED_FORMAT_VERSION = 1_000_000L; // 1.0.0
@@ -85,6 +101,13 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private final long parquetRowCount;
 
     private final List<ParquetColumnReader> dedicatedReaders = Collections.synchronizedList(new ArrayList<>());
+
+    /** True for the shared-registry producer: readers are tracked weakly, not pinned. */
+    private final boolean reusedAcrossRequests;
+
+    /** Weakly-held readers of a shared producer; {@link #close()} is the backstop for any still live. */
+    private final Set<ParquetColumnReader> weakDedicatedReaders = Collections.newSetFromMap(new WeakHashMap<>());
+
     private volatile boolean closed;
 
     /**
@@ -94,6 +117,12 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * @throws IllegalStateException if the Parquet row count does not match the segment's {@code maxDoc}
      */
     public ParquetDocValuesProducer(SegmentReadState state, MapperService mapperService) throws IOException {
+        this(state, mapperService, false);
+    }
+
+    /** @param reusedAcrossRequests true for the shared-registry producer; tracks readers weakly. */
+    public ParquetDocValuesProducer(SegmentReadState state, MapperService mapperService, boolean reusedAcrossRequests) throws IOException {
+        this.reusedAcrossRequests = reusedAcrossRequests;
         this.mapperService = mapperService;
         this.indexSettings = mapperService == null ? Settings.EMPTY : mapperService.getIndexSettings().getSettings();
         this.maxDoc = state.segmentInfo.maxDoc();
@@ -153,12 +182,18 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     }
 
     @Override
-    public SortedDocValues getSorted(FieldInfo field) {
-        throw unsupported("sorted", field);
+    public SortedDocValues getSorted(FieldInfo field) throws IOException {
+        ensureOpen();
+        validate(field, DocValuesType.SORTED);
+        // The reader recipe runs on the iterator's first value request, so an ordinal-only
+        // consumer never opens a native cursor.
+        return new ParquetSortedDocValues(() -> binaryDedicatedReaderFor(field), maxDoc);
     }
 
     @Override
     public SortedSetDocValues getSortedSet(FieldInfo field) {
+        // Single-valued keyword/ip is served through getSorted and singleton-wrapped by the leaf
+        // reader; SORTED_SET would reach here only for repeated columns, which have no read path.
         throw unsupported("sorted-set", field);
     }
 
@@ -192,6 +227,15 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         }
     }
 
+    /**
+     * Number of rows with a non-null value in this column, from the Parquet footer's per-row-group
+     * column-chunk statistics; {@code -1} when any row group lacks the null count. Used to verify
+     * that postings-derived ordinal tables cover every stored value.
+     */
+    long nonNullRowCount(FieldInfo field) throws IOException {
+        return ParquetCodecBridge.columnNonNullCount(parquetFile.toString(), field.getName(), storePointer);
+    }
+
     @Override
     public void close() throws IOException {
         if (closed) {
@@ -209,6 +253,21 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
                 }
             }
             dedicatedReaders.clear();
+        }
+        if (reusedAcrossRequests) {
+            // Backstop: close any weakly-tracked reader still live at segment close.
+            List<ParquetColumnReader> liveReaders;
+            synchronized (weakDedicatedReaders) {
+                liveReaders = new ArrayList<>(weakDedicatedReaders);
+                weakDedicatedReaders.clear();
+            }
+            for (ParquetColumnReader reader : liveReaders) {
+                try {
+                    reader.close();
+                } catch (RuntimeException e) {
+                    logger.warn("Failed to close Parquet column reader for [{}]", parquetFile, e);
+                }
+            }
         }
     }
 
@@ -278,27 +337,39 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     /** Opens a dedicated forward-only cursor for one iterator, registered for close with this producer. */
     private ParquetColumnReader dedicatedReaderFor(FieldInfo field) throws IOException {
-        ParquetColumnReader reader = ParquetColumnReader.open(parquetFile, field.getName(), indexSettings, storePointer);
-        // Register under the same lock close() clears the list under: an open that races a
-        // concurrent close would otherwise add to an already-drained list and leak the cursor.
-        synchronized (dedicatedReaders) {
+        return registerForClose(ParquetColumnReader.open(parquetFile, field.getName(), indexSettings, storePointer));
+    }
+
+    /** Opens a dedicated binary cursor for one iterator, registered for close with this producer. */
+    private ParquetColumnReader binaryDedicatedReaderFor(FieldInfo field) throws IOException {
+        return registerForClose(ParquetColumnReader.openBinary(parquetFile, field.getName(), indexSettings, storePointer));
+    }
+
+    /**
+     * Tracks a just-opened reader for release: pinned in {@link #dedicatedReaders} for a
+     * request-scoped producer, weakly tracked for a shared one (the reader's Cleaner frees the
+     * cursor once its iterator is unreachable). Registration happens under the same lock close()
+     * drains under, so an open racing a concurrent close cannot leak the cursor.
+     */
+    private ParquetColumnReader registerForClose(ParquetColumnReader reader) throws IOException {
+        Object lock = reusedAcrossRequests ? weakDedicatedReaders : dedicatedReaders;
+        synchronized (lock) {
             if (closed) {
                 reader.close();
                 throw new IllegalStateException("producer for " + parquetFile + " is closed");
             }
-            dedicatedReaders.add(reader);
+            if (reusedAcrossRequests) {
+                weakDedicatedReaders.add(reader);
+            } else {
+                dedicatedReaders.add(reader);
+            }
         }
         return reader;
     }
 
     private UnsupportedOperationException unsupported(String kind, FieldInfo field) {
         return new UnsupportedOperationException(
-            String.format(
-                Locale.ROOT,
-                "Parquet DocValues codec does not serve %s doc values (field '%s'); numeric only",
-                kind,
-                field.getName()
-            )
+            String.format(Locale.ROOT, "Parquet DocValues codec does not serve %s doc values (field '%s')", kind, field.getName())
         );
     }
 

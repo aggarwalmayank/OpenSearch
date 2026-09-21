@@ -23,6 +23,8 @@ import org.opensearch.be.datafusion.cache.CacheManager;
 import org.opensearch.be.datafusion.cache.CacheSettings;
 import org.opensearch.be.datafusion.cache.CacheUtils;
 import org.opensearch.be.datafusion.docvalues.ParquetDocValuesDirectoryReader;
+import org.opensearch.be.datafusion.docvalues.ParquetDocValuesProducer;
+import org.opensearch.be.datafusion.docvalues.UninvertedOrdinalsCache;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -71,6 +73,7 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.backpressure.trackers.NativeMemoryUsageTracker;
 import org.opensearch.search.sort.SortOrder;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
@@ -496,6 +499,8 @@ public class DataFusionPlugin extends Plugin
     // DocumentLookupProvider implementation. Construction deferred until the DataFusion service is live.
     private volatile GetService getService;
     private volatile CircuitBreaker datafusionBreaker;
+    /** Periodic deletion pass for unused .ord files; cancelled in {@link #close()}. */
+    private volatile Scheduler.Cancellable ordSweeper;
 
     /**
      * Creates the DataFusion plugin.
@@ -608,6 +613,23 @@ public class DataFusionPlugin extends Plugin
                 logger.info("Scoped page-index disabled: cleared CI and OI caches");
             }
         });
+        ParquetDocValuesProducer.setCheckpointInterval(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT.get(settings));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT, ParquetDocValuesProducer::setCheckpointInterval);
+        UninvertedOrdinalsCache.start();
+        UninvertedOrdinalsCache.setDeleteUnusedAfter(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER.get(settings));
+        UninvertedOrdinalsCache.setMaxConcurrentBuilds(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS.get(settings));
+        UninvertedOrdinalsCache.setDataRoots(environment.dataFiles());
+        // Deletion pass: fixed cadence, reads the current (dynamic) delete-unused-after value each pass.
+        this.ordSweeper = threadPool.scheduleWithFixedDelay(
+            UninvertedOrdinalsCache::deleteUnusedOrdFiles,
+            DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL.get(settings),
+            ThreadPool.Names.GENERIC
+        );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER, UninvertedOrdinalsCache::setDeleteUnusedAfter);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS, UninvertedOrdinalsCache::setMaxConcurrentBuilds);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(DATAFUSION_MEMORY_GUARD_SPILL_EXEMPT_CAP, NativeBridge::setSpillExemptCapBytes);
         // The four memory-guard thresholds are pushed to the native pool together via a single
@@ -1075,6 +1097,11 @@ public class DataFusionPlugin extends Plugin
 
     @Override
     public void close() throws IOException {
+        // Stop the deletion pass and abort in-flight ord builds so shutdown is not held hostage.
+        if (ordSweeper != null) {
+            ordSweeper.cancel();
+        }
+        UninvertedOrdinalsCache.shutdown();
         if (getService != null) {
             getService.close();
         }

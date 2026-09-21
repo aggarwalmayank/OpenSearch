@@ -14,6 +14,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.node.resource.tracker.ResourceTrackerSettings;
 import org.opensearch.search.SearchService;
@@ -263,6 +264,51 @@ public final class DatafusionSettings {
     }
 
     /**
+     * Terms between sparse checkpoints in an .ord file: smaller means faster ord->term lookups,
+     * larger checkpoint section. Read at build time only; each file keeps the value it was built with.
+     */
+    public static final Setting<Integer> ORD_FILE_TERMS_CHECKPOINT = Setting.intSetting(
+        "parquet.docvalues.ord_file.terms_checkpoint",
+        128,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Idle time before an unused .ord file is deleted; any use resets the clock.
+     * {@code 0} = never delete (files are removed only with their shard).
+     */
+    public static final Setting<TimeValue> ORD_FILE_DELETE_UNUSED_AFTER = Setting.timeSetting(
+        "parquet.docvalues.ord_file.delete_unused_after",
+        TimeValue.timeValueDays(7),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /** How often the deletion pass looks for unused .ord files. Startup-only; shorter values make deletion tests faster. */
+    public static final Setting<TimeValue> ORD_FILE_DELETE_CHECK_INTERVAL = Setting.timeSetting(
+        "parquet.docvalues.ord_file.delete_check_interval",
+        TimeValue.timeValueMinutes(5),
+        TimeValue.timeValueSeconds(1),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Cap on concurrent from-scratch .ord builds node-wide: each holds a transient packed buffer
+     * of {@code maxDoc × bits} heap (~287 MB at 100M docs). Loads of existing files and cache
+     * hits are not limited.
+     */
+    public static final Setting<Integer> ORD_FILE_MAX_CONCURRENT_BUILDS = Setting.intSetting(
+        "parquet.docvalues.ord_file.max_concurrent_builds",
+        2,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Index-scoped settings the plugin registers. Kept separate from {@link #NODE_SCOPED_SETTINGS} because
      * that list is fed to {@link ClusterSettings}, which accepts only {@code NodeScope} settings.
      */
@@ -311,7 +357,11 @@ public final class DatafusionSettings {
         INDEXED_PUSHDOWN_FILTERS,
         INDEXED_MIN_SKIP_RUN_DEFAULT,
         INDEXED_MIN_SKIP_RUN_SELECTIVITY_THRESHOLD,
-        INDEXED_FORCE_STRATEGY
+        INDEXED_FORCE_STRATEGY,
+        ORD_FILE_TERMS_CHECKPOINT,
+        ORD_FILE_DELETE_UNUSED_AFTER,
+        ORD_FILE_DELETE_CHECK_INTERVAL,
+        ORD_FILE_MAX_CONCURRENT_BUILDS
     );
 
     // ── Snapshot management ──
