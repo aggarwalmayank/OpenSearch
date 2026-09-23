@@ -56,7 +56,7 @@ public class DatafusionSettingsTests extends OpenSearchTestCase {
     }
 
     public void testNodeScopedSettingsContainsAllExpectedSettings() {
-        assertEquals(31, DatafusionSettings.NODE_SCOPED_SETTINGS.size());
+        assertEquals(35, DatafusionSettings.NODE_SCOPED_SETTINGS.size());
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DataFusionPlugin.DATAFUSION_REDUCE_TARGET_PARTITIONS));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DataFusionPlugin.DATAFUSION_MEMORY_GUARD_SPILL_EXEMPT_CAP));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DataFusionPlugin.DATAFUSION_SPILL_DIRECTORY));
@@ -66,6 +66,10 @@ public class DatafusionSettingsTests extends OpenSearchTestCase {
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.INDEXED_MIN_SKIP_RUN_DEFAULT));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.INDEXED_MIN_SKIP_RUN_SELECTIVITY_THRESHOLD));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.INDEXED_FORCE_STRATEGY));
+        assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER));
+        assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL));
+        assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS));
+        assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT));
     }
 
     /**

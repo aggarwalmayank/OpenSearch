@@ -57,11 +57,24 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
     }
 
     /**
-     * Still deliberately out: the binary/keyword/text/ip family has no variable-width borrow path in the
-     * native cursor, so admitting one would fail at read time.
+     * Keyword and ip resolve to SORTED_SET because that is what KeywordFieldMapper and IpFieldMapper
+     * index; a column holding one value per document is served as a singleton over it.
+     */
+    public void testKeywordAndIpResolveToSortedSetDocValues() {
+        for (String type : new String[] { "keyword", "ip" }) {
+            assertTrue(type + " must be supported", FieldTypeMapping.isSupported(type));
+            assertEquals(type, DocValuesType.SORTED_SET, FieldTypeMapping.forType(type));
+        }
+        FieldTypeMapping.validate("city", "keyword", DocValuesType.SORTED_SET);
+        FieldTypeMapping.validate("client_ip", "ip", DocValuesType.SORTED_SET);
+    }
+
+    /**
+     * Still deliberately out: text and binary have no read path in the native cursor, so admitting one
+     * would fail at read time.
      */
     public void testTypesWithoutAVerifiedDecodeAreNotSupported() {
-        for (String type : new String[] { "keyword", "text", "ip", "binary" }) {
+        for (String type : new String[] { "text", "binary" }) {
             assertFalse(type + " must not be supported yet", FieldTypeMapping.isSupported(type));
             expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.forType(type));
         }
@@ -85,9 +98,9 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
     public void testValidateRejectsAnUnsupportedMappingType() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> FieldTypeMapping.validate("title", "keyword", DocValuesType.SORTED_SET)
+            () -> FieldTypeMapping.validate("title", "text", DocValuesType.SORTED_SET)
         );
-        assertTrue(e.getMessage(), e.getMessage().contains("keyword"));
+        assertTrue(e.getMessage(), e.getMessage().contains("text"));
     }
 
     /** A supported mapping type still must not be served as a DocValues type it does not resolve to. */
@@ -96,5 +109,7 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.validate("flag", "boolean", DocValuesType.BINARY));
         // The single-valued form is served as a SORTED_NUMERIC singleton, never as bare NUMERIC.
         expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.validate("count", "long", DocValuesType.NUMERIC));
+        // Keyword resolves to SORTED_SET, so the bare SORTED form is not accepted for it either.
+        expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.validate("city", "keyword", DocValuesType.SORTED));
     }
 }
