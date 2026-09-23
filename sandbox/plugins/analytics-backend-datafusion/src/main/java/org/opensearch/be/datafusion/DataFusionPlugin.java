@@ -24,6 +24,8 @@ import org.opensearch.be.datafusion.cache.CacheSettings;
 import org.opensearch.be.datafusion.cache.CacheUtils;
 import org.opensearch.be.datafusion.docvalues.ParquetDocValuesDirectoryReader;
 import org.opensearch.be.datafusion.docvalues.ParquetSegmentResourceCache;
+import org.opensearch.be.datafusion.docvalues.UninvertedOrdinals;
+import org.opensearch.be.datafusion.docvalues.UninvertedOrdinalsCache;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -35,6 +37,7 @@ import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -72,6 +75,7 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.backpressure.trackers.NativeMemoryUsageTracker;
 import org.opensearch.search.sort.SortOrder;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
@@ -497,6 +501,11 @@ public class DataFusionPlugin extends Plugin
     // DocumentLookupProvider implementation. Construction deferred until the DataFusion service is live.
     private volatile GetService getService;
     private volatile CircuitBreaker datafusionBreaker;
+    /** Periodic deletion pass for unused .ord files; cancelled in {@link #close()}. */
+    private volatile Scheduler.Cancellable ordSweeper;
+    private final Object ordSweeperLock = new Object();
+    /** Set by {@link #close()} so a late settings update cannot start a new pass on a closed plugin. */
+    private boolean ordSweeperClosed;
 
     /**
      * Creates the DataFusion plugin.
@@ -609,6 +618,24 @@ public class DataFusionPlugin extends Plugin
                 logger.info("Scoped page-index disabled: cleared CI and OI caches");
             }
         });
+        UninvertedOrdinals.setCheckpointInterval(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT.get(settings));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT, UninvertedOrdinals::setCheckpointInterval);
+        UninvertedOrdinalsCache.start();
+        UninvertedOrdinalsCache.setDeleteUnusedAfter(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER.get(settings));
+        UninvertedOrdinalsCache.setMaxConcurrentBuilds(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS.get(settings));
+        UninvertedOrdinalsCache.setDataRoots(environment.dataFiles());
+        // Deletion pass: reads the current delete-unused-after value each pass.
+        scheduleOrdSweeper(threadPool, DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL.get(settings));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER, UninvertedOrdinalsCache::setDeleteUnusedAfter);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL,
+                interval -> scheduleOrdSweeper(threadPool, interval)
+            );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS, UninvertedOrdinalsCache::setMaxConcurrentBuilds);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(DATAFUSION_MEMORY_GUARD_SPILL_EXEMPT_CAP, NativeBridge::setSpillExemptCapBytes);
         // The four memory-guard thresholds are pushed to the native pool together via a single
@@ -1074,8 +1101,36 @@ public class DataFusionPlugin extends Plugin
         };
     }
 
+    /**
+     * Starts the .ord deletion pass at the given cadence, replacing any pass already running.
+     * Cancelling lets an in-flight run finish; only the next run is dropped.
+     */
+    private void scheduleOrdSweeper(ThreadPool threadPool, TimeValue interval) {
+        synchronized (ordSweeperLock) {
+            if (ordSweeperClosed) {
+                return;
+            }
+            if (ordSweeper != null) {
+                ordSweeper.cancel();
+            }
+            ordSweeper = threadPool.scheduleWithFixedDelay(
+                UninvertedOrdinalsCache::deleteUnusedOrdFiles,
+                interval,
+                ThreadPool.Names.GENERIC
+            );
+        }
+    }
+
     @Override
     public void close() throws IOException {
+        // Stop the deletion pass and abort in-flight ord builds so shutdown is not held hostage.
+        synchronized (ordSweeperLock) {
+            ordSweeperClosed = true;
+            if (ordSweeper != null) {
+                ordSweeper.cancel();
+            }
+        }
+        UninvertedOrdinalsCache.shutdown();
         if (getService != null) {
             getService.close();
         }

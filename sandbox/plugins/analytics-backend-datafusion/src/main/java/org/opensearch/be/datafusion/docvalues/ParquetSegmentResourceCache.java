@@ -27,9 +27,11 @@ import org.opensearch.index.mapper.MapperService;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -109,6 +111,7 @@ public final class ParquetSegmentResourceCache {
 
         FieldInfos existing = in.getFieldInfos();
         Map<String, FieldInfo> parquetFields = new LinkedHashMap<>();
+        Set<String> multiValuedFields = new HashSet<>();
         List<FieldInfo> combined = new ArrayList<>();
         int maxNumber = -1;
         for (FieldInfo fi : existing) {
@@ -116,12 +119,10 @@ public final class ParquetSegmentResourceCache {
             maxNumber = Math.max(maxNumber, fi.number);
         }
 
-        // Synthesize a FieldInfo carrying the mapped DV type for each codec-supported field the Lucene
-        // segment does not know about at all. A field Lucene does know about is left entirely to the
-        // underlying reader: its FieldInfo is the only record of its postings, points and doc values, so
-        // replacing it here would hide those from every consumer of getFieldInfos(). In the composite
-        // model a Parquet-resident numeric is absent from Lucene, because LuceneDocumentInput skips
-        // fields for which the mapping declares no Lucene capability.
+        // Synthesize a FieldInfo carrying the mapped DV type for every codec-supported field whose doc
+        // values Lucene does not serve. A keyword or ip field is present in the Lucene segment for its
+        // term postings, so its entry is replaced rather than added: FieldInfos rejects two entries under
+        // one name, and the synthetic one reports no postings or points.
         for (MappedFieldType mft : mapperService.fieldTypes()) {
             String name = mft.name();
             if (mapperService.isMetadataField(name)) {
@@ -130,13 +131,23 @@ public final class ParquetSegmentResourceCache {
             if (FieldTypeMapping.isSupported(mft.typeName()) == false) {
                 continue;
             }
-            if (existing.fieldInfo(name) != null) {
+            FieldInfo realFi = existing.fieldInfo(name);
+            if (realFi != null && realFi.getDocValuesType() != DocValuesType.NONE) {
                 continue;
             }
             DocValuesType dvType = FieldTypeMapping.forType(mft.typeName());
             FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType);
+            if (realFi != null) {
+                combined.removeIf(fi -> fi.name.equals(name));
+            }
             parquetFields.put(name, synthetic);
             combined.add(synthetic);
+            // A mapping flips to LIST permanently the first time an array is ingested, so a field not
+            // marked LIST has never stored one. The reverse is only wasteful: a LIST field whose older
+            // segments happen to hold single values is still treated as multi-valued.
+            if (mft.isMultiValued()) {
+                multiValuedFields.add(name);
+            }
         }
 
         if (parquetFields.isEmpty()) {
@@ -145,7 +156,13 @@ public final class ParquetSegmentResourceCache {
 
         ParquetDocValuesProducer producer = new ParquetDocValuesProducer(state, mapperService);
         FieldInfos combinedFieldInfos = new FieldInfos(combined.toArray(new FieldInfo[0]));
-        ParquetSegmentResources built = new ParquetSegmentResources(producer, parquetFields, combinedFieldInfos);
+        ParquetSegmentResources built = new ParquetSegmentResources(
+            producer,
+            parquetFields,
+            combinedFieldInfos,
+            Set.copyOf(multiValuedFields),
+            segmentReader.getSegmentInfo().info
+        );
         resourceByCore.put(key, built);
         // Registered once, in the create branch only, so a core carries exactly one listener no matter
         // how many requests wrap its leaf.

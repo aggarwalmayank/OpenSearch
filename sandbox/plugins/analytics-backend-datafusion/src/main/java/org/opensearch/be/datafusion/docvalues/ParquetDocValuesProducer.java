@@ -22,6 +22,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
@@ -174,12 +175,24 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     @Override
     public SortedDocValues getSorted(FieldInfo field) {
+        // Keyword and ip are served as SORTED_SET (FieldTypeMapping), so per the DocValuesProducer
+        // contract this accessor is never invoked for a valid FieldInfo.
         throw unsupported("sorted", field);
     }
 
+    /**
+     * Serves {@code field} as a singleton over a dedicated forward-only binary cursor, which the
+     * iterator that receives it closes; callers recover the inner iterator via
+     * {@code DocValues.unwrapSingleton}.
+     */
+    // TODO(multi-value): no repeated read path; the write path emits single values only.
     @Override
-    public SortedSetDocValues getSortedSet(FieldInfo field) {
-        throw unsupported("sorted-set", field);
+    public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
+        ensureOpen();
+        validate(field, DocValuesType.SORTED_SET);
+        // The cursor opens on the first value request, so a leaf whose documents the query never
+        // reaches allocates nothing.
+        return DocValues.singleton(new ParquetSortedDocValues(() -> openBinaryCursor(field.getName()), maxDoc));
     }
 
     /** No DocValues skip index is served; the synthetic {@code FieldInfo}s advertise skip type NONE. */
@@ -211,11 +224,21 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         }
     }
 
+    /**
+     * Number of rows with a non-null value in this column, from the Parquet footer's per-row-group
+     * column-chunk statistics; {@code -1} when any row group lacks the null count. Used to verify
+     * that postings-derived ordinal tables cover every stored value.
+     */
+    long nonNullRowCount(FieldInfo field) throws IOException {
+        return ParquetCodecBridge.columnNonNullCount(parquetFile.toString(), field.getName(), storePointer);
+    }
+
     @Override
     public void close() {
         // Segment-lifetime producer, closed once by the core's closed-listener. It holds no open file
         // handle in this codec (each cursor opens its own), so close only marks the producer done;
-        // request cursors are closed by the request's CursorRegistry, not here.
+        // numeric cursors are closed by the request's CursorRegistry and binary cursors by the
+        // iterator that opened them, not here.
         closed = true;
     }
 
@@ -347,15 +370,30 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return reader;
     }
 
+    /**
+     * Opens a dedicated forward-only binary cursor for one iterator. It is not recorded on the
+     * request's {@code CursorRegistry}: a leaf reader retained by the fielddata cache serves later
+     * requests whose registry is already closed, so the iterator that receives this cursor closes it.
+     */
+    private ParquetColumnReader openBinaryCursor(String field) throws IOException {
+        return ParquetColumnReader.openBinary(parquetFile, field, indexSettings, storePointer);
+    }
+
     private UnsupportedOperationException unsupported(String kind, FieldInfo field) {
         return new UnsupportedOperationException(
             String.format(
                 Locale.ROOT,
-                "Parquet DocValues codec does not serve %s doc values (field '%s'); sorted-numeric only",
+                "Parquet DocValues codec does not serve %s doc values (field '%s'); sorted-numeric and sorted-set only",
                 kind,
                 field.getName()
             )
         );
+    }
+
+    private void ensureOpen() {
+        if (closed) {
+            throw new IllegalStateException("ParquetDocValuesProducer is closed");
+        }
     }
 
     /** Whether {@link #close()} has run. */

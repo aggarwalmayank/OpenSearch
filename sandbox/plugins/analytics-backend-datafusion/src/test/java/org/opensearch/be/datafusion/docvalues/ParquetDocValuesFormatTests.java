@@ -42,15 +42,18 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.NumericUtils;
 import org.opensearch.be.datafusion.DatafusionSettings;
 import org.opensearch.be.datafusion.docvalues.bridge.DataFusionBackedTestCase;
 import org.opensearch.be.datafusion.docvalues.bridge.DecodedBatch;
+import org.opensearch.be.datafusion.docvalues.bridge.DecodedBinaryBatch;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
 import org.opensearch.common.settings.Settings;
@@ -59,10 +62,14 @@ import org.opensearch.parquet.bridge.NativeParquetWriter;
 import org.opensearch.parquet.bridge.ParquetSortConfig;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 
@@ -939,7 +946,13 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
      */
     public void testSecondWrapOverSameCoreReusesResources() throws Exception {
         ParquetDocValuesProducer producer = newFixtureProducer("identity.parquet");
-        ParquetSegmentResources resources = new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]));
+        ParquetSegmentResources resources = new ParquetSegmentResources(
+            producer,
+            Map.of(),
+            new FieldInfos(new FieldInfo[0]),
+            Set.of(),
+            null
+        );
 
         Directory dir = newDirectory();
         IndexWriter writer = singleDocWriter(dir);
@@ -957,7 +970,7 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
             // records nothing new: the per-core resources are resolved once.
             ParquetSegmentResources second = cache.cacheForTesting(
                 leaf,
-                new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]))
+                new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]), Set.of(), null)
             );
             assertSame("second wrap over the same core reuses the same resources instance", resources, second);
             assertEquals("second wrap adds no cache entry", before + 1, cache.size());
@@ -975,7 +988,13 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
      */
     public void testSegmentCoreCloseClosesTheProducer() throws Exception {
         ParquetDocValuesProducer producer = newFixtureProducer("core.parquet");
-        ParquetSegmentResources resources = new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]));
+        ParquetSegmentResources resources = new ParquetSegmentResources(
+            producer,
+            Map.of(),
+            new FieldInfos(new FieldInfo[0]),
+            Set.of(),
+            null
+        );
 
         Directory dir = newDirectory();
         IndexWriter writer = singleDocWriter(dir);
@@ -1003,18 +1022,14 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
     }
 
     // ------------------------------------------------------------------------------------------------
-    // Unsupported doc-values kinds. The format serves only SORTED_NUMERIC; the base DocValuesFormat
-    // matrix also exercises SORTED, SORTED_SET and BINARY. The producer is asserted to reject them.
+    // Accessors no served field can validly reach. A served field is SORTED_NUMERIC (numeric types) or
+    // SORTED_SET (keyword, ip), so the base DocValuesFormat matrix's SORTED and BINARY accessors, and the
+    // plain numeric one, are always refused.
     // ------------------------------------------------------------------------------------------------
 
     public void testSortedIsUnsupported() {
         ParquetDocValuesProducer producer = newFixtureProducer("unsupported-sorted.parquet");
         expectThrows(UnsupportedOperationException.class, () -> producer.getSorted(sortedNumericField(COLUMN)));
-    }
-
-    public void testSortedSetIsUnsupported() {
-        ParquetDocValuesProducer producer = newFixtureProducer("unsupported-sortedset.parquet");
-        expectThrows(UnsupportedOperationException.class, () -> producer.getSortedSet(sortedNumericField(COLUMN)));
     }
 
     public void testBinaryIsUnsupported() {
@@ -1032,6 +1047,268 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
     public void testSortedNumericWithoutRegistryIsUnsupported() {
         ParquetDocValuesProducer producer = newFixtureProducer("unsupported-noregistry.parquet");
         expectThrows(UnsupportedOperationException.class, () -> producer.getSortedNumeric(sortedNumericField(COLUMN)));
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Keyword columns served through the binary cursor. A keyword field is synthesized as SORTED_SET and
+    // served as a singleton over a UTF-8 column; the leaf reader unwraps that singleton to layer segment
+    // ordinals over it.
+    // ------------------------------------------------------------------------------------------------
+
+    public void testKeywordColumnRoundTripsValues() throws Exception {
+        List<String> values = List.of("apple", "banana", "cherry", "délicieux");
+        Path file = createTempDir().resolve("keyword-roundtrip.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            values.size(),
+            null
+        );
+        SortedDocValues dv = DocValues.unwrapSingleton(producer.getSortedSet(sortedSetField(COLUMN)));
+
+        for (int doc = 0; doc < values.size(); doc++) {
+            assertTrue("row " + doc + " must be present", dv.advanceExact(doc));
+            assertEquals(new BytesRef(values.get(doc)), dv.lookupOrd(dv.ordValue()));
+        }
+    }
+
+    public void testKeywordNullRowIsAbsent() throws Exception {
+        List<String> values = Arrays.asList("first", null, "third");
+        Path file = createTempDir().resolve("keyword-nulls.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            values.size(),
+            null
+        );
+        SortedDocValues dv = DocValues.unwrapSingleton(producer.getSortedSet(sortedSetField(COLUMN)));
+
+        assertTrue(dv.advanceExact(0));
+        assertEquals(new BytesRef("first"), dv.lookupOrd(dv.ordValue()));
+        assertFalse("the null row carries no value", dv.advanceExact(1));
+        assertTrue(dv.advanceExact(2));
+        assertEquals(new BytesRef("third"), dv.lookupOrd(dv.ordValue()));
+    }
+
+    /** ParquetDocValuesLeafReader unwraps this singleton to wrap it in segment ordinals, so the wrapping is load-bearing. */
+    public void testKeywordSortedSetIsASingletonView() throws Exception {
+        ParquetDocValuesProducer producer = newFixtureProducer("keyword-singleton.parquet");
+        assertNotNull(DocValues.unwrapSingleton(producer.getSortedSet(sortedSetField(COLUMN))));
+    }
+
+    /**
+     * The doc id doubles as the ordinal, so an ordinal issued for another document must be refused: serving
+     * it would return the current document's value under a stale ordinal.
+     */
+    public void testKeywordLookupOrdRefusesAnotherDocumentsOrdinal() throws Exception {
+        List<String> values = List.of("apple", "banana");
+        Path file = createTempDir().resolve("keyword-cross-ord.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        SortedDocValues dv = keywordDocValues(file, values.size());
+        assertTrue(dv.advanceExact(0));
+        UnsupportedOperationException e = expectThrows(UnsupportedOperationException.class, () -> dv.lookupOrd(1));
+        assertTrue(e.getMessage(), e.getMessage().contains("execution_hint:map"));
+    }
+
+    public void testKeywordNextDocVisitsOnlyPresentRows() throws Exception {
+        List<String> values = Arrays.asList("a", null, "c", null, "e");
+        Path file = createTempDir().resolve("keyword-nextdoc.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        SortedDocValues dv = keywordDocValues(file, values.size());
+        assertEquals(0, dv.nextDoc());
+        assertEquals(2, dv.nextDoc());
+        assertEquals(4, dv.nextDoc());
+        assertEquals(DocIdSetIterator.NO_MORE_DOCS, dv.nextDoc());
+    }
+
+    public void testKeywordAdvanceSkipsToTheNextPresentRow() throws Exception {
+        List<String> values = Arrays.asList("a", null, null, "d");
+        Path file = createTempDir().resolve("keyword-advance.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        SortedDocValues dv = keywordDocValues(file, values.size());
+        assertEquals("advance skips the two null rows", 3, dv.advance(1));
+        assertEquals(DocIdSetIterator.NO_MORE_DOCS, dv.advance(values.size()));
+    }
+
+    /**
+     * The count the leaf reader compares against the ordinals it assigned; a wrong value would either
+     * refuse a healthy field or accept an under-covered one.
+     */
+    public void testNonNullRowCountCountsPresentRows() throws Exception {
+        List<String> values = Arrays.asList("a", null, "c", null, "e");
+        Path file = createTempDir().resolve("nonnull-count.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            values.size(),
+            null
+        );
+        assertEquals("three of five rows carry a value", 3L, producer.nonNullRowCount(sortedSetField(COLUMN)));
+    }
+
+    /** Zero non-null rows is what sends the leaf reader to DocValues.emptySorted instead of building ordinals. */
+    public void testNonNullRowCountIsZeroForAnAllNullColumn() throws Exception {
+        List<String> values = Arrays.asList(null, null, null);
+        Path file = createTempDir().resolve("nonnull-count-allnull.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            values.size(),
+            null
+        );
+        assertEquals("no row carries a value", 0L, producer.nonNullRowCount(sortedSetField(COLUMN)));
+    }
+
+    /** The keyword column of {@code file} as the leaf reader sees it: the singleton unwrapped. */
+    private SortedDocValues keywordDocValues(Path file, int maxDoc) throws IOException {
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            maxDoc,
+            null
+        );
+        return DocValues.unwrapSingleton(producer.getSortedSet(sortedSetField(COLUMN)));
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Binary batch mechanics. The keyword path copies each batch out of native memory, so the presence
+    // bitmap, the fence-post offsets and the value buffer are all this module's own code.
+    // ------------------------------------------------------------------------------------------------
+
+    public void testBinaryPresenceBitmapMatchesTheColumn() throws Exception {
+        List<String> values = Arrays.asList("a", null, "ccc", "dd", null, "f", "gg", null, "i", "jj");
+        Path file = createTempDir().resolve("binary-presence.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        try (ParquetColumnReader reader = ParquetColumnReader.openBinary(file, COLUMN)) {
+            for (int row = 0; row < values.size(); row++) {
+                DecodedBinaryBatch batch = loadBinaryRow(reader, row);
+                assertEquals("presence of row " + row, values.get(row) != null, batch.isPresent(row));
+            }
+        }
+    }
+
+    /**
+     * Lengths are byte lengths, not character counts, and an empty value is present with length zero -
+     * only the presence bit separates it from an absent row.
+     */
+    public void testBinaryValueLengthsAreByteLengths() throws Exception {
+        List<String> values = Arrays.asList("a", "délicieux", "", null, "zzzzzzzz");
+        Path file = createTempDir().resolve("binary-lengths.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        try (ParquetColumnReader reader = ParquetColumnReader.openBinary(file, COLUMN)) {
+            for (int row = 0; row < values.size(); row++) {
+                DecodedBinaryBatch batch = loadBinaryRow(reader, row);
+                String value = values.get(row);
+                if (value == null) {
+                    assertFalse("row " + row + " is absent", batch.isPresent(row));
+                    assertEquals("an absent row has no bytes", 0, batch.valueLength(row));
+                    continue;
+                }
+                byte[] expected = value.getBytes(StandardCharsets.UTF_8);
+                assertTrue("row " + row + " is present", batch.isPresent(row));
+                assertEquals("row " + row + " byte length", expected.length, batch.valueLength(row));
+
+                byte[] actual = new byte[batch.valueLength(row)];
+                assertEquals(expected.length, batch.copyValue(row, actual));
+                assertArrayEquals("row " + row + " bytes", expected, actual);
+            }
+        }
+    }
+
+    /** A presence test for a row the resident batch does not cover is a programming error, not a false. */
+    public void testBinaryPresenceLookupOutsideTheBatchThrows() throws Exception {
+        List<String> values = List.of("a", "b", "c", "d", "e", "f");
+        Path file = createTempDir().resolve("binary-bounds.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        try (ParquetColumnReader reader = ParquetColumnReader.openBinary(file, COLUMN, 2, 2, ParquetColumnReader.LOCAL_STORE)) {
+            DecodedBinaryBatch batch = loadBinaryRow(reader, 0);
+            assertFalse("a two-row window cannot cover the last row", batch.contains(5));
+            expectThrows(IndexOutOfBoundsException.class, () -> batch.isPresent(5));
+        }
+    }
+
+    public void testBinaryWindowStaysCappedAtMaxBatchSize() throws Exception {
+        List<String> values = new ArrayList<>();
+        for (int row = 0; row < 16; row++) {
+            values.add("v" + row);
+        }
+        Path file = createTempDir().resolve("binary-window.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        try (ParquetColumnReader reader = ParquetColumnReader.openBinary(file, COLUMN, 4, 8, ParquetColumnReader.LOCAL_STORE)) {
+            for (int row = 0; row < values.size(); row++) {
+                DecodedBinaryBatch batch = loadBinaryRow(reader, row);
+                assertTrue("the batch must cover the requested row " + row, batch.contains(row));
+                assertFalse("window must stay capped at max_batch_size=8 rows", batch.contains(row + 8));
+            }
+        }
+    }
+
+    /** The native cursor is forward-only, so an earlier row must reopen it rather than fail. */
+    public void testBinaryEarlierRowReloadsTheBatch() throws Exception {
+        List<String> values = new ArrayList<>();
+        for (int row = 0; row < 12; row++) {
+            values.add("v" + row);
+        }
+        Path file = createTempDir().resolve("binary-backward.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        try (ParquetColumnReader reader = ParquetColumnReader.openBinary(file, COLUMN, 2, 2, ParquetColumnReader.LOCAL_STORE)) {
+            DecodedBinaryBatch forward = loadBinaryRow(reader, 10);
+            assertEquals("v10", readValue(forward, 10));
+
+            DecodedBinaryBatch back = loadBinaryRow(reader, 1);
+            assertTrue("the reopened cursor must cover the earlier row", back.contains(1));
+            assertEquals("v1", readValue(back, 1));
+        }
+    }
+
+    /** A value longer than the 64 KB starting buffer takes the overflow retry, which resizes and re-reads. */
+    public void testBinaryValueLargerThanTheStartingBufferIsServed() throws Exception {
+        String large = "x".repeat(70_000);
+        Path file = createTempDir().resolve("binary-large.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, List.of(large));
+
+        try (ParquetColumnReader reader = ParquetColumnReader.openBinary(file, COLUMN)) {
+            DecodedBinaryBatch batch = loadBinaryRow(reader, 0);
+            assertEquals(70_000, batch.valueLength(0));
+            assertEquals(large, readValue(batch, 0));
+        }
+    }
+
+    /** The batch containing {@code row}, loading it when the resident batch does not cover it. */
+    private static DecodedBinaryBatch loadBinaryRow(ParquetColumnReader reader, long row) throws IOException {
+        DecodedBinaryBatch batch = reader.decodedBinaryBatch();
+        if (batch == null || batch.contains(row) == false) {
+            reader.loadBatchContaining(row);
+            batch = reader.decodedBinaryBatch();
+        }
+        return batch;
+    }
+
+    private static String readValue(DecodedBinaryBatch batch, long row) {
+        byte[] bytes = new byte[batch.valueLength(row)];
+        batch.copyValue(row, bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -1095,6 +1372,30 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
             false,
             IndexOptions.NONE,
             DocValuesType.SORTED_NUMERIC,
+            DocValuesSkipIndexType.NONE,
+            -1,
+            new HashMap<>(),
+            0,
+            0,
+            0,
+            0,
+            VectorEncoding.FLOAT32,
+            VectorSimilarityFunction.EUCLIDEAN,
+            false,
+            false
+        );
+    }
+
+    /** A synthetic SORTED_SET field info, as the resources builder synthesizes for a keyword or ip field. */
+    private static FieldInfo sortedSetField(String name) {
+        return new FieldInfo(
+            name,
+            0,
+            false,
+            true,
+            false,
+            IndexOptions.NONE,
+            DocValuesType.SORTED_SET,
             DocValuesSkipIndexType.NONE,
             -1,
             new HashMap<>(),

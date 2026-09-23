@@ -834,6 +834,69 @@ pub unsafe extern "C" fn parquet_df_file_metadata(
     Ok(RC_OK)
 }
 
+/// Total rows carrying a non-null value in `column`, summed over the footer's row-group column
+/// chunks through the same store and footer cache a cursor would use.
+///
+/// Writes `-1` (not an error) when any chunk lacks statistics or a null count: an unverifiable
+/// total must not masquerade as a real one. Writes `out_count` only on a non-negative return.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_column_non_null_count(
+    file_ptr: *const u8,
+    file_len: i64,
+    column_ptr: *const u8,
+    column_len: i64,
+    // 0 for a local (hot) shard; a warm shard passes its TieredObjectStore box pointer.
+    store_ptr: i64,
+    out_count: *mut i64,
+) -> i64 {
+    static FN: &str = "parquet_df_column_non_null_count";
+    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("{FN} file: {e}"))?;
+    let column = str_from_raw(column_ptr, column_len).map_err(|e| format!("{FN} column: {e}"))?;
+    if out_count.is_null() {
+        return Err(format!("{FN}: null out-parameter"));
+    }
+    let runtime = io_runtime().map_err(|e| format!("{FN}: {e}"))?;
+    let location = ObjectPath::from(filename);
+    let store: Arc<dyn ObjectStore> = match store_from_ptr(store_ptr).map_err(|e| format!("{FN}: {e}"))? {
+        Some(store) => store,
+        None => Arc::new(LocalFileSystem::new()),
+    };
+    let cache = runtime_env()
+        .map_err(|e| format!("{FN}: {e}"))?
+        .cache_manager
+        .get_file_metadata_cache();
+    let footer = runtime.block_on(async {
+        let object_meta = store
+            .head(&location)
+            .await
+            .map_err(|e| format!("{FN} head {filename}: {e}"))?;
+        load_parquet_metadata_with_meta(store, &location, object_meta, cache)
+            .await
+            .map(|(_schema, _size, footer)| footer)
+            .map_err(|e| format!("{FN} {filename}: {e}"))
+    })?;
+    let schema = footer.file_metadata().schema_descr();
+    let col_idx = (0..schema.num_columns())
+        .find(|&i| schema.column(i).name() == column)
+        .ok_or_else(|| format!("{FN}: column {column} not found"))?;
+    let mut total: i64 = 0;
+    for rg_idx in 0..footer.num_row_groups() {
+        let chunk = footer.row_group(rg_idx).column(col_idx);
+        match chunk.statistics().and_then(|s| s.null_count_opt()) {
+            Some(null_count) => total += chunk.num_values() - null_count as i64,
+            // A chunk without a null count can't prove its non-null total, so the whole file is
+            // unverifiable: -1 is the contract, not an error.
+            None => {
+                *out_count = -1;
+                return Ok(RC_OK);
+            }
+        }
+    }
+    *out_count = total;
+    Ok(RC_OK)
+}
+
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn parquet_df_close_iter(handle: i64) -> i64 {

@@ -21,7 +21,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 
 /**
- * Numeric column reader backed by a forward-only native Arrow column cursor.
+ * Column reader backed by a forward-only native Arrow column cursor.
  *
  * <p>The native cursor only advances forward. This wrapper still serves a request that falls behind
  * the current batch by reopening the cursor (cheap, since file metadata is cached) and scanning
@@ -31,11 +31,18 @@ import java.nio.file.Path;
  * points off-heap views at them and reads values in place, with no copy. Those views are valid only
  * until the next batch call on this reader, which always replaces the batch first.
  *
- * <p>Scope is numeric fixed-width columns. Types the native cursor cannot borrow are rejected when
- * the cursor is opened, so an unsupported field is unreadable rather than read incorrectly.
+ * <p>Binary (BYTE_ARRAY) columns cannot be borrowed: a view-encoded string column has no single
+ * contiguous buffer to point at, so {@link #openBinary} readers have the native side copy each
+ * batch out (values, fence-post offsets, presence bits) into reader-owned staging buffers exposed
+ * as a {@link DecodedBinaryBatch} of bounded off-heap views, valid until the reader's next load
+ * rather than its next native call.
+ *
+ * <p>Scope is numeric fixed-width columns and variable-width (keyword/ip) binary columns. Types the
+ * native cursor cannot serve are rejected when the cursor is opened, so an unsupported field is
+ * unreadable rather than read incorrectly.
  *
  * <p>Out of scope for this reader: booleans (Arrow packs them bit-wise, so borrowing needs a value
- * bit offset like the validity bitmap), repeated numerics, binary and keyword columns,
+ * bit offset like the validity bitmap), repeated (multi-valued) columns,
  * {@code half_float} (written as Arrow Float16, which would need a value kind that re-encodes to
  * {@code HalfFloatPoint.halfFloatToSortableShort}), and {@code scaled_float}.
  *
@@ -54,7 +61,7 @@ import java.nio.file.Path;
  * live-handle registry, and {@link #close()} is idempotent through the base class: closing an
  * already-closed reader is a no-op and the cursor is freed exactly once.
  */
-public final class ParquetColumnReader extends NativeHandle implements NumericValueReader {
+public final class ParquetColumnReader extends NativeHandle implements NumericValueReader, BinaryValueReader {
 
     private static final Logger LOGGER = LogManager.getLogger(ParquetColumnReader.class);
 
@@ -68,6 +75,9 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     /** Number of scalar out-parameters {@code nextBatch} writes back. */
     private static final int OUT_PARAM_COUNT = 7;
 
+    /** Starting binary value-buffer capacity; an overflow retry ratchets it to the reported need. */
+    private static final long INITIAL_BINARY_VALUE_BYTES = 64 * 1024L;
+
     private final Path file;
     private final String column;
 
@@ -79,13 +89,55 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
      */
     private final int maxBatchSize;
 
-    private DecodedBatch decodedBatch;
+    /**
+     * True when this reader serves a variable-width (keyword/ip) column through the binary batch
+     * export; false for the numeric zero-copy path. Fixed at open.
+     */
+    private final boolean binary;
 
-    private ParquetColumnReader(long handle, Path file, String column, int maxBatchSize) {
+    /**
+     * Staging buffers the native binary export copies into, sized once at open: a batch never
+     * exceeds {@code maxBatchSize} rows, so the offsets and presence buffers cannot overflow.
+     * Null for numeric readers.
+     */
+    private final Arena binaryArena;
+    private final MemorySegment offsetsBuf;
+    private final MemorySegment presenceBuf;
+    private final long presenceWords;
+
+    /**
+     * Replaced wholesale when a batch's value bytes outgrow it (grow-only ratchet); kept in its
+     * own arena so the old buffer can be freed without touching the fixed ones.
+     */
+    private Arena valueArena;
+    private MemorySegment valueBuf;
+
+    private DecodedBatch decodedBatch;
+    private DecodedBinaryBatch decodedBinaryBatch;
+
+    private ParquetColumnReader(long handle, Path file, String column, int maxBatchSize, boolean binary) {
         super(handle);
         this.file = file;
         this.column = column;
         this.maxBatchSize = maxBatchSize;
+        this.binary = binary;
+        if (binary) {
+            this.presenceWords = (maxBatchSize + 63) / 64;
+            // Shared, not confined: the reader is opened by the segment-opening thread and read by
+            // search threads.
+            this.binaryArena = Arena.ofShared();
+            this.offsetsBuf = binaryArena.allocate(ValueLayout.JAVA_INT, maxBatchSize + 1L);
+            this.presenceBuf = binaryArena.allocate(ValueLayout.JAVA_LONG, presenceWords);
+            this.valueArena = Arena.ofShared();
+            this.valueBuf = valueArena.allocate(INITIAL_BINARY_VALUE_BYTES);
+        } else {
+            this.presenceWords = 0;
+            this.binaryArena = null;
+            this.offsetsBuf = null;
+            this.presenceBuf = null;
+            this.valueArena = null;
+            this.valueBuf = null;
+        }
     }
 
     /** Opens a numeric cursor over a local file using the default batch-size settings. */
@@ -133,12 +185,51 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     public static ParquetColumnReader open(Path file, String column, int initialBatchSize, int maxBatchSize, long storePtr)
         throws IOException {
         long handle = ParquetCodecBridge.openColumnCursor(file.toString(), column, initialBatchSize, maxBatchSize, storePtr);
-        return new ParquetColumnReader(handle, file, column, maxBatchSize);
+        return new ParquetColumnReader(handle, file, column, maxBatchSize, false);
+    }
+
+    /** Opens a binary (keyword/ip) cursor over a local file using the default batch-size settings. */
+    public static ParquetColumnReader openBinary(Path file, String column) throws IOException {
+        return openBinary(file, column, Settings.EMPTY);
+    }
+
+    /** Opens a binary cursor over a local file, sized from {@code settings}. */
+    public static ParquetColumnReader openBinary(Path file, String column, Settings settings) throws IOException {
+        return openBinary(file, column, settings, LOCAL_STORE);
+    }
+
+    /** Opens a binary cursor sized from the {@code index.parquet.docvalues.*} batch settings. */
+    public static ParquetColumnReader openBinary(Path file, String column, Settings settings, long storePtr) throws IOException {
+        return openBinary(
+            file,
+            column,
+            DatafusionSettings.docValuesInitialBatchSize(settings),
+            DatafusionSettings.docValuesMaxBatchSize(settings),
+            storePtr
+        );
+    }
+
+    /** Opens a binary cursor with explicit window sizes, bypassing settings resolution. */
+    public static ParquetColumnReader openBinary(Path file, String column, int initialBatchSize, int maxBatchSize, long storePtr)
+        throws IOException {
+        long handle = ParquetCodecBridge.openColumnCursor(file.toString(), column, initialBatchSize, maxBatchSize, storePtr);
+        return new ParquetColumnReader(handle, file, column, maxBatchSize, true);
     }
 
     @Override
     public DecodedBatch decodedBatch() {
+        if (binary) {
+            throw new IllegalStateException("column " + column + " is binary; use decodedBinaryBatch()");
+        }
         return decodedBatch;
+    }
+
+    @Override
+    public DecodedBinaryBatch decodedBinaryBatch() {
+        if (binary == false) {
+            throw new IllegalStateException("column " + column + " is numeric; use decodedBatch()");
+        }
+        return decodedBinaryBatch;
     }
 
     /**
@@ -149,6 +240,19 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     @Override
     public void loadBatchContaining(long row) throws IOException {
         ensureOpen();
+        if (binary) {
+            DecodedBinaryBatch currentBinary = decodedBinaryBatch;
+            if (currentBinary != null) {
+                if (currentBinary.contains(row)) {
+                    return;
+                }
+                if (row < currentBinary.firstRow()) {
+                    reopen();
+                }
+            }
+            loadBinaryBatch(row);
+            return;
+        }
         DecodedBatch current = decodedBatch;
         if (current != null) {
             // The native cursor parks past the resident batch, so re-requesting a row it already
@@ -166,6 +270,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     /** Replaces the forward-only cursor with a fresh one at row zero. Only reached on a backward request. */
     private void reopen() throws IOException {
         decodedBatch = null;
+        decodedBinaryBatch = null;
         ParquetCodecBridge.resetColumnCursor(ptr);
     }
 
@@ -258,6 +363,93 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     }
 
     /**
+     * Loads a copied-out binary batch containing {@code row}: values packed back to back, fence-post
+     * offsets, and presence bits, staged in this reader's buffers and served as bounded off-heap
+     * views; consumers copy one row at a time into reusable scratch via
+     * {@link DecodedBinaryBatch#copyValue}.
+     */
+    private void loadBinaryBatch(long row) throws IOException {
+        // Dropped before the call: a failed load must not leave a batch describing stale buffers.
+        decodedBinaryBatch = null;
+
+        try (Arena callArena = Arena.ofConfined()) {
+            MemorySegment out = callArena.allocate(ValueLayout.JAVA_LONG, 3);
+            MemorySegment firstRowOut = out.asSlice(0L, Long.BYTES);
+            MemorySegment lastRowOut = out.asSlice(Long.BYTES, Long.BYTES);
+            MemorySegment actualLenOut = out.asSlice(2L * Long.BYTES, Long.BYTES);
+
+            // Two attempts: only RC_OVERFLOW triggers the second, and the retry's buffer is sized to
+            // the exact reported need over the batch the native side staged, so it cannot overflow
+            // again unless the native contract is broken.
+            for (int attempt = 0; attempt < 2; attempt++) {
+                long rc = ParquetCodecBridge.nextBinaryBatch(
+                    ptr,
+                    row,
+                    firstRowOut,
+                    lastRowOut,
+                    valueBuf,
+                    valueBuf.byteSize(),
+                    actualLenOut,
+                    offsetsBuf,
+                    maxBatchSize + 1L,
+                    presenceBuf,
+                    presenceWords
+                );
+                if (rc == ParquetCodecBridge.RC_OVERFLOW) {
+                    growBinaryValueBuffer(actualLenOut.get(ValueLayout.JAVA_LONG, 0), row);
+                    continue;
+                }
+                checkStatus(rc, row);
+
+                long firstRow = firstRowOut.get(ValueLayout.JAVA_LONG, 0);
+                long lastRow = lastRowOut.get(ValueLayout.JAVA_LONG, 0);
+                long actualLen = actualLenOut.get(ValueLayout.JAVA_LONG, 0);
+                if (firstRow < 0 || lastRow < firstRow || row < firstRow || row > lastRow) {
+                    throw contractViolation(row, "row range [" + firstRow + ", " + lastRow + "]");
+                }
+                long batchRowsLong = lastRow - firstRow + 1;
+                if (batchRowsLong > maxBatchSize) {
+                    throw contractViolation(row, batchRowsLong + " rows exceeds cap " + maxBatchSize);
+                }
+                if (actualLen < 0 || actualLen > valueBuf.byteSize()) {
+                    throw contractViolation(row, "value length " + actualLen + " outside buffer of " + valueBuf.byteSize());
+                }
+                int batchRows = (int) batchRowsLong;
+                int firstPost = offsetsBuf.getAtIndex(ValueLayout.JAVA_INT, 0);
+                int lastPost = offsetsBuf.getAtIndex(ValueLayout.JAVA_INT, batchRows);
+                if (firstPost != 0 || lastPost != actualLen) {
+                    throw contractViolation(row, "offset posts [" + firstPost + ", " + lastPost + "] vs length " + actualLen);
+                }
+
+                // Bounded views of exactly the filled bytes, not the buffers' full capacity, so the
+                // batch's bounds-checked reads cannot wander into leftover garbage. Valid until the
+                // next load on this reader, which replaces the batch (and may replace the buffers)
+                // before the native side writes again.
+                decodedBinaryBatch = new DecodedBinaryBatch(
+                    firstRow,
+                    lastRow,
+                    valueBuf.asSlice(0, actualLen),
+                    offsetsBuf.asSlice(0, (batchRows + 1L) * Integer.BYTES),
+                    presenceBuf.asSlice(0, (long) ((batchRows + 63) >>> 6) * Long.BYTES)
+                );
+                return;
+            }
+            throw contractViolation(row, "cursor still overflowing after growing to " + valueBuf.byteSize() + " bytes");
+        }
+    }
+
+    /** Grow-only ratchet: frees the old value buffer and allocates one at the reported need. */
+    private void growBinaryValueBuffer(long neededBytes, long row) throws IOException {
+        if (neededBytes <= valueBuf.byteSize()) {
+            throw contractViolation(row, "overflow reported at " + neededBytes + " bytes into a buffer of " + valueBuf.byteSize());
+        }
+        Arena old = valueArena;
+        valueArena = Arena.ofShared();
+        valueBuf = valueArena.allocate(neededBytes);
+        old.close();
+    }
+
+    /**
      * Byte length of the borrowed values buffer for a batch, rejecting any kind this reader does not
      * understand. Called before {@code reinterpret} so an unknown kind never sizes a memory view.
      */
@@ -275,32 +467,44 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     }
 
     private IOException contractViolation(long row, String detail) {
+        String shape = binary ? "binary" : "numeric";
         return new IOException(
-            "native numeric cursor returned an invalid batch at row " + row + " (" + detail + ") for " + file + "/" + column
+            "native " + shape + " cursor returned an invalid batch at row " + row + " (" + detail + ") for " + file + "/" + column
         );
     }
 
     private void checkStatus(long rc, long row) throws IOException {
+        String shape = binary ? "binary" : "numeric";
         if (rc == ParquetCodecBridge.RC_EOF) {
-            throw new IOException("native numeric cursor exhausted before row " + row + " (" + file + "/" + column + ")");
+            throw new IOException("native " + shape + " cursor exhausted before row " + row + " (" + file + "/" + column + ")");
         }
         if (rc != ParquetCodecBridge.RC_OK) {
-            throw new IOException("Unexpected native numeric cursor status " + rc + " at row " + row + " (" + file + "/" + column + ")");
+            throw new IOException(
+                "Unexpected native " + shape + " cursor status " + rc + " at row " + row + " (" + file + "/" + column + ")"
+            );
         }
     }
 
     @Override
     protected void doClose() {
-        // Drop the resident batch before freeing the cursor: a DecodedBatch holds off-heap views
+        // Drop the resident batches before freeing the cursor: a DecodedBatch holds off-heap views
         // into buffers the native cursor owns, so it must not stay reachable once those buffers are
         // freed.
         decodedBatch = null;
+        decodedBinaryBatch = null;
         try {
             ParquetCodecBridge.closeColumnCursor(ptr);
         } catch (IOException e) {
             // A negative status means Rust panicked tearing the cursor down; #[ffm_safe] caught it at
             // the boundary. doClose() cannot throw a checked exception, so keep the message here.
             LOGGER.error("failed to close native column cursor for {}/{}", file, column, e);
+        } finally {
+            if (valueArena != null) {
+                valueArena.close();
+            }
+            if (binaryArena != null) {
+                binaryArena.close();
+            }
         }
     }
 }

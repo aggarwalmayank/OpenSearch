@@ -1,0 +1,121 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.be.datafusion.docvalues.iter;
+
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.util.BytesRef;
+import org.opensearch.be.datafusion.docvalues.UninvertedOrdinals;
+
+import java.io.IOException;
+
+/**
+ * Fully contract-compliant {@link SortedDocValues} for keyword fields, backed by disk-resident
+ * {@link UninvertedOrdinals}: {@code ordValue()} is one packed read from the mapped ord file
+ * (no Parquet); {@code lookupOrd(currentOrd)} is served zero-copy from the streaming reader;
+ * {@code lookupOrd(otherOrd)} resolves through a stateful terms cursor.
+ */
+public final class ParquetUninvertedSortedDocValues extends SortedDocValues {
+
+    private final UninvertedOrdinals ordinals;
+    private final ParquetSortedDocValues streaming;
+    private final int maxDoc;
+
+    private UninvertedOrdinals.TermCursor termCursor;
+    private UninvertedOrdinals.OrdinalCursor ordCursor; // block-caching; forward-only for sparse (IndexedDISI)
+    private int doc = -1;
+    private int currentOrd = -1;
+    private boolean streamingPositioned = false;
+
+    public ParquetUninvertedSortedDocValues(UninvertedOrdinals ordinals, ParquetSortedDocValues streaming, int maxDoc) {
+        this.ordinals = ordinals;
+        this.streaming = streaming;
+        this.maxDoc = maxDoc;
+    }
+
+    @Override
+    public boolean advanceExact(int target) {
+        if (target >= maxDoc) {
+            doc = NO_MORE_DOCS;
+            currentOrd = -1;
+            return false;
+        }
+        doc = target;
+        streamingPositioned = false; // value read is lazy; most consumers never need it
+        if (ordCursor == null) {
+            ordCursor = ordinals.newOrdinalCursor();
+        }
+        currentOrd = ordCursor.ordinal(target);
+        return currentOrd >= 0;
+    }
+
+    @Override
+    public int ordValue() {
+        return currentOrd;
+    }
+
+    @Override
+    public BytesRef lookupOrd(int ord) throws IOException {
+        if (ord == currentOrd && doc >= 0 && doc != NO_MORE_DOCS) {
+            // Per-document value access: the streaming reader serves the CURRENT document's
+            // bytes from its resident page — O(1), not a terms-index walk.
+            if (streamingPositioned == false) {
+                streaming.advanceExact(doc);
+                streamingPositioned = true;
+            }
+            return streaming.lookupOrd(streaming.ordValue());
+        }
+        if (termCursor == null) {
+            termCursor = ordinals.newTermCursor();
+        }
+        return termCursor.term(ord);
+    }
+
+    @Override
+    public int getValueCount() {
+        return ordinals.valueCount();
+    }
+
+    @Override
+    public int lookupTerm(BytesRef key) {
+        return ordinals.rank(key);
+    }
+
+    @Override
+    public TermsEnum termsEnum() throws IOException {
+        return ordinals.termsEnum();
+    }
+
+    @Override
+    public int docID() {
+        return doc;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+        return advance(doc + 1);
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+        for (int d = target; d < maxDoc; d++) {
+            if (advanceExact(d)) {
+                return d;
+            }
+        }
+        doc = NO_MORE_DOCS;
+        currentOrd = -1;
+        return NO_MORE_DOCS;
+    }
+
+    @Override
+    public long cost() {
+        return maxDoc;
+    }
+}
