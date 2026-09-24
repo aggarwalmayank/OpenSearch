@@ -53,9 +53,8 @@ import java.nio.file.Path;
  * {@code MappedFieldType}, so the field must be excluded where the mapping type is known before it
  * reaches this reader.
  *
- * <p>The Parquet page index is also not exposed here. A future DocValues skipper needs it to skip
- * whole pages without decoding, which requires a page-index read in both the native cursor and this
- * bridge.
+ * <p>The Parquet page index is exposed through {@link #pageIndex()} for a DocValues skipper to skip
+ * whole pages without decoding them.
  *
  * <p>This extends {@link NativeHandle}, so the native cursor pointer is tracked in the shared
  * live-handle registry, and {@link #close()} is idempotent through the base class: closing an
@@ -114,6 +113,9 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
 
     private DecodedBatch decodedBatch;
     private DecodedBinaryBatch decodedBinaryBatch;
+
+    /** Loaded once on first request and cached for this reader's lifetime. */
+    private ColumnPageIndex pageIndex;
 
     private ParquetColumnReader(long handle, Path file, String column, int maxBatchSize, boolean binary) {
         super(handle);
@@ -230,6 +232,15 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
             throw new IllegalStateException("column " + column + " is numeric; use decodedBatch()");
         }
         return decodedBinaryBatch;
+    }
+
+    /** Per-page statistics for a DocValues skipper, loaded once and cached for this reader's lifetime. */
+    public ColumnPageIndex pageIndex() throws IOException {
+        ensureOpen();
+        if (pageIndex == null) {
+            pageIndex = loadPageIndex();
+        }
+        return pageIndex;
     }
 
     /**
@@ -447,6 +458,55 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         valueArena = Arena.ofShared();
         valueBuf = valueArena.allocate(neededBytes);
         old.close();
+    }
+
+    /**
+     * Sizes the parallel arrays from the current page count and retries once at the count the native
+     * side reports if the page table grew between the two calls, so a raced size change widens the
+     * arrays rather than truncating the table.
+     */
+    private ColumnPageIndex loadPageIndex() throws IOException {
+        int capacity = Math.max((int) ParquetCodecBridge.pageCount(ptr), 1);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment firstRow = arena.allocate(ValueLayout.JAVA_LONG, capacity);
+                MemorySegment rowCount = arena.allocate(ValueLayout.JAVA_LONG, capacity);
+                MemorySegment nullCount = arena.allocate(ValueLayout.JAVA_LONG, capacity);
+                MemorySegment minLong = arena.allocate(ValueLayout.JAVA_LONG, capacity);
+                MemorySegment maxLong = arena.allocate(ValueLayout.JAVA_LONG, capacity);
+                MemorySegment actualPages = arena.allocate(ValueLayout.JAVA_LONG, 1);
+
+                long rc = ParquetCodecBridge.pageIndex(ptr, firstRow, rowCount, nullCount, minLong, maxLong, capacity, actualPages);
+                if (rc == ParquetCodecBridge.RC_OVERFLOW) {
+                    int actual = (int) actualPages.get(ValueLayout.JAVA_LONG, 0);
+                    if (actual <= capacity) {
+                        throw contractViolation(0, "page-index overflow reported " + actual + " pages into capacity " + capacity);
+                    }
+                    capacity = actual;
+                    continue;
+                }
+
+                int pages = (int) actualPages.get(ValueLayout.JAVA_LONG, 0);
+                long[] rowCountOf = toLongArray(rowCount, pages);
+                long totalRows = 0;
+                for (long rows : rowCountOf) {
+                    totalRows += rows;
+                }
+                return new ColumnPageIndex(
+                    toLongArray(firstRow, pages),
+                    rowCountOf,
+                    toLongArray(nullCount, pages),
+                    toLongArray(minLong, pages),
+                    toLongArray(maxLong, pages),
+                    totalRows
+                );
+            }
+        }
+        throw contractViolation(0, "page index still overflowing after growing to " + capacity + " pages");
+    }
+
+    private static long[] toLongArray(MemorySegment segment, int length) {
+        return length == 0 ? new long[0] : segment.asSlice(0, (long) length * Long.BYTES).toArray(ValueLayout.JAVA_LONG);
     }
 
     /**

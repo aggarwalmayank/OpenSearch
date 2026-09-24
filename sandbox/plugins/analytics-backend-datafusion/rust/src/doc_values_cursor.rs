@@ -1036,6 +1036,62 @@ pub unsafe extern "C" fn parquet_df_next_binary_batch(
     Ok(RC_OK)
 }
 
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_page_count(handle: i64) -> i64 {
+    static FN: &str = "parquet_df_page_count";
+    let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
+    let page_count = cursor.lock().reader.pages().len() as i64;
+    Ok(page_count)
+}
+
+/// Copies the retained reader's per-page OffsetIndex/ColumnIndex table into
+/// caller-owned parallel arrays for Lucene's DocValuesSkipper.
+#[ffm_safe]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn parquet_df_page_index(
+    handle: i64,
+    out_first_row: *mut i64,
+    out_row_count: *mut i64,
+    out_null_count: *mut i64,
+    out_min_long: *mut i64,
+    out_max_long: *mut i64,
+    out_buf_capacity: i64,
+    out_actual_pages: *mut i64,
+) -> i64 {
+    static FN: &str = "parquet_df_page_index";
+    let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
+    let cursor = cursor.lock();
+    let pages = cursor.reader.pages();
+    if !out_actual_pages.is_null() {
+        *out_actual_pages = pages.len() as i64;
+    }
+    // Report the true page count first, then refuse to write past the caller's arrays.
+    if out_buf_capacity < pages.len() as i64 {
+        return Ok(RC_OVERFLOW);
+    }
+    for (idx, page) in pages.iter().enumerate() {
+        if !out_first_row.is_null() {
+            *out_first_row.add(idx) = page.first_row as i64;
+        }
+        if !out_row_count.is_null() {
+            *out_row_count.add(idx) = page.row_count as i64;
+        }
+        if !out_null_count.is_null() {
+            // -1 is the "unknown" contract when the ColumnIndex carried no null count.
+            *out_null_count.add(idx) = page.null_count.unwrap_or(-1);
+        }
+        if !out_min_long.is_null() {
+            *out_min_long.add(idx) = page.min;
+        }
+        if !out_max_long.is_null() {
+            *out_max_long.add(idx) = page.max;
+        }
+    }
+    Ok(RC_OK)
+}
+
 /// Opening a cursor reads two process globals — the runtime manager and the global `RuntimeEnv`
 /// registration — and inserts into the process-global scoped page-index caches, so every test here
 /// holds `crate::test_process_globals::lock` for its whole body. Uniformly, including the few tests

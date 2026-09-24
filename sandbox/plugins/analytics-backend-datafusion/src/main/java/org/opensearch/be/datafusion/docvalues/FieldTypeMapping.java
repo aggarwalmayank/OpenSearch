@@ -19,10 +19,22 @@ import java.util.Map;
  * <p>One entry per supported mapping type, naming the DV type OpenSearch's own mapper indexes for
  * that type, so a single-valued field arrives as a singleton callers recover via
  * {@code DocValues.unwrapSingleton}. Supporting a new mapping type is one entry here plus the
- * matching accessor on {@link ParquetDocValuesProducer}. The Parquet physical type is not modeled
- * here: the native cursor reads it from the Parquet schema at open time.
+ * matching accessor on {@link ParquetDocValuesProducer}. The exact Parquet primitive type is still
+ * read by the native cursor from the schema at open time; only the coarse {@link PhysicalShape} a
+ * numeric range skipper gates on is recorded here.
  */
 public final class FieldTypeMapping {
+
+    /**
+     * Parquet physical shape of a column, the axis a numeric range skipper gates on: only
+     * {@link #INTEGRAL} columns (INT32 / INT64 / BOOLEAN) carry a minimum and maximum that sort
+     * correctly when their raw bits are compared as signed 64-bit integers.
+     */
+    public enum PhysicalShape {
+        INTEGRAL,
+        FLOATING_POINT,
+        BYTE_ARRAY
+    }
 
     // token_count resolves through the "integer" entry (TokenCountFieldType extends NumberFieldType).
 
@@ -53,6 +65,28 @@ public final class FieldTypeMapping {
         Map.entry("ip", DocValuesType.SORTED_SET)
     );
 
+    // float and double are also stamped SORTED_NUMERIC, so a gate on the doc-values type alone would
+    // admit them, and comparing IEEE-754 bits as a signed 64-bit integer inverts the order of negative
+    // values; the physical shape is the separate axis that keeps them out.
+    private static final Map<String, PhysicalShape> SHAPE_BY_TYPE = Map.ofEntries(
+        Map.entry("byte", PhysicalShape.INTEGRAL),
+        Map.entry("short", PhysicalShape.INTEGRAL),
+        Map.entry("integer", PhysicalShape.INTEGRAL),
+        Map.entry("long", PhysicalShape.INTEGRAL),
+        Map.entry("float", PhysicalShape.FLOATING_POINT),
+        Map.entry("double", PhysicalShape.FLOATING_POINT),
+        Map.entry("date", PhysicalShape.INTEGRAL),
+        Map.entry("date_nanos", PhysicalShape.INTEGRAL),
+        Map.entry("boolean", PhysicalShape.INTEGRAL),
+        Map.entry("unsigned_long", PhysicalShape.INTEGRAL),
+        // Stored as the already-scaled long, so its raw bits are a genuine signed long that sorts correctly.
+        Map.entry("scaled_float", PhysicalShape.INTEGRAL),
+        // Parquet Float16; its stored minimum and maximum are half-precision float bits, not a signed long.
+        Map.entry("half_float", PhysicalShape.FLOATING_POINT),
+        Map.entry("keyword", PhysicalShape.BYTE_ARRAY),
+        Map.entry("ip", PhysicalShape.BYTE_ARRAY)
+    );
+
     private FieldTypeMapping() {}
 
     /** True if the codec has a Parquet DocValues mapping for the given OpenSearch mapping type. */
@@ -73,6 +107,21 @@ public final class FieldTypeMapping {
             );
         }
         return dvType;
+    }
+
+    /**
+     * Returns the Parquet physical shape the codec reads {@code mappingType} as.
+     *
+     * @throws IllegalArgumentException if the mapping type has no Parquet DocValues mapping
+     */
+    public static PhysicalShape physicalShape(String mappingType) {
+        PhysicalShape shape = SHAPE_BY_TYPE.get(mappingType);
+        if (shape == null) {
+            throw new IllegalArgumentException(
+                String.format(Locale.ROOT, "Parquet DocValues codec has no mapping for OpenSearch type '%s'", mappingType)
+            );
+        }
+        return shape;
     }
 
     /**

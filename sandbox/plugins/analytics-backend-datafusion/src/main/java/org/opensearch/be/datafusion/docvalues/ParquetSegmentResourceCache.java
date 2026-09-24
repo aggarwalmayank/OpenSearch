@@ -136,7 +136,7 @@ public final class ParquetSegmentResourceCache {
                 continue;
             }
             DocValuesType dvType = FieldTypeMapping.forType(mft.typeName());
-            FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType);
+            FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType, skipIndexTypeFor(mft.typeName()));
             if (realFi != null) {
                 combined.removeIf(fi -> fi.name.equals(name));
             }
@@ -211,8 +211,18 @@ public final class ParquetSegmentResourceCache {
         return resourceByCore.size();
     }
 
-    /** Builds a synthetic doc-values {@link FieldInfo}. Skip index is NONE: the codec serves no skipper. */
-    private static FieldInfo newDocValuesFieldInfo(String name, int number, DocValuesType dvType) {
+    static boolean isIntegerShaped(String mappingType) {
+        return switch (mappingType) {
+            case "long", "integer", "short", "byte", "date", "boolean" -> true;
+            default -> false;
+        };
+    }
+
+    private static DocValuesSkipIndexType skipIndexTypeFor(String mappingType) {
+        return isIntegerShaped(mappingType) ? DocValuesSkipIndexType.RANGE : DocValuesSkipIndexType.NONE;
+    }
+
+    private static FieldInfo newDocValuesFieldInfo(String name, int number, DocValuesType dvType, DocValuesSkipIndexType skipType) {
         return new FieldInfo(
             name,
             number,
@@ -221,7 +231,7 @@ public final class ParquetSegmentResourceCache {
             false,                       // storePayloads
             IndexOptions.NONE,           // not indexed via this reader
             dvType,
-            DocValuesSkipIndexType.NONE,
+            skipType,
             -1,                          // dvGen
             new HashMap<>(),             // attributes (mutable, per FieldInfo contract)
             0,                           // pointDimensionCount

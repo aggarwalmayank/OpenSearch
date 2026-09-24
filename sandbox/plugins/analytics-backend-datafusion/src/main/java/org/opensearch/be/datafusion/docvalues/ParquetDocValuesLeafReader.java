@@ -10,6 +10,8 @@ package org.opensearch.be.datafusion.docvalues;
 
 import org.apache.lucene.codecs.StoredFieldsReader;
 import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.DocValuesSkipIndexType;
+import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
@@ -94,6 +96,19 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             return null;
         }
         return in.getSortedDocValues(field);
+    }
+
+    @Override
+    public DocValuesSkipper getDocValuesSkipper(String field) throws IOException {
+        FieldInfo fi = resources.parquetFieldInfo(field);
+        if (fi != null) {
+            if (fi.docValuesSkipIndexType() == DocValuesSkipIndexType.NONE) {
+                return null;
+            }
+            assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet doc-values read path";
+            return resources.producer.getSkipper(fi);
+        }
+        return in.getDocValuesSkipper(field);
     }
 
     @Override

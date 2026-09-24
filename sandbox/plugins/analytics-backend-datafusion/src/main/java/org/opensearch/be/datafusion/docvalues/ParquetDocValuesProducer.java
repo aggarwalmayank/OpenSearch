@@ -195,10 +195,15 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return DocValues.singleton(new ParquetSortedDocValues(() -> openBinaryCursor(field.getName()), maxDoc));
     }
 
-    /** No DocValues skip index is served; the synthetic {@code FieldInfo}s advertise skip type NONE. */
     @Override
-    public DocValuesSkipper getSkipper(FieldInfo field) {
-        return null;
+    public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
+        ensureOpen();
+        if (mapperService == null || ParquetSegmentResourceCache.isIntegerShaped(mappingType(field)) == false) {
+            return null;
+        }
+        try (ParquetColumnReader reader = ParquetColumnReader.open(parquetFile, field.getName(), indexSettings, storePointer)) {
+            return new ParquetDocValuesSkipper(reader.pageIndex(), maxDoc);
+        }
     }
 
     /**

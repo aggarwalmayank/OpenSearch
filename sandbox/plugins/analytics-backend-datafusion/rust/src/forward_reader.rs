@@ -48,6 +48,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+/// Absent per-page statistics widen the range rather than narrow it, so the page intersects every query range and is never wrongly skipped.
+const MINMAX_UNKNOWN: (i64, i64) = (i64::MIN, i64::MAX);
+
 /// OffsetIndex/ColumnIndex information for one projected data page.
 #[derive(Debug, Clone)]
 pub struct ParquetForwardPage {
@@ -58,6 +61,12 @@ pub struct ParquetForwardPage {
     /// Whether every value in the page is null, so it can be satisfied without
     /// decoding.
     pub all_null: bool,
+    /// Null count from the ColumnIndex, retained so the page-index export can surface it.
+    pub null_count: Option<i64>,
+    /// Per-page minimum from the ColumnIndex; MINMAX_UNKNOWN when absent.
+    pub min: i64,
+    /// Per-page maximum from the ColumnIndex; MINMAX_UNKNOWN when absent.
+    pub max: i64,
 }
 
 /// A forward-only, page-lazy Parquet batch reader over a single projected leaf
@@ -306,6 +315,11 @@ impl ParquetForwardBatchReader {
         self.row_count
     }
 
+    /// Per-page table, exposed so the cursor's page-index export can read page bounds.
+    pub fn pages(&self) -> &[ParquetForwardPage] {
+        &self.pages
+    }
+
     /// Number of physical rows in the page containing `target_row`.
     pub fn page_row_count(&self, target_row: usize) -> ParquetResult<usize> {
         Ok(self.page_at(target_row)?.row_count)
@@ -421,15 +435,47 @@ fn projected_pages(
             let all_null = page_statistics.is_some_and(|index| {
                 page_idx < index.num_pages() as usize && index.is_null_page(page_idx)
             }) || null_count == Some((end - start) as i64);
+            // Same ColumnIndex the null count came from, guarded on page index the way null_count is.
+            let bounds_index =
+                page_statistics.filter(|index| page_idx < index.num_pages() as usize);
+            let (min, max) = page_min_max(bounds_index, page_idx);
             pages.push(ParquetForwardPage {
                 first_row: row_group_start + start,
                 row_count: end - start,
                 all_null,
+                null_count,
+                min,
+                max,
             });
         }
         row_group_start += row_group_rows;
     }
     Ok(pages)
+}
+
+/// Maps a page's ColumnIndex bounds to (min, max) as i64; only INT32/INT64/BOOLEAN yield real bounds, everything else (FLOAT/DOUBLE, byte arrays) widens to MINMAX_UNKNOWN.
+fn page_min_max(index: Option<&ColumnIndexMetaData>, page_index: usize) -> (i64, i64) {
+    match index {
+        Some(ColumnIndexMetaData::INT32(index)) => {
+            match (index.min_value(page_index), index.max_value(page_index)) {
+                (Some(min), Some(max)) => (*min as i64, *max as i64),
+                _ => MINMAX_UNKNOWN,
+            }
+        }
+        Some(ColumnIndexMetaData::INT64(index)) => {
+            match (index.min_value(page_index), index.max_value(page_index)) {
+                (Some(min), Some(max)) => (*min, *max),
+                _ => MINMAX_UNKNOWN,
+            }
+        }
+        Some(ColumnIndexMetaData::BOOLEAN(index)) => {
+            match (index.min_value(page_index), index.max_value(page_index)) {
+                (Some(min), Some(max)) => (i64::from(*min), i64::from(*max)),
+                _ => MINMAX_UNKNOWN,
+            }
+        }
+        _ => MINMAX_UNKNOWN,
+    }
 }
 
 /// Adapts DataFusion's async object-store reader to Arrow's synchronous lazy

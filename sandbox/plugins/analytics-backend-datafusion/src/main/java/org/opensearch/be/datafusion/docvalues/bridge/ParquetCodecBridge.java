@@ -34,6 +34,8 @@ public final class ParquetCodecBridge {
     private static final MethodHandle NEXT_BINARY_BATCH;
     private static final MethodHandle FILE_METADATA;
     private static final MethodHandle COLUMN_NON_NULL_COUNT;
+    private static final MethodHandle PAGE_COUNT;
+    private static final MethodHandle PAGE_INDEX;
 
     /**
      * Value of {@link FileMetadata#opensearchFormatVersion} when the footer carries no parseable
@@ -138,6 +140,24 @@ public final class ParquetCodecBridge {
                 ValueLayout.ADDRESS     // out_count
             )
         );
+        PAGE_COUNT = linker.downcallHandle(
+            lib.find("parquet_df_page_count").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+        PAGE_INDEX = linker.downcallHandle(
+            lib.find("parquet_df_page_index").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,  // handle
+                ValueLayout.ADDRESS,    // out_first_row
+                ValueLayout.ADDRESS,    // out_row_count
+                ValueLayout.ADDRESS,    // out_null_count
+                ValueLayout.ADDRESS,    // out_min_long
+                ValueLayout.ADDRESS,    // out_max_long
+                ValueLayout.JAVA_LONG,  // out_buf_capacity
+                ValueLayout.ADDRESS     // out_actual_pages
+            )
+        );
     }
 
     /**
@@ -193,6 +213,34 @@ public final class ParquetCodecBridge {
             var countOut = call.longOut();
             call.invokeIO(COLUMN_NON_NULL_COUNT, f.segment(), f.len(), c.segment(), c.len(), storePtr, countOut);
             return countOut.get(ValueLayout.JAVA_LONG, 0);
+        }
+    }
+
+    /** Number of OffsetIndex data pages for the retained cursor's projected column. */
+    public static long pageCount(long handle) throws IOException {
+        try (var call = new NativeCall()) {
+            return call.invokeIO(PAGE_COUNT, handle);
+        }
+    }
+
+    /**
+     * Copies the cursor's per-page OffsetIndex and ColumnIndex values into the caller's parallel
+     * arrays. Returns {@link #RC_OK}, or {@link #RC_OVERFLOW} when {@code capacity} is below the page
+     * count, in which case {@code outActualPages} holds the true count for a retry; a {@code < 0}
+     * return is decoded into an {@link IOException}.
+     */
+    public static long pageIndex(
+        long handle,
+        MemorySegment outFirstRow,
+        MemorySegment outRowCount,
+        MemorySegment outNullCount,
+        MemorySegment outMinLong,
+        MemorySegment outMaxLong,
+        long capacity,
+        MemorySegment outActualPages
+    ) throws IOException {
+        try (var call = new NativeCall()) {
+            return call.invokeIO(PAGE_INDEX, handle, outFirstRow, outRowCount, outNullCount, outMinLong, outMaxLong, capacity, outActualPages);
         }
     }
 
