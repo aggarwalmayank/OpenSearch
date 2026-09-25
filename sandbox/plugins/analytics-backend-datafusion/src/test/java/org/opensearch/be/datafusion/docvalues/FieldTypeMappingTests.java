@@ -69,12 +69,19 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
         FieldTypeMapping.validate("client_ip", "ip", DocValuesType.SORTED_SET);
     }
 
+    /** {@code binary} is served through the variable-width borrow path as BINARY doc values. */
+    public void testBinaryIsSupportedAsBinaryDocValues() {
+        assertTrue("binary must be supported", FieldTypeMapping.isSupported("binary"));
+        assertEquals(DocValuesType.BINARY, FieldTypeMapping.forType("binary"));
+        FieldTypeMapping.validate("blob", "binary", DocValuesType.BINARY);
+    }
+
     /**
-     * Still deliberately out: text and binary have no read path in the native cursor, so admitting one
-     * would fail at read time.
+     * Still deliberately out: text has no read path in the native cursor, so admitting it would fail at
+     * read time.
      */
     public void testTypesWithoutAVerifiedDecodeAreNotSupported() {
-        for (String type : new String[] { "text", "binary" }) {
+        for (String type : new String[] { "text" }) {
             assertFalse(type + " must not be supported yet", FieldTypeMapping.isSupported(type));
             expectThrows(IllegalArgumentException.class, () -> FieldTypeMapping.forType(type));
         }

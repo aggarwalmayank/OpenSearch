@@ -96,7 +96,8 @@ public final class ParquetCodecBridge {
                 ValueLayout.ADDRESS,    // out_validity_addr
                 ValueLayout.ADDRESS,    // out_validity_bit_offset
                 ValueLayout.ADDRESS,    // out_value_kind
-                ValueLayout.ADDRESS     // out_value_bit_offset
+                ValueLayout.ADDRESS,    // out_value_bit_offset
+                ValueLayout.ADDRESS     // out_offsets_addr
             )
         );
         NEXT_BINARY_BATCH = linker.downcallHandle(
@@ -286,6 +287,8 @@ public final class ParquetCodecBridge {
      *
      * <p>{@code outValueBitOffset} is meaningful only for the bit-packed boolean KIND; the
      * byte-addressed kinds fold their offset into {@code outValuesAddr} and report zero.
+     * {@code outOffsetsAddr} is written only for the variable-width binary KIND (the i32 offsets
+     * buffer at row 0); every other kind reports zero, its values living wholly in {@code outValuesAddr}.
      */
     public static long nextBatch(
         long handle,
@@ -296,7 +299,8 @@ public final class ParquetCodecBridge {
         MemorySegment outValidityAddr,
         MemorySegment outValidityBitOffset,
         MemorySegment outValueKind,
-        MemorySegment outValueBitOffset
+        MemorySegment outValueBitOffset,
+        MemorySegment outOffsetsAddr
     ) throws IOException {
         try (var call = new NativeCall()) {
             return call.invokeIO(
@@ -309,7 +313,8 @@ public final class ParquetCodecBridge {
                 outValidityAddr,
                 outValidityBitOffset,
                 outValueKind,
-                outValueBitOffset
+                outValueBitOffset,
+                outOffsetsAddr
             );
         }
     }

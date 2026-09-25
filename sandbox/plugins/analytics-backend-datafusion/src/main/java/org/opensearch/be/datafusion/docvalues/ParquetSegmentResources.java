@@ -45,6 +45,8 @@ final class ParquetSegmentResources {
     final Set<String> multiValuedFields;
     /** Identifies the segment to {@link UninvertedOrdinalsCache}, which keys .ord files by segment and field. */
     final SegmentInfo segmentInfo;
+    /** Parquet-resident fields served as stored fields, keyed by name; a subset of {@link #parquetFields}. */
+    final Map<String, StoredFieldMapping.Kind> storedFields;
 
     /** Memoized result of the assertions-only row-id identity check; computed once per segment core. */
     private boolean rowIdsChecked;
@@ -57,11 +59,23 @@ final class ParquetSegmentResources {
         Set<String> multiValuedFields,
         SegmentInfo segmentInfo
     ) {
+        this(producer, parquetFields, combinedFieldInfos, multiValuedFields, segmentInfo, Map.of());
+    }
+
+    ParquetSegmentResources(
+        ParquetDocValuesProducer producer,
+        Map<String, FieldInfo> parquetFields,
+        FieldInfos combinedFieldInfos,
+        Set<String> multiValuedFields,
+        SegmentInfo segmentInfo,
+        Map<String, StoredFieldMapping.Kind> storedFields
+    ) {
         this.producer = producer;
         this.parquetFields = parquetFields;
         this.combinedFieldInfos = combinedFieldInfos;
         this.multiValuedFields = multiValuedFields;
         this.segmentInfo = segmentInfo;
+        this.storedFields = storedFields;
     }
 
     /** Whether this core serves no Parquet doc values. */

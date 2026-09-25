@@ -110,6 +110,9 @@ struct DocValuesCursor {
     /// Retained so a reset can rebuild the reader without re-resolving metadata or the page index.
     factory: ParquetForwardBatchReaderFactory,
     physical_type: PhysicalType,
+    /// Whether `next_batch` can borrow this column's buffers; `None` for layouts only the copying
+    /// binary export can serve (view- and large-offset encodings).
+    borrowable: bool,
     repeated: bool,
     row_count: i64,
     initial_batch_size: usize,
@@ -221,6 +224,7 @@ impl DocValuesCursor {
             footer.file_metadata().key_value_metadata(),
         )?;
         let data_type = leaf_schema.field(0).data_type();
+        let borrowable = BorrowKind::for_arrow(data_type).is_some();
         let is_binary = matches!(
             data_type,
             DataType::Utf8
@@ -230,7 +234,7 @@ impl DocValuesCursor {
                 | DataType::LargeBinary
                 | DataType::BinaryView
         );
-        if BorrowKind::for_arrow(data_type).is_none() && !is_binary {
+        if !borrowable && !is_binary {
             return Err(DataFusionError::NotImplemented(format!(
                 "unsupported type {data_type} for column '{column}'"
             )));
@@ -280,6 +284,7 @@ impl DocValuesCursor {
             reader,
             factory,
             physical_type,
+            borrowable,
             repeated,
             row_count,
             initial_batch_size: batch_size,
@@ -377,14 +382,22 @@ fn at_eof(
 }
 
 /// Each batch output is valid for exactly one (repeated, binary) column shape.
-fn check_column_shape(
-    cursor: &DocValuesCursor,
-    want_repeated: bool,
-    want_binary: bool,
-    fn_name: &str,
-) -> Result<(), String> {
+/// `next_batch` borrows: any single-valued column with a `BorrowKind`, plain `Binary` included.
+fn check_borrowable_shape(cursor: &DocValuesCursor, fn_name: &str) -> Result<(), String> {
+    if cursor.repeated || !cursor.borrowable {
+        return Err(format!(
+            "{fn_name}: column is repeated={}, borrowable={}; use parquet_df_next_binary_batch",
+            cursor.repeated, cursor.borrowable
+        ));
+    }
+    Ok(())
+}
+
+/// `next_binary_batch` copies: any single-valued BYTE_ARRAY column, including the view and
+/// large-offset encodings that cannot be borrowed.
+fn check_binary_shape(cursor: &DocValuesCursor, fn_name: &str) -> Result<(), String> {
     let is_binary = cursor.physical_type == PhysicalType::BYTE_ARRAY;
-    if cursor.repeated != want_repeated || is_binary != want_binary {
+    if cursor.repeated || !is_binary {
         return Err(format!(
             "{fn_name}: column is repeated={}, binary={is_binary}; use the batch output matching that shape",
             cursor.repeated
@@ -560,6 +573,7 @@ enum BorrowKind {
     Float = 9,      // f32 raw bits; Java re-encodes to a sign-extended sortable int
     Bool = 10, // one bit per row, not one byte; read via `value_bit_offset` like the validity bitmap
     HalfFloat = 11, // f16 raw bits; Java re-encodes to the sortable short Lucene stores for half_float
+    Binary = 12, // variable-width: i32 offsets buffer + data buffer, row i = data[offsets[i]..offsets[i+1]]
 }
 
 impl BorrowKind {
@@ -580,11 +594,13 @@ impl BorrowKind {
             DataType::UInt8 => Some(Self::Ubyte),
             DataType::Boolean => Some(Self::Bool),
             DataType::Float16 => Some(Self::HalfFloat),
+            DataType::Binary => Some(Self::Binary),
             _ => None,
         }
     }
 
-    /// Bytes per row, or `None` for a bit-packed kind that has no whole-byte width.
+    /// Bytes per row, or `None` for a kind with no fixed whole-byte width (bit-packed, or
+    /// variable-width like `Binary`).
     /// Mirrors `ParquetColumnReader.valuesByteLength`.
     fn width(self) -> Option<usize> {
         match self {
@@ -593,6 +609,7 @@ impl BorrowKind {
             Self::Short | Self::Ushort | Self::HalfFloat => Some(2),
             Self::Byte | Self::Ubyte => Some(1),
             Self::Bool => None,
+            Self::Binary => None,
         }
     }
 }
@@ -600,6 +617,8 @@ impl BorrowKind {
 struct BorrowedBuffers {
     values_addr: usize,
     value_bit_offset: usize,
+    /// Binary only: i32 offsets buffer at row 0. Zero for every other kind.
+    offsets_addr: usize,
     validity_addr: usize,
     validity_bit_offset: usize,
     kind: i64,
@@ -615,18 +634,33 @@ struct BorrowedBuffers {
 fn borrowable_buffers(array: &dyn Array) -> Option<BorrowedBuffers> {
     let kind = BorrowKind::for_arrow(array.data_type())?;
     let data = array.to_data();
-    let buffer = data.buffers().first()?; // buffer 0 holds the values for a primitive array
-    let (values_addr, value_bit_offset) = match kind.width() {
-        Some(width) => {
-            debug_assert_eq!(array.data_type().primitive_width(), Some(width));
-            // Fold the array offset into the pointer so it addresses row 0. Zero for primitive
-            // arrays, whose window Arrow folds into the buffer pointer.
-            (buffer.as_ptr() as usize + data.offset() * width, 0)
+    let (values_addr, value_bit_offset, offsets_addr) = match kind {
+        // Two buffers: [0] i32 offsets, [1] data. Offsets are absolute into the data buffer, so the
+        // array window advances the offsets pointer only; the data pointer stays at the buffer start.
+        BorrowKind::Binary => {
+            let offsets = data.buffers().first()?;
+            let values = data.buffers().get(1)?;
+            (
+                values.as_ptr() as usize,
+                0,
+                offsets.as_ptr() as usize + data.offset() * std::mem::size_of::<i32>(),
+            )
         }
-        // Bit-packed values (`BooleanArray`): the offset is a bit index, not a byte count, so it
-        // cannot be folded into the pointer. Hand it over separately and let Java apply it exactly
-        // as it already applies `validity_bit_offset`.
-        None => (buffer.as_ptr() as usize, data.offset()),
+        _ => {
+            let buffer = data.buffers().first()?; // buffer 0 holds the values for a primitive array
+            match kind.width() {
+                Some(width) => {
+                    debug_assert_eq!(array.data_type().primitive_width(), Some(width));
+                    // Fold the array offset into the pointer so it addresses row 0. Zero for primitive
+                    // arrays, whose window Arrow folds into the buffer pointer.
+                    (buffer.as_ptr() as usize + data.offset() * width, 0, 0)
+                }
+                // Bit-packed values (`BooleanArray`): the offset is a bit index, not a byte count, so
+                // it cannot be folded into the pointer. Hand it over separately and let Java apply it
+                // exactly as it already applies `validity_bit_offset`.
+                None => (buffer.as_ptr() as usize, data.offset(), 0),
+            }
+        }
     };
     let (validity_addr, validity_bit_offset) = match data.nulls() {
         None => (0, 0),
@@ -635,6 +669,7 @@ fn borrowable_buffers(array: &dyn Array) -> Option<BorrowedBuffers> {
     Some(BorrowedBuffers {
         values_addr,
         value_bit_offset, // bit index of row 0 within the values buffer; 0 for byte-addressed kinds
+        offsets_addr,     // Binary only; 0 for every other kind
         validity_addr,    // start of the null-bitmap buffer; the bit offset is applied separately
         validity_bit_offset, // bit index of row 0 within that bitmap (bitmaps are bit-addressable)
         kind: kind as i64,
@@ -854,10 +889,11 @@ pub unsafe extern "C" fn parquet_df_column_non_null_count(
     }
     let runtime = io_runtime().map_err(|e| format!("{FN}: {e}"))?;
     let location = ObjectPath::from(filename);
-    let store: Arc<dyn ObjectStore> = match store_from_ptr(store_ptr).map_err(|e| format!("{FN}: {e}"))? {
-        Some(store) => store,
-        None => Arc::new(LocalFileSystem::new()),
-    };
+    let store: Arc<dyn ObjectStore> =
+        match store_from_ptr(store_ptr).map_err(|e| format!("{FN}: {e}"))? {
+            Some(store) => store,
+            None => Arc::new(LocalFileSystem::new()),
+        };
     let cache = runtime_env()
         .map_err(|e| format!("{FN}: {e}"))?
         .cache_manager
@@ -939,11 +975,13 @@ pub unsafe extern "C" fn parquet_df_next_batch(
     out_value_kind: *mut i64,
     // Bit index of row 0 for the bit-packed boolean kind; zero for byte-addressed kinds.
     out_value_bit_offset: *mut i64,
+    // Binary only: i32 offsets buffer at row 0. Zero for every other kind.
+    out_offsets_addr: *mut i64,
 ) -> i64 {
     static FN: &str = "parquet_df_next_batch";
     let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
     let mut cursor = cursor.lock();
-    check_column_shape(&cursor, false, false, FN)?;
+    check_borrowable_shape(&cursor, FN)?;
 
     // Released here rather than on success, so no early return below leaves buffers held. Java
     // clears its resident batch before calling. The reservation follows the batch.
@@ -979,6 +1017,7 @@ pub unsafe extern "C" fn parquet_df_next_batch(
     write_out(out_validity_bit_offset, borrow.validity_bit_offset as i64);
     write_out(out_value_kind, borrow.kind);
     write_out(out_value_bit_offset, borrow.value_bit_offset as i64);
+    write_out(out_offsets_addr, borrow.offsets_addr as i64);
     cursor.borrowed_batch = Some(batch);
     Ok(RC_OK)
 }
@@ -1005,7 +1044,7 @@ pub unsafe extern "C" fn parquet_df_next_binary_batch(
     const FN: &str = "parquet_df_next_binary_batch";
     let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
     let mut cursor = cursor.lock();
-    check_column_shape(&cursor, false, true, FN)?;
+    check_binary_shape(&cursor, FN)?;
     if at_eof(&cursor, target_row, FN).map_err(|e| e.to_string())? {
         return Ok(RC_EOF);
     }
@@ -1947,6 +1986,56 @@ mod tests {
         assert!(borrowable_buffers(&strings).is_none(), "Utf8");
     }
 
+    #[test]
+    fn a_binary_array_borrows_offsets_and_data_buffers() {
+        let binary = arrow::array::BinaryArray::from(vec![
+            Some(b"ab".as_ref()),
+            Some(b"".as_ref()),
+            Some(b"cde".as_ref()),
+        ]);
+        let borrow = borrowable_buffers(&binary).expect("Binary must be borrowable");
+        assert_eq!(
+            borrow.kind,
+            BorrowKind::Binary as i64,
+            "wire value 12 (KIND_BINARY)"
+        );
+        assert_ne!(borrow.values_addr, 0, "data buffer");
+        assert_ne!(borrow.offsets_addr, 0, "offsets buffer");
+        assert_eq!(borrow.value_bit_offset, 0, "not bit-packed");
+        // [0, 2, 2, 5]: row 0 = "ab", row 1 = "", row 2 = "cde".
+        let offsets = unsafe { std::slice::from_raw_parts(borrow.offsets_addr as *const i32, 4) };
+        assert_eq!(offsets, &[0, 2, 2, 5]);
+        let data = unsafe { std::slice::from_raw_parts(borrow.values_addr as *const u8, 5) };
+        assert_eq!(data, b"abcde");
+    }
+
+    /// Slicing advances the offsets pointer only; the offsets are absolute into the data buffer.
+    #[test]
+    fn a_sliced_binary_array_windows_the_offsets_buffer() {
+        let binary = arrow::array::BinaryArray::from(vec![
+            Some(b"aa".as_ref()),
+            Some(b"bb".as_ref()),
+            Some(b"cc".as_ref()),
+            Some(b"dd".as_ref()),
+        ]);
+        let full = borrowable_buffers(&binary).expect("Binary must be borrowable");
+
+        let sliced = binary.slice(2, 2); // rows "cc", "dd"
+        let borrow = borrowable_buffers(&sliced).expect("a sliced Binary must be borrowable");
+        assert_eq!(
+            borrow.values_addr, full.values_addr,
+            "data pointer stays at the buffer start"
+        );
+        assert_eq!(
+            borrow.offsets_addr,
+            full.offsets_addr + 2 * std::mem::size_of::<i32>(),
+            "offsets pointer advances to the window's first row"
+        );
+        // Window reads [4, 6, 8]: "cc" = data[4..6], "dd" = data[6..8].
+        let offsets = unsafe { std::slice::from_raw_parts(borrow.offsets_addr as *const i32, 3) };
+        assert_eq!(offsets, &[4, 6, 8]);
+    }
+
     /// Boolean is bit-packed, so its offset is a bit index that cannot be folded into the pointer
     /// the way a byte-addressed kind's is.
     #[test]
@@ -2082,6 +2171,7 @@ mod ffm_tests {
         validity_addr: i64,
         value_kind: i64,
         value_bit_offset: i64,
+        offsets_addr: i64,
     }
 
     /// Reads values back out of an exported buffer the way Java does, via
@@ -2102,6 +2192,7 @@ mod ffm_tests {
         let mut validity_bit_offset = -1i64;
         let mut value_kind = -1i64;
         let mut value_bit_offset = -1i64;
+        let mut offsets_addr = 0i64;
         let rc = unsafe {
             parquet_df_next_batch(
                 handle,
@@ -2113,6 +2204,7 @@ mod ffm_tests {
                 &mut validity_bit_offset,
                 &mut value_kind,
                 &mut value_bit_offset,
+                &mut offsets_addr,
             )
         };
         Batch {
@@ -2123,6 +2215,7 @@ mod ffm_tests {
             validity_addr,
             value_kind,
             value_bit_offset,
+            offsets_addr,
         }
     }
 

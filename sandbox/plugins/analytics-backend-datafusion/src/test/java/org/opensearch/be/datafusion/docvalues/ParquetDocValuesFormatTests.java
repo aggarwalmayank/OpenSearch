@@ -31,6 +31,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipIndexType;
@@ -47,6 +48,7 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.NumericUtils;
@@ -1345,6 +1347,105 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
     }
 
     /** Deliberately not an alternating pattern, so a shifted bit read changes a value. */
+    // ---- binary field type: the zero-copy borrow path (open(), KIND_BINARY), distinct from openBinary() above ----
+
+    /** A plain Binary column borrows through the numeric-style export: two buffers, rows sliced by offsets. */
+    public void testBinaryColumnBorrowsVariableWidthRows() throws Exception {
+        int rowCount = 300;
+        int nullEvery = 5;
+        Path file = createTempDir().resolve("binary-borrow.parquet");
+        BinaryColumnFixture.write(file, allocator, COLUMN, rowCount, nullEvery);
+
+        BytesRef scratch = new BytesRef(BytesRef.EMPTY_BYTES);
+        try (ParquetColumnReader reader = ParquetColumnReader.open(file, COLUMN)) {
+            for (int row = 0; row < rowCount; row++) {
+                DecodedBatch batch = loadRow(reader, row);
+                assertEquals(DecodedBatch.KIND_BINARY, batch.valueKind());
+                assertNotNull("a binary batch must carry its offsets buffer", batch.offsets());
+                if (row % nullEvery == 0) {
+                    assertFalse("row " + row + " should be null", batch.isPresent(row));
+                } else {
+                    assertTrue("row " + row + " should be present", batch.isPresent(row));
+                    batch.bytesAt(row, scratch);
+                    assertEquals("value at row " + row, new BytesRef(BinaryColumnFixture.valueAt(row)), scratch);
+                }
+            }
+        }
+    }
+
+    public void testBinaryColumnRejectsTheNumericRead() throws Exception {
+        Path file = createTempDir().resolve("binary-kind.parquet");
+        BinaryColumnFixture.write(file, allocator, COLUMN, 8, 0);
+
+        try (ParquetColumnReader reader = ParquetColumnReader.open(file, COLUMN)) {
+            DecodedBatch batch = loadRow(reader, 0);
+            assertEquals(DecodedBatch.KIND_BINARY, batch.valueKind());
+            expectThrows(IllegalStateException.class, () -> batch.valueAt(0));
+        }
+    }
+
+    /**
+     * {@code getBinary} follows the request-scoped cursor protocol of the other accessors, and the value
+     * it serves is the raw column bytes behind the {@code vInt(1) vInt(len)} header the vanilla binary
+     * consumer parses.
+     */
+    public void testBinaryAccessorOpensItsOwnCursorAndFramesTheValue() throws Exception {
+        int rows = 40;
+        Path file = createTempDir().resolve("binary-lifecycle.parquet");
+        BinaryColumnFixture.write(file, allocator, COLUMN, rows, -1);
+
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(file, ParquetColumnReader.LOCAL_STORE, Settings.EMPTY, rows, null);
+        FieldInfo fi = binaryField(COLUMN);
+        expectThrows(UnsupportedOperationException.class, () -> producer.getBinary(fi));
+
+        CursorRegistry request = new CursorRegistry();
+        BinaryDocValues dv = producer.getBinary(fi, request);
+        assertEquals("the accessor opens one cursor", 1, request.opened().size());
+        ParquetColumnReader cursor = request.opened().get(0);
+
+        for (int doc : new int[] { 0, 4, 9 }) { // an empty value, a 200-byte value, a 3-byte value
+            assertTrue(dv.advanceExact(doc));
+            BytesRef framed = dv.binaryValue();
+            ByteArrayDataInput in = new ByteArrayDataInput(framed.bytes, framed.offset, framed.length);
+            assertEquals("value count", 1, in.readVInt());
+            byte[] expected = BinaryColumnFixture.valueAt(doc);
+            int length = in.readVInt();
+            assertEquals("value length at doc " + doc, expected.length, length);
+            byte[] actual = new byte[length];
+            in.readBytes(actual, 0, length);
+            assertArrayEquals("value at doc " + doc, expected, actual);
+            assertTrue("frame must end with the value", in.eof());
+        }
+
+        request.close();
+        assertTrue("the request's cursor is closed at request end", cursor.isClosed());
+        assertFalse("producer must outlive the request", producer.isClosed());
+        producer.close();
+    }
+
+    private static FieldInfo binaryField(String name) {
+        return new FieldInfo(
+            name,
+            0,
+            false,
+            true,
+            false,
+            IndexOptions.NONE,
+            DocValuesType.BINARY,
+            DocValuesSkipIndexType.NONE,
+            -1,
+            new HashMap<>(),
+            0,
+            0,
+            0,
+            0,
+            VectorEncoding.FLOAT32,
+            VectorSimilarityFunction.EUCLIDEAN,
+            false,
+            false
+        );
+    }
+
     private static boolean expectedBoolean(long row) {
         return row % 3 == 0 || row % 7 == 2;
     }

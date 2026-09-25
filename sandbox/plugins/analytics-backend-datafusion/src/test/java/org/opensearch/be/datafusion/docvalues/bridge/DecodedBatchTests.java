@@ -8,6 +8,7 @@
 
 package org.opensearch.be.datafusion.docvalues.bridge;
 
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.lang.foreign.Arena;
@@ -30,7 +31,7 @@ public class DecodedBatchTests extends OpenSearchTestCase {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment values = arena.allocate(16 * Long.BYTES);
             // No presence bitmap: every row is present, so the answer is always the query row.
-            DecodedBatch batch = new DecodedBatch(100, 115, values, DecodedBatch.KIND_LONG, 0, null, 0);
+            DecodedBatch batch = new DecodedBatch(100, 115, values, DecodedBatch.KIND_LONG, 0, null, null, 0);
             assertEquals(100, batch.nextPresentRow(100));
             assertEquals(107, batch.nextPresentRow(107));
             assertEquals(115, batch.nextPresentRow(115));
@@ -46,7 +47,7 @@ public class DecodedBatchTests extends OpenSearchTestCase {
             presence.set(ValueLayout.JAVA_BYTE, 0, (byte) 0x0A);
             presence.set(ValueLayout.JAVA_BYTE, 2, (byte) 0x10);
             presence.set(ValueLayout.JAVA_BYTE, 3, (byte) 0x10);
-            DecodedBatch batch = new DecodedBatch(0, 26, values, DecodedBatch.KIND_LONG, 0, presence, 1);
+            DecodedBatch batch = new DecodedBatch(0, 26, values, DecodedBatch.KIND_LONG, 0, null, presence, 1);
 
             assertEquals("first set bit in the start byte", 0, batch.nextPresentRow(0));
             assertEquals("start mask must hide the lower set bit", 2, batch.nextPresentRow(1));
@@ -73,12 +74,60 @@ public class DecodedBatchTests extends OpenSearchTestCase {
 
             for (int offset : new int[] { 1, 7, 9 }) {
                 int rows = 16 - offset;
-                DecodedBatch batch = new DecodedBatch(0, rows - 1, values, DecodedBatch.KIND_BOOL, offset, presence, offset);
+                DecodedBatch batch = new DecodedBatch(0, rows - 1, values, DecodedBatch.KIND_BOOL, offset, null, presence, offset);
                 for (int row = 0; row < rows; row++) {
                     long expected = (offset + row) % 3 == 0 ? 1L : 0L;
                     assertEquals("offset " + offset + " row " + row + " (bit " + (offset + row) + ")", expected, batch.valueAt(row));
                 }
             }
+        }
+    }
+
+    /**
+     * {@link DecodedBatch#bytesAt} slices the data buffer by two consecutive i32 offsets and refills the
+     * caller's scratch in place, so a caller reusing one {@link BytesRef} across rows allocates only when
+     * a row is longer than any seen before.
+     */
+    public void testBytesAtSlicesByOffsetsAndReusesTheScratch() {
+        try (Arena arena = Arena.ofConfined()) {
+            // Rows (global 10..13): "ab", "", "cde", "fghij" -> data "abcdefghij", offsets [0,2,2,5,10].
+            byte[] data = "abcdefghij".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            MemorySegment values = arena.allocate(data.length);
+            MemorySegment.copy(data, 0, values, ValueLayout.JAVA_BYTE, 0, data.length);
+            MemorySegment offsets = arena.allocate(5L * Integer.BYTES);
+            int[] offs = { 0, 2, 2, 5, 10 };
+            for (int i = 0; i < offs.length; i++) {
+                offsets.setAtIndex(ValueLayout.JAVA_INT, i, offs[i]);
+            }
+            DecodedBatch batch = new DecodedBatch(10, 13, values, DecodedBatch.KIND_BINARY, 0, offsets, null, 0);
+
+            BytesRef scratch = new BytesRef(BytesRef.EMPTY_BYTES);
+            batch.bytesAt(12, scratch);
+            assertEquals("cde", scratch.utf8ToString());
+            byte[] grownOnce = scratch.bytes;
+            assertTrue("first read grows the empty scratch", grownOnce.length >= 3);
+
+            batch.bytesAt(11, scratch);
+            assertEquals("empty row", 0, scratch.length);
+            assertSame("a shorter row reuses the buffer", grownOnce, scratch.bytes);
+
+            batch.bytesAt(10, scratch);
+            assertEquals("ab", scratch.utf8ToString());
+            assertSame("a row that fits reuses the buffer", grownOnce, scratch.bytes);
+
+            batch.bytesAt(13, scratch);
+            assertEquals("fghij", scratch.utf8ToString());
+            assertEquals(0, scratch.offset);
+            assertTrue("a longer row grows the buffer", scratch.bytes.length >= 5);
+        }
+    }
+
+    public void testBytesAtRejectsNonBinaryKinds() {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment values = arena.allocate(8 * Long.BYTES);
+            DecodedBatch batch = new DecodedBatch(0, 7, values, DecodedBatch.KIND_LONG, 0, null, null, 0);
+            IllegalStateException e = expectThrows(IllegalStateException.class, () -> batch.bytesAt(0, new BytesRef()));
+            assertTrue(e.getMessage(), e.getMessage().contains("KIND_BINARY"));
         }
     }
 }

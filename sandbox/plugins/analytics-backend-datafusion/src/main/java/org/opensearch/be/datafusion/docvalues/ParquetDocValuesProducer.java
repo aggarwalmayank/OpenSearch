@@ -21,6 +21,8 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
+import org.opensearch.be.datafusion.docvalues.iter.BinaryFramingDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetBinaryDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.common.settings.Settings;
@@ -170,7 +172,21 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     @Override
     public BinaryDocValues getBinary(FieldInfo field) {
-        throw unsupported("binary", field);
+        // Like getSortedNumeric(FieldInfo), the doc-values accessor API carries no request identity;
+        // a cursor opened here would have no request-scoped owner to close it. Callers go through the
+        // leaf wrapper, which supplies the request's CursorRegistry via the overload below.
+        throw new UnsupportedOperationException(
+            "ParquetDocValuesProducer requires a request-scoped cursor registry; call getBinary(field, cursors)"
+        );
+    }
+
+    /**
+     * Serves {@code field} as binary doc values over a dedicated forward-only cursor, recorded on
+     * {@code cursors} so the calling request closes it when it ends.
+     */
+    BinaryDocValues getBinary(FieldInfo field, CursorRegistry cursors) throws IOException {
+        validate(field, DocValuesType.BINARY);
+        return new BinaryFramingDocValues(new ParquetBinaryDocValues(openCursor(field.getName(), cursors), maxDoc));
     }
 
     @Override
@@ -369,7 +385,8 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * Opens a dedicated forward-only cursor for one iterator and records it on the request's
      * {@code cursors}, which closes it at request end.
      */
-    private ParquetColumnReader openCursor(String field, CursorRegistry cursors) throws IOException {
+    /** Opens a cursor over {@code field}'s column and records it on the request's registry. */
+    ParquetColumnReader openCursor(String field, CursorRegistry cursors) throws IOException {
         ParquetColumnReader reader = ParquetColumnReader.open(parquetFile, field, indexSettings, storePointer);
         cursors.register(reader);
         return reader;

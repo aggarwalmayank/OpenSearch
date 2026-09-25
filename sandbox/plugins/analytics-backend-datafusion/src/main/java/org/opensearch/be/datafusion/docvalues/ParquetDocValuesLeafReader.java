@@ -9,6 +9,7 @@
 package org.opensearch.be.datafusion.docvalues;
 
 import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesSkipper;
@@ -21,6 +22,7 @@ import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.StoredFields;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
 import org.opensearch.common.lucene.index.PerDocumentValuesProvider;
@@ -52,11 +54,14 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     private final ParquetSegmentResources resources;
     private final CursorRegistry cursors;
+    /** Null when no Parquet field of this segment is served as a stored field. */
+    private final ParquetStoredFields storedFields;
 
     ParquetDocValuesLeafReader(LeafReader in, ParquetSegmentResources resources, CursorRegistry cursors) {
         super(in);
         this.resources = resources;
         this.cursors = cursors;
+        this.storedFields = resources.storedFields.isEmpty() ? null : new ParquetStoredFields(resources, cursors);
     }
 
     @Override
@@ -78,6 +83,11 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public SortedNumericDocValues getSortedNumericDocValues(String field) throws IOException {
         FieldInfo fi = resources.parquetFieldInfo(field);
         if (fi != null) {
+            if (fi.getDocValuesType() != DocValuesType.SORTED_NUMERIC) {
+                // A Parquet-resident field of another DV type (keyword, ip, binary) is served by its own
+                // accessor; a mismatched accessor returns null per the CodecReader contract.
+                return null;
+            }
             // OpenSearch numeric value sources request SORTED_NUMERIC even for single-valued fields,
             // then call DocValues.unwrapSingleton(...). The producer serves this as a singleton over
             // the single-valued numeric iterator (docId == Parquet row, asserted here). The cursor is
@@ -86,6 +96,21 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             return resources.producer.getSortedNumeric(fi, cursors);
         }
         return in.getSortedNumericDocValues(field);
+    }
+
+    @Override
+    public BinaryDocValues getBinaryDocValues(String field) throws IOException {
+        FieldInfo fi = resources.parquetFieldInfo(field);
+        if (fi != null) {
+            if (fi.getDocValuesType() != DocValuesType.BINARY) {
+                return null;
+            }
+            // A single-valued binary field: docId == Parquet row (asserted). The cursor is recorded on
+            // this request's registry and closed when the request ends.
+            assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet doc-values read path";
+            return resources.producer.getBinary(fi, cursors);
+        }
+        return in.getBinaryDocValues(field);
     }
 
     @Override
@@ -189,9 +214,25 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     }
 
     @Override
+    public StoredFields storedFields() throws IOException {
+        StoredFields lucene = in.storedFields();
+        if (storedFields == null) {
+            return lucene;
+        }
+        assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet stored-fields read path";
+        return storedFields.wrap(lucene);
+    }
+
+    @Override
+    public StoredFieldsReader getSequentialStoredFieldsReader() throws IOException {
+        assert storedFields == null || resources.assertRowIdsAreIdentity(in)
+            : "non-identity __row_id__ segment reached the Parquet stored-fields read path";
+        return super.getSequentialStoredFieldsReader();
+    }
+
+    @Override
     protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {
-        // This reader overlays doc values only; the underlying segment holds the real stored fields.
-        return reader;
+        return storedFields == null ? reader : storedFields.wrap(reader);
     }
 
     @Override

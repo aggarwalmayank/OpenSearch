@@ -31,20 +31,18 @@ import java.nio.file.Path;
  * points off-heap views at them and reads values in place, with no copy. Those views are valid only
  * until the next batch call on this reader, which always replaces the batch first.
  *
- * <p>Binary (BYTE_ARRAY) columns cannot be borrowed: a view-encoded string column has no single
- * contiguous buffer to point at, so {@link #openBinary} readers have the native side copy each
- * batch out (values, fence-post offsets, presence bits) into reader-owned staging buffers exposed
- * as a {@link DecodedBinaryBatch} of bounded off-heap views, valid until the reader's next load
- * rather than its next native call.
+ * <p>Binary (BYTE_ARRAY) columns are served two ways. {@link #openBinary} readers copy each batch into
+ * reader-owned staging buffers exposed as a {@link DecodedBinaryBatch}, valid until the reader's next
+ * load; that path also accepts view-encoded string columns, which have no single contiguous buffer to
+ * point at. A plain {@code Binary} column opened with {@link #open} is borrowed zero-copy instead: the
+ * i32 offsets buffer beside the data buffer is exported as {@link DecodedBatch#KIND_BINARY}.
  *
- * <p>Scope is numeric fixed-width columns and variable-width (keyword/ip) binary columns. Types the
+ * <p>Scope is single-valued columns: fixed-width numerics, bit-packed booleans, {@code half_float}, and
+ * variable-width binary (keyword/ip through {@link #openBinary}, binary through either). Types the
  * native cursor cannot serve are rejected when the cursor is opened, so an unsupported field is
  * unreadable rather than read incorrectly.
  *
- * <p>Out of scope for this reader: booleans (Arrow packs them bit-wise, so borrowing needs a value
- * bit offset like the validity bitmap), repeated (multi-valued) columns,
- * {@code half_float} (written as Arrow Float16, which would need a value kind that re-encodes to
- * {@code HalfFloatPoint.halfFloatToSortableShort}), and {@code scaled_float}.
+ * <p>Out of scope for this reader: repeated ({@code LIST}) columns and {@code scaled_float}.
  *
  * <p>{@code scaled_float} needs care because it cannot be rejected here: it is written as a plain
  * long column ({@code CoreDataFieldPlugin} maps it to {@code LongParquetField}), so on the wire it
@@ -72,7 +70,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     public static final long LOCAL_STORE = 0L;
 
     /** Number of scalar out-parameters {@code nextBatch} writes back. */
-    private static final int OUT_PARAM_COUNT = 7;
+    private static final int OUT_PARAM_COUNT = 8;
 
     /** Starting binary value-buffer capacity; an overflow retry ratchets it to the reported need. */
     private static final long INITIAL_BINARY_VALUE_BYTES = 64 * 1024L;
@@ -142,18 +140,18 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         }
     }
 
-    /** Opens a numeric cursor over a local file using the default batch-size settings. */
+    /** Opens a cursor over a local file using the default batch-size settings. */
     public static ParquetColumnReader open(Path file, String column) throws IOException {
         return open(file, column, Settings.EMPTY);
     }
 
-    /** Opens a numeric cursor over a local file, sized from {@code settings}. */
+    /** Opens a cursor over a local file, sized from {@code settings}. */
     public static ParquetColumnReader open(Path file, String column, Settings settings) throws IOException {
         return open(file, column, settings, LOCAL_STORE);
     }
 
     /**
-     * Opens a numeric cursor sized from {@code index.parquet.docvalues.initial_batch_size} and
+     * Opens a cursor sized from {@code index.parquet.docvalues.initial_batch_size} and
      * {@code index.parquet.docvalues.max_batch_size}.
      *
      * @param settings index settings, or {@link Settings#EMPTY} to take the defaults
@@ -170,7 +168,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     }
 
     /**
-     * Opens a numeric cursor over a local file with explicit window sizes, bypassing settings
+     * Opens a cursor over a local file with explicit window sizes, bypassing settings
      * resolution.
      */
     public static ParquetColumnReader open(Path file, String column, int initialBatchSize, int maxBatchSize) throws IOException {
@@ -178,7 +176,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     }
 
     /**
-     * Opens a numeric cursor with explicit window sizes, bypassing settings resolution.
+     * Opens a cursor with explicit window sizes, bypassing settings resolution.
      *
      * @param initialBatchSize rows in the first decode window; must be in {@code 1..=maxBatchSize}
      * @param maxBatchSize     ceiling the adaptive window grows to
@@ -275,7 +273,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
                 reopen();
             }
         }
-        loadNumericBatch(row);
+        loadBatch(row);
     }
 
     /** Replaces the forward-only cursor with a fresh one at row zero. Only reached on a backward request. */
@@ -285,7 +283,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         ParquetCodecBridge.resetColumnCursor(ptr);
     }
 
-    private void loadNumericBatch(long row) throws IOException {
+    private void loadBatch(long row) throws IOException {
         long firstRow;
         long lastRow;
         long valuesAddr;
@@ -293,6 +291,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         int kind;
         int bitOffset;
         int valueBitOffset;
+        long offsetsAddr;
 
         // Drop the resident batch before crossing over. A successful native call frees the buffers
         // the old batch borrowed, so any exit between here and the assignment below - a bad status
@@ -300,9 +299,9 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         // memory.
         decodedBatch = null;
 
-        // The seven scalar out-parameters are tiny and read out immediately, so a per-call arena is
-        // enough; the borrowed value/validity buffers live in native (Rust-owned) memory and are
-        // reinterpreted separately below, outside this arena.
+        // The eight scalar out-parameters are tiny and read out immediately, so a per-call arena is
+        // enough; the borrowed value/validity/offsets buffers live in native (Rust-owned) memory and
+        // are reinterpreted separately below, outside this arena.
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment out = arena.allocate(ValueLayout.JAVA_LONG, OUT_PARAM_COUNT);
             MemorySegment firstRowOut = out.asSlice(0L, Long.BYTES);
@@ -312,6 +311,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
             MemorySegment validityBitOffsetOut = out.asSlice(4L * Long.BYTES, Long.BYTES);
             MemorySegment valueKindOut = out.asSlice(5L * Long.BYTES, Long.BYTES);
             MemorySegment valueBitOffsetOut = out.asSlice(6L * Long.BYTES, Long.BYTES);
+            MemorySegment offsetsAddrOut = out.asSlice(7L * Long.BYTES, Long.BYTES);
 
             long rc = ParquetCodecBridge.nextBatch(
                 ptr,
@@ -322,7 +322,8 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
                 validityAddrOut,
                 validityBitOffsetOut,
                 valueKindOut,
-                valueBitOffsetOut
+                valueBitOffsetOut,
+                offsetsAddrOut
             );
             checkStatus(rc, row);
 
@@ -333,6 +334,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
             bitOffset = (int) validityBitOffsetOut.get(ValueLayout.JAVA_LONG, 0);
             kind = (int) valueKindOut.get(ValueLayout.JAVA_LONG, 0);
             valueBitOffset = (int) valueBitOffsetOut.get(ValueLayout.JAVA_LONG, 0);
+            offsetsAddr = offsetsAddrOut.get(ValueLayout.JAVA_LONG, 0);
         }
 
         // Validate the native cursor's framing before pointing memory views at the borrowed
@@ -355,9 +357,6 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         }
         int batchRows = (int) batchRowsLong;
 
-        // Borrowed Arrow buffers, read in place: O(rows accessed), no copy. Valid until the next
-        // batch call on this cursor, which clears the resident batch before borrowing again.
-        MemorySegment values = MemorySegment.ofAddress(valuesAddr).reinterpret(valuesByteLength(kind, batchRows, valueBitOffset, row));
         MemorySegment presenceBits;
         int presenceBitOffset;
         if (validityAddr == 0) {
@@ -370,7 +369,33 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
             presenceBits = MemorySegment.ofAddress(validityAddr).reinterpret(presenceBytes);
             presenceBitOffset = bitOffset;
         }
-        decodedBatch = new DecodedBatch(firstRow, lastRow, values, kind, valueBitOffset, presenceBits, presenceBitOffset);
+
+        // Borrowed Arrow buffers, read in place: O(rows accessed), no copy. Valid until the next
+        // batch call on this cursor, which clears the resident batch before borrowing again.
+        MemorySegment values;
+        MemorySegment offsets;
+        if (kind == DecodedBatch.KIND_BINARY) {
+            // Variable-width: an i32 offsets buffer of batchRows+1 entries plus a data buffer whose
+            // length is offsets[batchRows] (the end of the last row). The offsets buffer is sized and
+            // read first; the data buffer is then sized to exactly the bytes the offsets span.
+            if (offsetsAddr == 0) {
+                throw contractViolation(row, "binary batch with no offsets buffer");
+            }
+            long offsetsBytes = ((long) batchRows + 1) * Integer.BYTES;
+            offsets = MemorySegment.ofAddress(offsetsAddr).reinterpret(offsetsBytes);
+            int firstOffset = offsets.getAtIndex(ValueLayout.JAVA_INT, 0);
+            int lastOffset = offsets.getAtIndex(ValueLayout.JAVA_INT, batchRows);
+            if (firstOffset < 0 || lastOffset < firstOffset) {
+                throw contractViolation(row, "binary offsets span [" + firstOffset + ", " + lastOffset + "]");
+            }
+            // Rows index absolute into the data buffer, so the view must reach offsets[batchRows];
+            // a sliced parent can start at a non-zero firstOffset, so size to the end, not the span.
+            values = MemorySegment.ofAddress(valuesAddr).reinterpret(lastOffset);
+        } else {
+            values = MemorySegment.ofAddress(valuesAddr).reinterpret(valuesByteLength(kind, batchRows, valueBitOffset, row));
+            offsets = null;
+        }
+        decodedBatch = new DecodedBatch(firstRow, lastRow, values, kind, valueBitOffset, offsets, presenceBits, presenceBitOffset);
     }
 
     /**
