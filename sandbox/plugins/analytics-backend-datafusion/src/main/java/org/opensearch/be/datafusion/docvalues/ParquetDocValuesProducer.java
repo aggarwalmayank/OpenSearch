@@ -11,6 +11,7 @@ package org.opensearch.be.datafusion.docvalues;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
@@ -22,6 +23,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
@@ -29,6 +31,8 @@ import org.opensearch.index.mapper.MapperService;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Read-only {@link DocValuesProducer} that serves single-valued numeric doc values from a Parquet
@@ -82,6 +86,13 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private final Settings indexSettings;
     private final int maxDoc;
     private final long parquetRowCount;
+
+    /**
+     * Per-column {@link ColumnPageIndex} cache, loaded once and held for the segment's life. Safe as a
+     * producer field because this producer is itself cached once per segment core (see class javadoc),
+     * so the map's lifetime is exactly the core's and the immutable page index need never reload.
+     */
+    private final Map<String, ColumnPageIndex> pageIndexByField = new ConcurrentHashMap<>();
 
     private volatile boolean closed;
 
@@ -182,10 +193,66 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         throw unsupported("sorted-set", field);
     }
 
-    /** No DocValues skip index is served; the synthetic {@code FieldInfo}s advertise skip type NONE. */
+    /**
+     * Serves a {@link DocValuesSkipper} backed by the column's Parquet ColumnIndex (per-page
+     * min/max/null-count), letting Lucene's range machinery skip whole pages whose stats exclude the
+     * query range — no decode, no cursor, no FFM crossing for skipped pages.
+     *
+     * <p>Gated first on the synthetic {@code FieldInfo}'s stamped {@code DocValuesSkipIndexType}: a
+     * NONE stamp yields no skipper. That stamp is the open-time snapshot of the gate (see
+     * {@link ParquetSegmentResourceCache#skipTypeFor}), so it also covers multi-valued (LIST) columns,
+     * whose page stats are unreliable. Then gated on {@link FieldTypeMapping#isRangeSkippable}: only
+     * integer-shaped columns whose raw-bits doc-values order is numeric order get a skipper. These are
+     * the same gates the stamp is built from, so declaration and producer stay in lockstep. Returns
+     * {@code null} (no skipper) for float/double/unsigned columns and, in low-level tests, when there
+     * is no mapper service to resolve the field's type.
+     *
+     * <p>Cursorless: the skipper reads only column metadata (page boundaries + per-page stats), so no
+     * forward-only decode cursor is opened and no request-scoped {@link CursorRegistry} is needed.
+     */
     @Override
-    public DocValuesSkipper getSkipper(FieldInfo field) {
-        return null;
+    public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
+        if (mapperService == null) {
+            return null; // low-level tests bypass mapping; no type to gate on
+        }
+        // The synthetic FieldInfo is the open-time snapshot of the gate (type skippability AND
+        // single-valued-ness). Trust it here rather than re-reading live mapper state: that keeps this
+        // producer and the FieldInfo declaration in lockstep even if the field flips to multi-valued
+        // after this core opened, since this segment's column was written before the flip and is plain.
+        if (field.docValuesSkipIndexType() == DocValuesSkipIndexType.NONE) {
+            return null;
+        }
+        if (FieldTypeMapping.isRangeSkippable(mappingType(field)) == false) {
+            return null;
+        }
+        String name = field.getName();
+        ColumnPageIndex pageIndex = cachedPageIndex(name, () -> {
+            ParquetCodecBridge.PageIndex data = ParquetCodecBridge.columnPageIndex(parquetFile.toString(), name, storePointer);
+            return new ColumnPageIndex(data.firstRow(), data.nullCount(), data.min(), data.max(), data.totalRows());
+        });
+        // Skipper stays per-call: it is a stateful forward cursor over the shared, immutable page index.
+        return new ParquetDocValuesSkipper(pageIndex, maxDoc);
+    }
+
+    /**
+     * The cached {@link ColumnPageIndex} for {@code field}, loading it once via {@code loader} on the
+     * first request. The page index is immutable for the segment's life, so caching it here - on a
+     * producer that is itself cached once per segment core - replaces the per-query native call and
+     * array copy with a single load.
+     *
+     * <p>get() then putIfAbsent(), not computeIfAbsent: the loader crosses the FFM boundary and does
+     * I/O, and holding the bucket lock across that is bad. A cold-miss race where two threads both
+     * build and one copy wins is harmless because the data is immutable. A loader failure stores
+     * nothing, so the next call retries.
+     */
+    ColumnPageIndex cachedPageIndex(String field, CheckedSupplier<ColumnPageIndex, IOException> loader) throws IOException {
+        ColumnPageIndex cached = pageIndexByField.get(field);
+        if (cached != null) {
+            return cached;
+        }
+        ColumnPageIndex loaded = loader.get(); // may throw; nothing is stored on failure, so it is retried next call
+        ColumnPageIndex won = pageIndexByField.putIfAbsent(field, loaded);
+        return won != null ? won : loaded;
     }
 
     /**

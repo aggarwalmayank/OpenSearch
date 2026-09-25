@@ -32,6 +32,8 @@ public final class ParquetCodecBridge {
     private static final MethodHandle RESET_CURSOR;
     private static final MethodHandle NEXT_BATCH;
     private static final MethodHandle FILE_METADATA;
+    private static final MethodHandle COLUMN_PAGE_INDEX;
+    private static final MethodHandle FREE_PAGE_INDEX;
 
     /**
      * Value of {@link FileMetadata#opensearchFormatVersion} when the footer carries no parseable
@@ -100,6 +102,27 @@ public final class ParquetCodecBridge {
                 ValueLayout.ADDRESS,    // out_num_rows
                 ValueLayout.ADDRESS,    // out_format_version
                 ValueLayout.ADDRESS     // out_writer_generation
+            )
+        );
+        COLUMN_PAGE_INDEX = linker.downcallHandle(
+            lib.find("parquet_df_column_page_index").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,    // file_ptr
+                ValueLayout.JAVA_LONG,  // file_len
+                ValueLayout.ADDRESS,    // column_ptr
+                ValueLayout.JAVA_LONG,  // column_len
+                ValueLayout.JAVA_LONG,  // store_ptr
+                ValueLayout.ADDRESS,    // out_page_count
+                ValueLayout.ADDRESS,    // out_total_rows
+                ValueLayout.ADDRESS     // out_buf_addr
+            )
+        );
+        FREE_PAGE_INDEX = linker.downcallHandle(
+            lib.find("parquet_df_free_page_index").orElseThrow(),
+            FunctionDescriptor.ofVoid(
+                ValueLayout.JAVA_LONG,  // buf_addr
+                ValueLayout.JAVA_LONG   // len (i64 element count)
             )
         );
     }
@@ -212,6 +235,74 @@ public final class ParquetCodecBridge {
                 outValueBitOffset
             );
         }
+    }
+
+    /**
+     * A column's per-page skipper index: parallel arrays indexed by page. {@code firstRow} is
+     * globally ascending; a page's row count is the gap to the next page's first row (or
+     * {@code totalRows} for the last page). {@code nullCount} is -1 when unknown; {@code min}/
+     * {@code max} are raw i64 bits, carrying the sentinel ({@link Long#MIN_VALUE},
+     * {@link Long#MAX_VALUE}) for pages with absent stats.
+     */
+    public record PageIndex(long[] firstRow, long[] nullCount, long[] min, long[] max, long totalRows) {
+    }
+
+    /**
+     * Loads {@code column}'s per-page skipper index (OffsetIndex boundaries + ColumnIndex
+     * min/max/null-count) through the same store and footer cache a cursor over {@code file} would
+     * use. Cursorless: the skipper needs only metadata, so no decode cursor is opened.
+     *
+     * @param storePtr native object store to read through, or {@code 0} for a local file
+     */
+    public static PageIndex columnPageIndex(String file, String column, long storePtr) throws IOException {
+        try (var call = new NativeCall()) {
+            var f = call.str(file);
+            var c = call.str(column);
+            var pageCountOut = call.longOut();
+            var totalRowsOut = call.longOut();
+            var bufAddrOut = call.longOut();
+            call.invokeIO(
+                COLUMN_PAGE_INDEX,
+                f.segment(),
+                f.len(),
+                c.segment(),
+                c.len(),
+                storePtr,
+                pageCountOut,
+                totalRowsOut,
+                bufAddrOut
+            );
+            int pageCount = Math.toIntExact(pageCountOut.get(ValueLayout.JAVA_LONG, 0));
+            long totalRows = totalRowsOut.get(ValueLayout.JAVA_LONG, 0);
+            long bufAddr = bufAddrOut.get(ValueLayout.JAVA_LONG, 0);
+
+            long[] firstRow = new long[pageCount];
+            long[] nullCount = new long[pageCount];
+            long[] min = new long[pageCount];
+            long[] max = new long[pageCount];
+            if (pageCount > 0) {
+                // Native buffer is 4 * pageCount i64s laid out as four contiguous sections:
+                // [firstRow | nullCount | min | max]. Copied out, then freed on the native side.
+                long totalLongs = (long) pageCount * 4;
+                MemorySegment buf = MemorySegment.ofAddress(bufAddr).reinterpret(totalLongs * Long.BYTES);
+                try {
+                    for (int i = 0; i < pageCount; i++) {
+                        firstRow[i] = buf.getAtIndex(ValueLayout.JAVA_LONG, i);
+                        nullCount[i] = buf.getAtIndex(ValueLayout.JAVA_LONG, (long) pageCount + i);
+                        min[i] = buf.getAtIndex(ValueLayout.JAVA_LONG, 2L * pageCount + i);
+                        max[i] = buf.getAtIndex(ValueLayout.JAVA_LONG, 3L * pageCount + i);
+                    }
+                } finally {
+                    freePageIndex(bufAddr, totalLongs);
+                }
+            }
+            return new PageIndex(firstRow, nullCount, min, max, totalRows);
+        }
+    }
+
+    /** Releases a page-index buffer returned by the native {@code parquet_df_column_page_index}. */
+    private static void freePageIndex(long bufAddr, long lenLongs) {
+        NativeCall.invokeVoid(FREE_PAGE_INDEX, bufAddr, lenLongs);
     }
 
     private ParquetCodecBridge() {}

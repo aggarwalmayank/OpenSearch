@@ -9,6 +9,8 @@
 package org.opensearch.be.datafusion.docvalues;
 
 import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.index.DocValuesSkipIndexType;
+import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.LeafReader;
@@ -75,6 +77,29 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             return resources.producer.getSortedNumeric(fi, cursors);
         }
         return in.getSortedNumericDocValues(field);
+    }
+
+    /**
+     * Serves a {@link DocValuesSkipper} for a Parquet-resident field when its synthetic
+     * {@link FieldInfo} declares a skip index (RANGE), and delegates to the underlying leaf
+     * otherwise. The RANGE declaration and the producer's skipper gate share
+     * {@link FieldTypeMapping#isRangeSkippable}, so a Parquet field declaring NONE here is exactly
+     * one the producer would decline; short-circuiting on it avoids a needless native page-index
+     * load.
+     */
+    @Override
+    public DocValuesSkipper getDocValuesSkipper(String field) throws IOException {
+        FieldInfo fi = resources.parquetFieldInfo(field);
+        if (fi != null) {
+            if (fi.docValuesSkipIndexType() == DocValuesSkipIndexType.NONE) {
+                return null;
+            }
+            // Doc IDs and Parquet rows coincide (identity __row_id__), so page row ranges are
+            // directly valid as skipper doc ID intervals.
+            assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet doc-values skipper path";
+            return resources.producer.getSkipper(fi);
+        }
+        return in.getDocValuesSkipper(field);
     }
 
     @Override

@@ -47,6 +47,8 @@ use once_cell::sync::Lazy;
 use opensearch_tiered_storage::tiered_object_store::MetadataCachingStore;
 use parking_lot::Mutex;
 use parquet::arrow::{parquet_to_arrow_schema_by_columns, ProjectionMask};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use tokio::runtime::Runtime;
 
 use crate::cache::page_index::load_scoped_page_index_cols;
@@ -162,43 +164,7 @@ impl DocValuesCursor {
         .map_err(DataFusionError::Execution)?;
 
         let schema = footer.file_metadata().schema_descr();
-
-        // Collect every candidate rather than taking the first: two leaves in different row groups
-        // can share a name, and a group root can cover several leaves. Serving whichever came first
-        // would read the wrong column silently, so an ambiguous name is an error.
-        //
-        // Flat schemas cannot produce an ambiguity, so this only applies to files written with a
-        // nested schema, by a future mapping type or another writer.
-        let matches = (0..schema.num_columns())
-            .filter(|&idx| {
-                let descriptor = schema.column(idx);
-                descriptor.name() == column
-                    || descriptor.path().string() == column
-                    || descriptor
-                        .path()
-                        .parts()
-                        .first()
-                        .is_some_and(|root| root == column)
-            })
-            .collect::<Vec<_>>();
-        let leaf_idx = match matches.as_slice() {
-            [only] => *only,
-            [] => {
-                return Err(DataFusionError::Plan(format!(
-                    "column '{column}' not found in {filename}"
-                )))
-            }
-            several => {
-                let paths = several
-                    .iter()
-                    .map(|&idx| schema.column(idx).path().string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(DataFusionError::Plan(format!(
-                    "column '{column}' is ambiguous in {filename}; it matches {paths}"
-                )));
-            }
-        };
+        let leaf_idx = resolve_leaf_idx(schema, column, filename)?;
         // Reject on the Arrow type the reader will produce, not the Parquet physical type: an INT64
         // decimal is a valid physical type but decodes to `Decimal128`, which cannot be borrowed.
         // Converted with the same projection and key-value metadata the reader uses, so the two
@@ -734,6 +700,259 @@ pub unsafe extern "C" fn parquet_df_next_batch(
     write_out(out_value_bit_offset, borrow.value_bit_offset as i64);
     cursor.borrowed_batch = Some(batch);
     Ok(RC_OK)
+}
+
+// ── DocValues skipper page index ─────────────────────────────────────────────
+//
+// A DocValuesSkipper on the Java side skips whole Parquet pages whose per-page [min, max] excludes
+// a query range, with no decode and no cursor. It needs only column metadata (the OffsetIndex page
+// boundaries and the ColumnIndex per-page min/max/null-count), so this path is cursorless: it does
+// not open or hold a `DocValuesCursor`. Ported from the parquet-data-format ColumnPageIndex work.
+
+/// Resolves the single leaf column index for `column`, rejecting an ambiguous name.
+///
+/// Collects every candidate rather than taking the first: two leaves in different row groups can
+/// share a name, and a group root can cover several leaves. Serving whichever came first would read
+/// the wrong column silently, so an ambiguous name is an error. Flat schemas cannot produce an
+/// ambiguity, so this only applies to files written with a nested schema, by a future mapping type
+/// or another writer.
+fn resolve_leaf_idx(
+    schema: &SchemaDescriptor,
+    column: &str,
+    filename: &str,
+) -> Result<usize, DataFusionError> {
+    let matches = (0..schema.num_columns())
+        .filter(|&idx| {
+            let descriptor = schema.column(idx);
+            descriptor.name() == column
+                || descriptor.path().string() == column
+                || descriptor
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|root| root == column)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(DataFusionError::Plan(format!(
+            "column '{column}' not found in {filename}"
+        ))),
+        several => {
+            let paths = several
+                .iter()
+                .map(|&idx| schema.column(idx).path().string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(DataFusionError::Plan(format!(
+                "column '{column}' is ambiguous in {filename}; it matches {paths}"
+            )))
+        }
+    }
+}
+
+/// Sentinel pair meaning "min/max unknown": the widest possible range, so the Java DocValuesSkipper
+/// can never wrongly exclude the page. Distinguishable from real data only in that real data
+/// spanning the full i64 range behaves identically — which is exactly the safe behavior. Reported
+/// for absent stats (missing ColumnIndex, stats-free pages, the row-group-granularity fallback).
+const MINMAX_UNKNOWN: (i64, i64) = (i64::MIN, i64::MAX);
+
+/// Per-page min/max as raw i64 bits from a typed ColumnIndex, or [`MINMAX_UNKNOWN`] when the page's
+/// stats are absent.
+///
+/// Integer-shaped physical types (INT32/INT64/BOOLEAN) yield signed-ordered bounds that match the
+/// doc-value longs the skipper is compared against. FLOAT/DOUBLE raw bits diverge from numeric order
+/// for negatives, and BYTE_ARRAY/INT96/FLBA min/max are not exchanged as i64, so those report the
+/// sentinel; the Java gate (`FieldTypeMapping.isRangeSkippable`) also declines to serve a skipper
+/// for their mapping types, so this is belt-and-suspenders.
+fn page_min_max(ci: &ColumnIndexMetaData, idx: usize) -> (i64, i64) {
+    match ci {
+        ColumnIndexMetaData::INT32(p) => match (p.min_value(idx), p.max_value(idx)) {
+            (Some(min), Some(max)) => (*min as i64, *max as i64),
+            _ => MINMAX_UNKNOWN,
+        },
+        ColumnIndexMetaData::INT64(p) => match (p.min_value(idx), p.max_value(idx)) {
+            (Some(min), Some(max)) => (*min, *max),
+            _ => MINMAX_UNKNOWN,
+        },
+        ColumnIndexMetaData::BOOLEAN(p) => match (p.min_value(idx), p.max_value(idx)) {
+            (Some(min), Some(max)) => (if *min { 1 } else { 0 }, if *max { 1 } else { 0 }),
+            _ => MINMAX_UNKNOWN,
+        },
+        _ => MINMAX_UNKNOWN,
+    }
+}
+
+/// Per-page parallel arrays for one column, indexed by page. `first_rows` is globally ascending and
+/// contiguous (row groups abut), so the Java `ColumnPageIndex` derives a page's row count as the
+/// gap to the next page's first row (or `total_rows` for the last page).
+struct PageLayout {
+    first_rows: Vec<i64>,
+    null_counts: Vec<i64>,
+    mins: Vec<i64>,
+    maxes: Vec<i64>,
+    total_rows: i64,
+}
+
+/// Builds the per-page layout for a column from the Parquet OffsetIndex (page boundaries) and
+/// ColumnIndex (per-page min/max/null-count). Falls back to one entry per row group, with the
+/// unknown-stats sentinel, when a row group has no OffsetIndex.
+fn build_page_layout(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    leaf_idx: usize,
+) -> PageLayout {
+    let n_rg = metadata.num_row_groups();
+    let offset_index = metadata.offset_index();
+    let column_index = metadata.column_index();
+
+    let mut first_rows: Vec<i64> = Vec::new();
+    let mut null_counts: Vec<i64> = Vec::new();
+    let mut mins: Vec<i64> = Vec::new();
+    let mut maxes: Vec<i64> = Vec::new();
+    // Running global row offset: row groups are contiguous, so each starts where the last ended.
+    let mut running_first: i64 = 0;
+
+    for rg in 0..n_rg {
+        let rg_first = running_first;
+        running_first += metadata.row_group(rg).num_rows();
+
+        let oi_pages = offset_index
+            .and_then(|oi| oi.get(rg))
+            .and_then(|cols| cols.get(leaf_idx));
+        let ci = column_index
+            .and_then(|ci| ci.get(rg))
+            .and_then(|cols| cols.get(leaf_idx));
+
+        match oi_pages {
+            Some(oi) => {
+                for (p, loc) in oi.page_locations().iter().enumerate() {
+                    let null_count = ci.and_then(|c| c.null_count(p)).unwrap_or(-1);
+                    let (min_long, max_long) =
+                        ci.map(|c| page_min_max(c, p)).unwrap_or(MINMAX_UNKNOWN);
+                    first_rows.push(rg_first + loc.first_row_index);
+                    null_counts.push(null_count);
+                    mins.push(min_long);
+                    maxes.push(max_long);
+                }
+            }
+            None => {
+                // No page index for this row group: one entry spanning the whole group, with the
+                // unknown-stats sentinel so it is never wrongly skipped and an unknown (-1) null
+                // count so the skipper's docCount under-claims rather than overclaims.
+                first_rows.push(rg_first);
+                null_counts.push(-1);
+                mins.push(MINMAX_UNKNOWN.0);
+                maxes.push(MINMAX_UNKNOWN.1);
+            }
+        }
+    }
+
+    PageLayout {
+        first_rows,
+        null_counts,
+        mins,
+        maxes,
+        total_rows: running_first,
+    }
+}
+
+/// Resolves the column's metadata (footer + scoped page index) through the same store and footer
+/// cache a cursor over the file would use, then builds its per-page layout. Cursorless: the skipper
+/// needs only metadata, so no decode cursor is opened.
+fn load_column_page_layout(
+    filename: &str,
+    column: &str,
+    store_ptr: i64,
+) -> Result<PageLayout, DataFusionError> {
+    let runtime = io_runtime()?;
+    // SAFETY: store_ptr is either LOCAL_STORE (0) or a live TieredObjectStore box pointer supplied
+    // by the Java caller for this file, exactly as the cursor-open and file-metadata paths use it.
+    let store: Arc<dyn ObjectStore> = match unsafe { store_from_ptr(store_ptr) }? {
+        Some(store) => store,
+        // LOCAL_STORE by contract: a hot shard's files are on local disk.
+        None => Arc::new(LocalFileSystem::new()),
+    };
+    let env = runtime_env()?;
+    let location = ObjectPath::from(filename);
+    runtime.block_on(async {
+        let object_meta = store.head(&location).await?;
+        let (_arrow_schema, _file_size, footer) = load_parquet_metadata_with_meta(
+            Arc::clone(&store),
+            &location,
+            object_meta,
+            env.cache_manager.get_file_metadata_cache(),
+        )
+        .await
+        .map_err(DataFusionError::Execution)?;
+        let schema = footer.file_metadata().schema_descr();
+        let leaf_idx = resolve_leaf_idx(schema, column, filename)?;
+        let metadata =
+            load_scoped_page_index_cols(&store, &location, &footer, &[leaf_idx], &[leaf_idx])
+                .await
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "no page index available for column '{column}' in {filename}"
+                    ))
+                })?;
+        Ok(build_page_layout(&metadata, leaf_idx))
+    })
+}
+
+/// Loads a column's per-page skipper index (OffsetIndex boundaries + ColumnIndex min/max/null-count)
+/// and hands Java the four parallel arrays through one native allocation.
+///
+/// Writes `out_page_count`, `out_total_rows`, and `out_buf_addr` only on success (a caller that gets
+/// a negative return must not read them). `out_buf_addr` receives the address of a native-allocated
+/// i64 buffer of `4 * page_count` values laid out as four contiguous sections:
+/// `[first_rows | null_counts | mins | maxes]`. The caller must return it with
+/// [`parquet_df_free_page_index`] passing `len = 4 * page_count`. When `page_count` is 0 the buffer
+/// is empty and its address must not be read or freed.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_column_page_index(
+    file_ptr: *const u8,
+    file_len: i64,
+    column_ptr: *const u8,
+    column_len: i64,
+    // 0 for a local (hot) shard; a warm shard passes its TieredObjectStore box pointer.
+    store_ptr: i64,
+    out_page_count: *mut i64,
+    out_total_rows: *mut i64,
+    out_buf_addr: *mut i64,
+) -> i64 {
+    static FN: &str = "parquet_df_column_page_index";
+    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("{FN} file: {e}"))?;
+    let column = str_from_raw(column_ptr, column_len).map_err(|e| format!("{FN} column: {e}"))?;
+    if out_page_count.is_null() || out_total_rows.is_null() || out_buf_addr.is_null() {
+        return Err(format!("{FN}: null out-parameter"));
+    }
+    // All fallible work runs before the allocation below, so an error path never leaks the buffer.
+    let layout = load_column_page_layout(filename, column, store_ptr).map_err(|e| e.to_string())?;
+    let page_count = layout.first_rows.len();
+
+    // Pack the four parallel arrays contiguously so Java copies them out in one crossing, then frees.
+    let mut buf: Vec<i64> = Vec::with_capacity(page_count * 4);
+    buf.extend_from_slice(&layout.first_rows);
+    buf.extend_from_slice(&layout.null_counts);
+    buf.extend_from_slice(&layout.mins);
+    buf.extend_from_slice(&layout.maxes);
+    let boxed = buf.into_boxed_slice();
+    let addr = Box::into_raw(boxed) as *mut i64 as i64; // ownership transferred to Java
+
+    *out_page_count = page_count as i64;
+    *out_total_rows = layout.total_rows;
+    *out_buf_addr = addr;
+    Ok(RC_OK)
+}
+
+/// Frees a buffer returned by [`parquet_df_column_page_index`]. `len` is the i64 element count
+/// (`4 * page_count`); a zero or negative length is a no-op, matching the empty-column case.
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_free_page_index(buf_addr: i64, len: i64) {
+    if buf_addr != 0 && len > 0 {
+        let ptr = buf_addr as *mut i64;
+        let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, len as usize));
+    }
 }
 
 #[cfg(test)]

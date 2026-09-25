@@ -59,6 +59,47 @@ public final class FieldTypeMapping {
     }
 
     /**
+     * Supported types whose doc-values long ordering matches numeric order, so a
+     * {@link ParquetDocValuesSkipper} built from the column's ColumnIndex per-page min/max can serve
+     * range queries without a wrong skip. This is the single source of the skipper gate: both
+     * {@link ParquetDocValuesProducer#getSkipper} and the {@code DocValuesSkipIndexType.RANGE}
+     * declaration on the synthetic {@code FieldInfo} read it, so the producer and the reader stay in
+     * lockstep (declaring RANGE for a field whose getSkipper returns null would break consumers that
+     * trust the declaration).
+     *
+     * <p>Integer-shaped types only. Excluded on purpose:
+     * <ul>
+     *   <li>{@code float}, {@code double}, {@code half_float}: doc values are IEEE-754 raw bits whose
+     *       order diverges from numeric order for negatives, so page min/max on bits could wrongly
+     *       skip a page holding matches.</li>
+     *   <li>{@code unsigned_long}: stored as the raw 64-bit pattern, which the Parquet ColumnIndex
+     *       orders unsigned; a signed-long skipper could then wrongly skip. Left out conservatively
+     *       (correctness over the optimization).</li>
+     * </ul>
+     * Fail-closed: a new supported type gets no skipper until it is added here, which merely disables
+     * an optimization rather than risking a wrong result.
+     */
+    private static final Set<String> RANGE_SKIPPABLE = Set.of(
+        "byte",
+        "short",
+        "integer",
+        "long",
+        "date",
+        "date_nanos",
+        "boolean",
+        // Stored as a plain signed long holding the already-scaled value, so its order is numeric.
+        "scaled_float"
+    );
+
+    /**
+     * True when the codec can serve a {@link ParquetDocValuesSkipper} for {@code mappingType}: it is
+     * supported and integer-shaped (see {@link #RANGE_SKIPPABLE}).
+     */
+    public static boolean isRangeSkippable(String mappingType) {
+        return RANGE_SKIPPABLE.contains(mappingType);
+    }
+
+    /**
      * Returns the DV type the codec serves for {@code mappingType}: always
      * {@link DocValuesType#SORTED_NUMERIC}.
      *

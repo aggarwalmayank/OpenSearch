@@ -134,7 +134,8 @@ public final class ParquetSegmentResourceCache {
                 continue;
             }
             DocValuesType dvType = FieldTypeMapping.forType(mft.typeName());
-            FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType);
+            DocValuesSkipIndexType skipType = skipTypeFor(mft);
+            FieldInfo synthetic = newDocValuesFieldInfo(name, ++maxNumber, dvType, skipType);
             parquetFields.put(name, synthetic);
             combined.add(synthetic);
         }
@@ -194,8 +195,32 @@ public final class ParquetSegmentResourceCache {
         return resourceByCore.size();
     }
 
-    /** Builds a synthetic doc-values {@link FieldInfo}. Skip index is NONE: the codec serves no skipper. */
-    private static FieldInfo newDocValuesFieldInfo(String name, int number, DocValuesType dvType) {
+    /**
+     * The {@link DocValuesSkipIndexType} to stamp on {@code mft}'s synthetic {@link FieldInfo}: RANGE
+     * only when the mapping type is range-skippable ({@link FieldTypeMapping#isRangeSkippable}) AND the
+     * field is single-valued, NONE otherwise. This is the open-time snapshot of the skipper gate and
+     * must stay in sync with {@link ParquetDocValuesProducer#getSkipper}, which trusts the stamp.
+     *
+     * <p>Multi-valued (LIST) columns get NONE: the Parquet writer emits a multi-valued field as a LIST
+     * column, whose per-page null counts count leaf values not documents (so docCount would overclaim)
+     * and whose values for one document can straddle a page boundary, leaving the skipper's page stats
+     * unreliable. Single-valued is trustworthy because the AUTO->LIST flip is one-way: a field
+     * reporting single-valued has never held an array, so every existing segment's column for it is a
+     * plain (non-LIST) column.
+     */
+    static DocValuesSkipIndexType skipTypeFor(MappedFieldType mft) {
+        return FieldTypeMapping.isRangeSkippable(mft.typeName()) && mft.isMultiValued() == false
+            ? DocValuesSkipIndexType.RANGE
+            : DocValuesSkipIndexType.NONE;
+    }
+
+    /**
+     * Builds a synthetic doc-values {@link FieldInfo}. {@code skipType} is RANGE for integer-shaped,
+     * single-valued columns the codec can serve a {@link ParquetDocValuesSkipper} for (see
+     * {@link #skipTypeFor}), NONE otherwise; it must stay in sync with
+     * {@link ParquetDocValuesProducer#getSkipper}'s gate.
+     */
+    private static FieldInfo newDocValuesFieldInfo(String name, int number, DocValuesType dvType, DocValuesSkipIndexType skipType) {
         return new FieldInfo(
             name,
             number,
@@ -204,7 +229,7 @@ public final class ParquetSegmentResourceCache {
             false,                       // storePayloads
             IndexOptions.NONE,           // not indexed via this reader
             dvType,
-            DocValuesSkipIndexType.NONE,
+            skipType,
             -1,                          // dvGen
             new HashMap<>(),             // attributes (mutable, per FieldInfo contract)
             0,                           // pointDimensionCount
