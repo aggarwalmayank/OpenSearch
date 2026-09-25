@@ -8,17 +8,20 @@
 
 package org.opensearch.be.datafusion.docvalues.bridge;
 
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * One decoded batch of a numeric Parquet column, read in place.
+ * One decoded batch of a Parquet column, read in place.
  *
  * <p>Holds the inclusive global row range {@code [firstRow, lastRow]} and off-heap views of the
  * decoded values and the packed presence bitset. Both views are borrowed Arrow buffers, read with
  * no on-heap copy; they are valid only until the next batch call on the owning cursor, which always
  * replaces this batch first. {@link #valueKind} selects the width and sign of the per-row read in
- * {@link #valueAt}.
+ * {@link #valueAt}, or the offsets-based byte read in {@link #bytesAt} for {@link #KIND_BINARY}.
  *
  * @param firstRow          inclusive global index of the first row in the batch
  * @param lastRow           inclusive global index of the last row in the batch
@@ -26,12 +29,15 @@ import java.lang.foreign.ValueLayout;
  * @param valueKind         element interpretation of {@code values}; one of the {@code KIND_*} constants
  * @param valueBitOffset    first value bit of this batch within {@code values}, used only by the bit-packed
  *                          {@link #KIND_BOOL}; zero for the byte-addressed kinds, which fold the offset into the address
+ * @param offsets           off-heap view of the i32 offsets buffer for the variable-width {@link #KIND_BINARY}
+ *                          (row {@code firstRow + i}'s bytes span {@code values[offsets[i] .. offsets[i+1]]}); {@code null}
+ *                          for every fixed-width and bit-packed kind, whose values live wholly in {@code values}
  * @param presenceBits      off-heap view of the packed presence bitset (bit {@code presenceBitOffset + i}
  *                          is set when row {@code firstRow + i} is non-null); {@code null} means every row is present
  * @param presenceBitOffset first presence bit of this batch within {@code presenceBits} (borrowed bitmaps are bit-sliced)
  */
-public record DecodedBatch(long firstRow, long lastRow, MemorySegment values, int valueKind, int valueBitOffset, MemorySegment presenceBits,
-    int presenceBitOffset) {
+public record DecodedBatch(long firstRow, long lastRow, MemorySegment values, int valueKind, int valueBitOffset, MemorySegment offsets,
+    MemorySegment presenceBits, int presenceBitOffset) {
 
     /** {@link #values} holds one {@code long} of raw bits per row (i64/u64 bits). */
     public static final int KIND_LONG = 1;
@@ -63,6 +69,12 @@ public record DecodedBatch(long firstRow, long lastRow, MemorySegment values, in
      * OpenSearch's half_float field stores in doc values.
      */
     public static final int KIND_HALF_FLOAT = 11;
+    /**
+     * {@link #values} holds the concatenated bytes of every row and {@link #offsets} holds one i32 per row
+     * boundary, so row {@code firstRow + i}'s bytes are {@code values[offsets[i] .. offsets[i+1]]}. Read
+     * with {@link #bytesAt} rather than {@link #valueAt}.
+     */
+    public static final int KIND_BINARY = 12;
 
     /**
      * Constant-time presence test for a global row, which must fall within
@@ -124,6 +136,40 @@ public record DecodedBatch(long firstRow, long lastRow, MemorySegment values, in
             }
             default -> throw new IllegalStateException("unknown value kind " + valueKind);
         };
+    }
+
+    /**
+     * Copies the bytes stored at the given global row into {@code dest}, which the caller must already
+     * have accepted through {@link #contains} or {@link #isPresent}. Only valid for {@link #KIND_BINARY};
+     * the numeric kinds have no byte value and must be read with {@link #valueAt}.
+     *
+     * <p>Row {@code i = row - firstRow}'s bytes are {@code values[offsets[i] .. offsets[i+1]]}. The two
+     * i32 offsets are read from {@link #offsets} and the span copied out of {@link #values} into
+     * {@code dest.bytes}, grown when too small, since the borrowed off-heap buffer is valid only until
+     * the next batch call. {@code dest.offset} is set to 0 and {@code dest.length} to the row's length,
+     * so a caller reusing one {@code dest} across rows allocates only when a row is longer than any
+     * seen before.
+     */
+    public void bytesAt(long row, BytesRef dest) {
+        if (valueKind != KIND_BINARY) {
+            throw new IllegalStateException("bytesAt is only valid for KIND_BINARY, not value kind " + valueKind);
+        }
+        long i = row - firstRow;
+        // offsets[i], offsets[i+1]: i32 each. offsets carries n+1 entries for n rows, so i+1 is in range.
+        int start = offsets.getAtIndex(ValueLayout.JAVA_INT, i);
+        int end = offsets.getAtIndex(ValueLayout.JAVA_INT, i + 1);
+        int length = end - start;
+        if (length < 0) {
+            throw new IllegalStateException(
+                "negative binary length " + length + " at row " + row + " (offsets " + start + ".." + end + ")"
+            );
+        }
+        if (dest.bytes.length < length) {
+            dest.bytes = ArrayUtil.grow(dest.bytes, length);
+        }
+        MemorySegment.copy(values, ValueLayout.JAVA_BYTE, start, dest.bytes, 0, length);
+        dest.offset = 0;
+        dest.length = length;
     }
 
     /** True when the given global row falls within this batch's range. */

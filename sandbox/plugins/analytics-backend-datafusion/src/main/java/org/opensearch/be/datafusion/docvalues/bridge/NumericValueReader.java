@@ -10,7 +10,7 @@ package org.opensearch.be.datafusion.docvalues.bridge;
 
 import java.io.IOException;
 
-/** Minimal decoded-batch source used by the numeric DocValues iterator. */
+/** Minimal decoded-batch source used by the Parquet DocValues iterators. */
 public interface NumericValueReader {
 
     /** The currently decoded batch, or {@code null} when none is loaded. */

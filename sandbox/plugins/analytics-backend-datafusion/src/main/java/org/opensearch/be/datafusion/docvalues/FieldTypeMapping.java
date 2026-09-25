@@ -62,7 +62,9 @@ public final class FieldTypeMapping {
         // KeywordFieldMapper and IpFieldMapper index SortedSetDocValuesField, so both resolve as
         // SORTED_SET even where the column holds one value per document.
         Map.entry("keyword", DocValuesType.SORTED_SET),
-        Map.entry("ip", DocValuesType.SORTED_SET)
+        Map.entry("ip", DocValuesType.SORTED_SET),
+        // An ArrowType.Binary column holding the value; one value per document.
+        Map.entry("binary", DocValuesType.BINARY)
     );
 
     // float and double are also stamped SORTED_NUMERIC, so a gate on the doc-values type alone would

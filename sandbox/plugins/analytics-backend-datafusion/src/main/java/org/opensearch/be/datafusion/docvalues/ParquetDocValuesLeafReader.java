@@ -9,6 +9,7 @@
 package org.opensearch.be.datafusion.docvalues;
 
 import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesSkipper;
@@ -78,6 +79,11 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     public SortedNumericDocValues getSortedNumericDocValues(String field) throws IOException {
         FieldInfo fi = resources.parquetFieldInfo(field);
         if (fi != null) {
+            if (fi.getDocValuesType() != DocValuesType.SORTED_NUMERIC) {
+                // A Parquet-resident field of another DV type (keyword, ip, binary) is served by its own
+                // accessor; a mismatched accessor returns null per the CodecReader contract.
+                return null;
+            }
             // OpenSearch numeric value sources request SORTED_NUMERIC even for single-valued fields,
             // then call DocValues.unwrapSingleton(...). The producer serves this as a singleton over
             // the single-valued numeric iterator (docId == Parquet row, asserted here). The cursor is
@@ -86,6 +92,21 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             return resources.producer.getSortedNumeric(fi, cursors);
         }
         return in.getSortedNumericDocValues(field);
+    }
+
+    @Override
+    public BinaryDocValues getBinaryDocValues(String field) throws IOException {
+        FieldInfo fi = resources.parquetFieldInfo(field);
+        if (fi != null) {
+            if (fi.getDocValuesType() != DocValuesType.BINARY) {
+                return null;
+            }
+            // A single-valued binary field: docId == Parquet row (asserted). The cursor is recorded on
+            // this request's registry and closed when the request ends.
+            assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet doc-values read path";
+            return resources.producer.getBinary(fi, cursors);
+        }
+        return in.getBinaryDocValues(field);
     }
 
     @Override
