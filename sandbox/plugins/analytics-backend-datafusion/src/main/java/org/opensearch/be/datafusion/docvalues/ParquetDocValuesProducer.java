@@ -385,7 +385,8 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * Opens a dedicated forward-only cursor for one iterator and records it on the request's
      * {@code cursors}, which closes it at request end.
      */
-    private ParquetColumnReader openCursor(String field, CursorRegistry cursors) throws IOException {
+    /** Opens a cursor over {@code field}'s column and records it on the request's registry. */
+    ParquetColumnReader openCursor(String field, CursorRegistry cursors) throws IOException {
         ParquetColumnReader reader = ParquetColumnReader.open(parquetFile, field, indexSettings, storePointer);
         cursors.register(reader);
         return reader;

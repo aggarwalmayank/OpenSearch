@@ -22,6 +22,7 @@ import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.StoredFields;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
 import org.opensearch.common.lucene.index.PerDocumentValuesProvider;
@@ -53,11 +54,14 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
 
     private final ParquetSegmentResources resources;
     private final CursorRegistry cursors;
+    /** Null when no Parquet field of this segment is served as a stored field. */
+    private final ParquetStoredFields storedFields;
 
     ParquetDocValuesLeafReader(LeafReader in, ParquetSegmentResources resources, CursorRegistry cursors) {
         super(in);
         this.resources = resources;
         this.cursors = cursors;
+        this.storedFields = resources.storedFields.isEmpty() ? null : new ParquetStoredFields(resources, cursors);
     }
 
     @Override
@@ -210,9 +214,25 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     }
 
     @Override
+    public StoredFields storedFields() throws IOException {
+        StoredFields lucene = in.storedFields();
+        if (storedFields == null) {
+            return lucene;
+        }
+        assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet stored-fields read path";
+        return storedFields.wrap(lucene);
+    }
+
+    @Override
+    public StoredFieldsReader getSequentialStoredFieldsReader() throws IOException {
+        assert storedFields == null || resources.assertRowIdsAreIdentity(in)
+            : "non-identity __row_id__ segment reached the Parquet stored-fields read path";
+        return super.getSequentialStoredFieldsReader();
+    }
+
+    @Override
     protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {
-        // This reader overlays doc values only; the underlying segment holds the real stored fields.
-        return reader;
+        return storedFields == null ? reader : storedFields.wrap(reader);
     }
 
     @Override
