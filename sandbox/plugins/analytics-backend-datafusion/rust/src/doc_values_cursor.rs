@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray,
+    Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, ListArray,
+    StringArray, StringViewArray,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -230,7 +230,13 @@ impl DocValuesCursor {
                 | DataType::LargeBinary
                 | DataType::BinaryView
         );
-        if BorrowKind::for_arrow(data_type).is_none() && !is_binary {
+        // A single-level list decodes to `List(primitive)`; unwrap one level and check the child's
+        // borrowable kind. A nested list-of-list has a `List` child with no `BorrowKind`, so it is rejected.
+        let borrowable_leaf = match data_type {
+            DataType::List(field) => field.data_type(),
+            other => other,
+        };
+        if BorrowKind::for_arrow(borrowable_leaf).is_none() && !is_binary {
             return Err(DataFusionError::NotImplemented(format!(
                 "unsupported type {data_type} for column '{column}'"
             )));
@@ -534,6 +540,44 @@ unsafe fn copy_binary_values_out(
     Ok(())
 }
 
+/// Shared prologue for the two batch entry points: locks the cursor, releases any prior borrow,
+/// advances to `target_row`, validates the row count. Returns `None` at end-of-column.
+///
+/// Takes the caller-owned `&Arc<Mutex<..>>` because the returned guard borrows from it, so the Arc must outlive the guard.
+fn prepare_batch<'a>(
+    cursor: &'a Arc<Mutex<DocValuesCursor>>,
+    target_row: i64,
+    fn_name: &str,
+) -> Result<
+    Option<(
+        parking_lot::MutexGuard<'a, DocValuesCursor>,
+        RecordBatch,
+        usize,
+    )>,
+    String,
+> {
+    let mut cursor = cursor.lock();
+
+    // Released here rather than on success, so no early return below leaves buffers held. Java
+    // clears its resident batch before calling. The reservation follows the batch.
+    cursor.borrowed_batch = None;
+    cursor.reservation.resize(0);
+
+    if at_eof(&cursor, target_row, fn_name).map_err(|e| e.to_string())? {
+        return Ok(None); // target is past the last row (e.g. a scan running off the end)
+    }
+
+    let batch = cursor.next_batch(target_row).map_err(|e| e.to_string())?;
+    let rows = batch.num_rows();
+    if rows == 0 || rows > cursor.max_batch_size {
+        return Err(format!(
+            "{fn_name}: Arrow returned {rows} rows, expected 1..={}",
+            cursor.max_batch_size
+        ));
+    }
+    Ok(Some((cursor, batch, rows)))
+}
+
 /// Writes `value` through a nullable out-parameter.
 unsafe fn write_out(ptr: *mut i64, value: i64) {
     if !ptr.is_null() {
@@ -638,6 +682,41 @@ fn borrowable_buffers(array: &dyn Array) -> Option<BorrowedBuffers> {
         validity_addr,    // start of the null-bitmap buffer; the bit offset is applied separately
         validity_bit_offset, // bit index of row 0 within that bitmap (bitmaps are bit-addressable)
         kind: kind as i64,
+    })
+}
+
+/// Per-row list structure exported on top of the flat value buffers, so Java can carve the
+/// flattened child values into one list per row.
+struct BorrowedListBuffers {
+    /// Flattened child values, borrowed through [`borrowable_buffers`]; identical to the
+    /// single-valued flat-value contract.
+    values: BorrowedBuffers,
+    /// Start of the `i32` offsets buffer at row 0; row `r`'s values are `offsets[r]..offsets[r + 1]`.
+    offsets_addr: usize,
+    /// Child values backing this batch, bounding how far Java may read through `values.values_addr`.
+    value_count: usize,
+}
+
+/// Exposes a `ListArray`'s child values and offsets for zero-copy per-row list reads. A list-level
+/// null and an empty list both export a zero-width range, which suits SORTED_NUMERIC doc values.
+///
+/// `None` when the array is not an `i32`-offset `ListArray`, its child carries a non-zero offset, or
+/// its child is not a borrowable primitive.
+fn borrowable_list_buffers(array: &dyn Array) -> Option<BorrowedListBuffers> {
+    let list = array.as_any().downcast_ref::<ListArray>()?;
+    let child = list.values();
+    // A non-zero child offset would shift every read: `borrowable_buffers` folds the child offset
+    // into the address while the list offsets index from absolute 0, so reject rather than misread.
+    if child.offset() != 0 {
+        return None;
+    }
+    // `value_offsets()` is sliced to this array's window, so a list-level slice is folded in here.
+    let offsets_addr = list.value_offsets().as_ptr() as usize;
+    let values = borrowable_buffers(child.as_ref())?;
+    Some(BorrowedListBuffers {
+        values,
+        offsets_addr,
+        value_count: child.len(),
     })
 }
 
@@ -900,6 +979,17 @@ pub unsafe extern "C" fn parquet_df_close_iter(handle: i64) -> i64 {
     Ok(RC_OK)
 }
 
+/// Whether the cursor's projected column is physically repeated: `1` repeated, `0` scalar, `< 0`
+/// error pointer. Reads only the schema recorded at open, so it never advances the cursor.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_is_repeated(handle: i64) -> i64 {
+    static FN: &str = "parquet_df_is_repeated";
+    let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
+    let repeated = cursor.lock().reader.is_repeated();
+    Ok(if repeated { 1 } else { 0 })
+}
+
 /// Rewinds a cursor to row zero, rebuilding the Parquet decoder while reusing the resolved metadata
 /// and page index, so the rewind costs no IO.
 ///
@@ -942,26 +1032,10 @@ pub unsafe extern "C" fn parquet_df_next_batch(
 ) -> i64 {
     static FN: &str = "parquet_df_next_batch";
     let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
-    let mut cursor = cursor.lock();
-    check_column_shape(&cursor, false, false, FN)?;
-
-    // Released here rather than on success, so no early return below leaves buffers held. Java
-    // clears its resident batch before calling. The reservation follows the batch.
-    cursor.borrowed_batch = None;
-    cursor.reservation.resize(0);
-
-    if at_eof(&cursor, target_row, FN).map_err(|e| e.to_string())? {
-        return Ok(RC_EOF); // target is past the last row (e.g. a scan running off the end)
-    }
-
-    let batch = cursor.next_batch(target_row).map_err(|e| e.to_string())?;
-    let rows = batch.num_rows();
-    if rows == 0 || rows > cursor.max_batch_size {
-        return Err(format!(
-            "{FN}: Arrow returned {rows} rows, expected 1..={}",
-            cursor.max_batch_size
-        ));
-    }
+    let (mut cursor, batch, rows) = match prepare_batch(&cursor, target_row, FN)? {
+        Some(prepared) => prepared,
+        None => return Ok(RC_EOF), // target is past the last row (e.g. a scan running off the end)
+    };
 
     // Scoped so the borrow ends before `batch` moves onto the cursor; `BorrowedBuffers` holds
     // plain addresses.
@@ -1092,6 +1166,58 @@ pub unsafe extern "C" fn parquet_df_page_index(
     Ok(RC_OK)
 }
 
+/// Like [`parquet_df_next_batch`] but for repeated (list) values: the same flat value buffers plus
+/// per-row offsets. A distinct symbol because `parquet_df_next_batch`'s ABI is depended on by the
+/// shipped single-valued read path.
+#[ffm_safe]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn parquet_df_next_list_batch(
+    handle: i64,
+    target_row: i64,
+    out_first_row: *mut i64,
+    out_last_row: *mut i64,
+    out_values_addr: *mut i64,
+    out_validity_addr: *mut i64,
+    out_validity_bit_offset: *mut i64,
+    out_value_kind: *mut i64,
+    out_value_bit_offset: *mut i64,
+    // List slots appended after the single-valued ones, so those keep their indices: `out_offsets_addr`
+    // is the `i32` offsets buffer, `out_value_count` the child count.
+    out_offsets_addr: *mut i64,
+    out_value_count: *mut i64,
+) -> i64 {
+    static FN: &str = "parquet_df_next_list_batch";
+    let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
+    let (mut cursor, batch, rows) = match prepare_batch(&cursor, target_row, FN)? {
+        Some(prepared) => prepared,
+        None => return Ok(RC_EOF), // target is past the last row (e.g. a scan running off the end)
+    };
+
+    // Scoped so the borrow ends before `batch` moves onto the cursor.
+    let borrow = {
+        let array = batch.column(0); // single projected column, a ListArray for a repeated column
+        borrowable_list_buffers(array.as_ref())
+            .ok_or_else(|| format!("{FN}: unsupported array type {}", array.data_type()))?
+    };
+
+    // Written only once the export is known good, so a failed call leaves them untouched.
+    write_out(out_first_row, target_row);
+    write_out(out_last_row, target_row + rows as i64 - 1); // inclusive last row of this batch
+    write_out(out_values_addr, borrow.values.values_addr as i64);
+    write_out(out_validity_addr, borrow.values.validity_addr as i64);
+    write_out(
+        out_validity_bit_offset,
+        borrow.values.validity_bit_offset as i64,
+    );
+    write_out(out_value_kind, borrow.values.kind);
+    write_out(out_value_bit_offset, borrow.values.value_bit_offset as i64);
+    write_out(out_offsets_addr, borrow.offsets_addr as i64);
+    write_out(out_value_count, borrow.value_count as i64);
+    cursor.borrowed_batch = Some(batch);
+    Ok(RC_OK)
+}
+
 /// Opening a cursor reads two process globals — the runtime manager and the global `RuntimeEnv`
 /// registration — and inserts into the process-global scoped page-index caches, so every test here
 /// holds `crate::test_process_globals::lock` for its whole body. Uniformly, including the few tests
@@ -1175,6 +1301,57 @@ mod tests {
                 .unwrap();
         writer.write(&batch).unwrap();
         Bytes::from(writer.into_inner().unwrap().into_inner())
+    }
+
+    /// A single-level `list<int32>` column named "value": row `r` holds [`list_fixture_row_width`]`(r)`
+    /// elements. Child values are one global counter (child `i` reads back as `i`). Eight pages per row group.
+    pub(super) fn parquet_fixture_with_list_page_rows(
+        row_groups: usize,
+        rows_per_page: usize,
+    ) -> Bytes {
+        use arrow::datatypes::Int32Type;
+
+        let row_count = row_groups * rows_per_page * 8;
+        let mut next_value = 0i32;
+        let rows: Vec<Option<Vec<Option<i32>>>> = (0..row_count)
+            .map(|row| {
+                let width = list_fixture_row_width(row) as i32;
+                Some(
+                    (0..width)
+                        .map(|_| {
+                            let value = next_value;
+                            next_value += 1;
+                            Some(value)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(rows);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            list.data_type().clone(),
+            true,
+        )]));
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_data_page_row_count_limit(rows_per_page)
+            .set_write_batch_size(rows_per_page)
+            .set_max_row_group_row_count(Some(rows_per_page * 8))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(Cursor::new(Vec::new()), Arc::clone(&schema), Some(props))
+                .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(list) as ArrayRef]).unwrap();
+        writer.write(&batch).unwrap();
+        Bytes::from(writer.into_inner().unwrap().into_inner())
+    }
+
+    /// Element count of row `r` in [`parquet_fixture_with_list_page_rows`]: widths cycle 0..3. Shared
+    /// with the tests so the fixture and its assertions cannot drift.
+    pub(super) fn list_fixture_row_width(row: usize) -> usize {
+        row % 4
     }
 
     fn parquet_fixture_with_all_null_page(rows_per_page: usize) -> Bytes {
@@ -1990,6 +2167,163 @@ mod tests {
         assert_eq!(borrow.kind, BorrowKind::Long as i64);
         assert_eq!(borrow.value_bit_offset, 0);
     }
+
+    /// The exported offsets carve each row's child range back exactly, and `value_count` bounds the
+    /// child buffer. Widths differ and every value is distinct, so an off-by-one changes at least one row.
+    #[test]
+    fn list_buffers_export_offsets_that_carve_each_row_back_exactly() {
+        use arrow::datatypes::Int32Type;
+
+        // Widths 2, 0 (empty), 3, 1 -> offsets [0, 2, 2, 5, 6], child [10, 11, 20, 21, 22, 30].
+        let rows: Vec<Option<Vec<Option<i32>>>> = vec![
+            Some(vec![Some(10), Some(11)]),
+            Some(vec![]),
+            Some(vec![Some(20), Some(21), Some(22)]),
+            Some(vec![Some(30)]),
+        ];
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(rows.clone());
+        let child_len = list.values().len();
+
+        let borrow = borrowable_list_buffers(&list).expect("an i32 ListArray must be borrowable");
+        assert_eq!(
+            borrow.value_count, child_len,
+            "value_count must bound the child buffer Java may read to child.len()"
+        );
+        // The child is Int32, so it borrows as the Int wire kind.
+        assert_eq!(borrow.values.kind, BorrowKind::Int as i64);
+
+        // Reconstruct each row as Java does: read offsets[r]..offsets[r + 1] and carve that range
+        // out of the value buffer.
+        let read_offset = |i: usize| unsafe { *(borrow.offsets_addr as *const i32).add(i) };
+        let read_value =
+            |i: i32| unsafe { *(borrow.values.values_addr as *const i32).add(i as usize) };
+        for (r, expected) in rows.iter().enumerate() {
+            let start = read_offset(r);
+            let end = read_offset(r + 1);
+            let got: Vec<i32> = (start..end).map(read_value).collect();
+            let expected: Vec<i32> = expected
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap())
+                .collect();
+            assert_eq!(
+                got, expected,
+                "row {r} must reconstruct from its offset range exactly"
+            );
+        }
+        assert_eq!(
+            read_offset(rows.len()) as usize,
+            child_len,
+            "the final offset must equal the child length"
+        );
+    }
+
+    /// A list-level slice must still reconstruct: the offsets stay absolute indices into the whole
+    /// child, so the window is carried by the offsets rather than by re-slicing the child.
+    #[test]
+    fn a_sliced_list_still_reconstructs_from_absolute_offsets() {
+        use arrow::datatypes::Int32Type;
+
+        let rows: Vec<Option<Vec<Option<i32>>>> = vec![
+            Some(vec![Some(10), Some(11)]),
+            Some(vec![]),
+            Some(vec![Some(20), Some(21), Some(22)]),
+            Some(vec![Some(30)]),
+        ];
+        let full = ListArray::from_iter_primitive::<Int32Type, _, _>(rows.clone());
+        // Drop row 0; the survivors are the empty row, [20, 21, 22] and [30].
+        let sliced = full.slice(1, 3);
+        // The child stays unsliced, so value_count is the whole child, not the sliced window.
+        let child_len = full.values().len();
+
+        let borrow =
+            borrowable_list_buffers(&sliced).expect("a sliced i32 ListArray must be borrowable");
+        assert_eq!(
+            borrow.value_count, child_len,
+            "value_count follows the unsliced child, not the sliced row window"
+        );
+
+        let read_offset = |i: usize| unsafe { *(borrow.offsets_addr as *const i32).add(i) };
+        let read_value =
+            |i: i32| unsafe { *(borrow.values.values_addr as *const i32).add(i as usize) };
+        // The rebased offsets stay absolute into the whole child: row 1's start (2), not 0.
+        assert_eq!(
+            read_offset(0),
+            2,
+            "sliced offsets must remain absolute indices into the whole child"
+        );
+        for (r, expected) in rows[1..].iter().enumerate() {
+            let start = read_offset(r);
+            let end = read_offset(r + 1);
+            let got: Vec<i32> = (start..end).map(read_value).collect();
+            let expected: Vec<i32> = expected
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap())
+                .collect();
+            assert_eq!(got, expected, "surviving row {r} must reconstruct exactly");
+        }
+    }
+
+    /// A `LargeListArray` (i64 offsets) is not the i32-offset `ListArray` the export downcasts to, so
+    /// the helper returns `None` rather than misreading 64-bit offsets as 32-bit.
+    #[test]
+    fn a_large_list_array_is_not_borrowable_as_a_list() {
+        use arrow::array::LargeListArray;
+        use arrow::datatypes::Int32Type;
+
+        let large = LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3)]),
+        ]);
+        assert!(
+            borrowable_list_buffers(&large).is_none(),
+            "a LargeListArray's i64 offsets must be rejected, not misread as an i32 ListArray"
+        );
+    }
+
+    /// A list whose child carries a non-zero offset must be rejected: the offsets index from absolute
+    /// 0 while `borrowable_buffers` folds the child offset in, so every read would shift.
+    #[test]
+    fn a_list_with_a_non_zero_child_offset_is_not_borrowable() {
+        use arrow::array::{make_array, ArrayData};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::Field;
+
+        // A boolean child retains its bit offset (it cannot fold into a byte pointer), so
+        // `borrowable_buffers` would disagree with the absolute list offsets; the helper must reject.
+        let child_data = ArrayData::builder(DataType::Boolean)
+            .len(4)
+            .offset(1)
+            .add_buffer(Buffer::from_slice_ref([0b0001_0110u8]))
+            .build()
+            .unwrap();
+        assert_eq!(
+            child_data.offset(),
+            1,
+            "the child must carry a non-zero offset"
+        );
+
+        let offsets = Buffer::from_slice_ref([0i32, 2, 4]);
+        let list_data = ArrayData::builder(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Boolean,
+            true,
+        ))))
+        .len(2)
+        .add_buffer(offsets)
+        .add_child_data(child_data)
+        .build()
+        .unwrap();
+        let list = make_array(list_data);
+
+        assert!(
+            borrowable_list_buffers(list.as_ref()).is_none(),
+            "a list whose child carries a non-zero offset must be rejected, not misread"
+        );
+    }
 }
 
 /// Tests driving the `extern "C"` entry points: handle registry, status codes, and `borrowed_batch`,
@@ -2009,7 +2343,9 @@ mod ffm_tests {
     use tokio::runtime::Builder;
 
     use super::tests::{
-        parquet_fixture_with_page_rows, register_test_metadata_cache, register_test_runtime_manager,
+        list_fixture_row_width, parquet_fixture_with_list_page_rows,
+        parquet_fixture_with_page_rows, register_test_metadata_cache,
+        register_test_runtime_manager,
     };
     use super::*;
 
@@ -2124,6 +2460,90 @@ mod ffm_tests {
             value_kind,
             value_bit_offset,
         }
+    }
+
+    /// The list fixture is written with the same eight-pages-per-row-group layout as the scalar one.
+    const LIST_FIXTURE_ROWS: i64 = (ROWS_PER_PAGE * 8) as i64;
+
+    fn list_fixture_file() -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&parquet_fixture_with_list_page_rows(1, ROWS_PER_PAGE))
+            .unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// The list entry point's nine out-params, keeping the two list-only ones (`offsets_addr`,
+    /// `value_count`) the scalar `Batch` has no slot for.
+    struct ListBatch {
+        rc: i64,
+        first_row: i64,
+        last_row: i64,
+        values_addr: i64,
+        value_kind: i64,
+        offsets_addr: i64,
+        value_count: i64,
+    }
+
+    fn next_list_batch(handle: i64, target_row: i64) -> ListBatch {
+        let mut first_row = -1i64;
+        let mut last_row = -1i64;
+        let mut values_addr = 0i64;
+        let mut validity_addr = 0i64;
+        let mut validity_bit_offset = -1i64;
+        let mut value_kind = -1i64;
+        let mut value_bit_offset = -1i64;
+        // Sentinels for the two list-only slots: a dropped `write_out` leaves these untouched, so a
+        // test asserting they changed catches a missing export rather than reading a stale address.
+        let mut offsets_addr = 0i64;
+        let mut value_count = -1i64;
+        let rc = unsafe {
+            parquet_df_next_list_batch(
+                handle,
+                target_row,
+                &mut first_row,
+                &mut last_row,
+                &mut values_addr,
+                &mut validity_addr,
+                &mut validity_bit_offset,
+                &mut value_kind,
+                &mut value_bit_offset,
+                &mut offsets_addr,
+                &mut value_count,
+            )
+        };
+        ListBatch {
+            rc,
+            first_row,
+            last_row,
+            values_addr,
+            value_kind,
+            offsets_addr,
+            value_count,
+        }
+    }
+
+    /// Reads `i32`s back out of an exported buffer the way Java does for the list offsets and the
+    /// Int32 child values. Same unchecked-view contract as [`exported_i64s`].
+    ///
+    /// # Safety
+    /// Only valid while the cursor still holds the batch these addresses were borrowed from.
+    unsafe fn exported_i32s(addr: i64, count: usize) -> Vec<i32> {
+        std::slice::from_raw_parts(addr as *const i32, count).to_vec()
+    }
+
+    /// The physical-shape probe reports scalar for a scalar fixture through the FFI boundary. The
+    /// repeated side is covered by the `forward_reader` and Java list tests.
+    #[test]
+    fn is_repeated_reports_scalar_for_a_scalar_fixture() {
+        let file = fixture_file();
+        let handle = open_fixture(&file);
+        let rc = unsafe { parquet_df_is_repeated(handle) };
+        assert_eq!(
+            rc, 0,
+            "a scalar fixture must probe as not-repeated (rc={rc})"
+        );
+        unsafe { parquet_df_close_iter(handle) };
     }
 
     #[test]
@@ -2490,5 +2910,161 @@ mod ffm_tests {
         // No handle is returned, and `open_and_register` only inserts after a successful open, so
         // there is nothing to leak. `CURSORS` is process-wide and other tests add to and remove from
         // it concurrently, so its length is not a signal this test can assert on.
+    }
+
+    /// The list entry point returns RC_OK and writes all nine out-params. The exported offsets must
+    /// carve the batch's rows at their fixture widths, and `value_count` must bound the child.
+    #[test]
+    fn a_served_list_batch_exports_offsets_and_value_count_that_carve_each_row() {
+        let file = list_fixture_file();
+        let handle = open_fixture(&file);
+
+        let batch = next_list_batch(handle, 0);
+        assert_eq!(batch.rc, RC_OK, "{}", error_message(batch.rc));
+        assert_eq!(batch.first_row, 0);
+        assert_eq!(batch.last_row, 7, "the initial window is eight rows");
+        assert_eq!(
+            batch.value_kind,
+            BorrowKind::Int as i64,
+            "the list child is Int32, so it borrows as the Int wire kind"
+        );
+        assert!(
+            holds_borrow(handle),
+            "the served list batch must be retained"
+        );
+
+        // Guard the two list-only out-params before dereferencing, so a dropped export fails cleanly
+        // here rather than reading through a null/stale address.
+        assert_ne!(
+            batch.offsets_addr, 0,
+            "the offsets buffer address must be exported"
+        );
+        assert_ne!(
+            batch.value_count, -1,
+            "the child value count must be exported"
+        );
+
+        // n rows have n+1 CSR boundaries; Java reads `last_row - first_row + 2` of them.
+        let n = (batch.last_row - batch.first_row + 1) as usize;
+        let offsets = unsafe { exported_i32s(batch.offsets_addr, n + 1) };
+        // The first window is decoded whole and unsliced, so the offsets start at child index 0 and
+        // each gap is exactly the fixture's width for that absolute row.
+        assert_eq!(
+            offsets[0], 0,
+            "an unsliced first window starts at child index 0"
+        );
+        for i in 0..n {
+            let width = (offsets[i + 1] - offsets[i]) as usize;
+            assert_eq!(
+                width,
+                list_fixture_row_width(batch.first_row as usize + i),
+                "row {} width must match the fixture",
+                batch.first_row as usize + i
+            );
+        }
+        // value_count bounds the flattened child; the final offset must land exactly on that bound
+        // for an unsliced window.
+        assert_eq!(
+            batch.value_count as i32, offsets[n],
+            "value_count must equal the final offset for an unsliced window"
+        );
+        // The child values are a global counter, so each row's offset range reads back as contiguous
+        // child indices - a wrong values_addr or a swapped offset pair changes at least one.
+        let children = unsafe { exported_i32s(batch.values_addr, batch.value_count as usize) };
+        assert_eq!(
+            children,
+            (0..batch.value_count as i32).collect::<Vec<_>>(),
+            "child value i must read back as i"
+        );
+
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// Requesting a row past the last returns RC_EOF and releases the borrow, like the scalar path
+    /// (the shared prologue drops the prior batch before the bounds check).
+    #[test]
+    fn reaching_end_of_a_list_column_releases_the_borrow() {
+        let file = list_fixture_file();
+        let handle = open_fixture(&file);
+
+        assert_eq!(next_list_batch(handle, 0).rc, RC_OK);
+        assert!(holds_borrow(handle));
+
+        assert_eq!(next_list_batch(handle, LIST_FIXTURE_ROWS).rc, RC_EOF);
+        assert!(
+            !holds_borrow(handle),
+            "end of column must release the retained list batch"
+        );
+
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// A failed list read releases the borrow: the prologue drops the prior batch before the failing
+    /// read, so an out-of-range row and a backward seek both leave nothing retained.
+    #[test]
+    fn a_failed_list_read_releases_the_borrow() {
+        let file = list_fixture_file();
+        let handle = open_fixture(&file);
+
+        assert_eq!(next_list_batch(handle, 0).rc, RC_OK);
+        assert!(holds_borrow(handle));
+
+        // Out of range: fails after the release, so nothing stays held.
+        let message = error_message(next_list_batch(handle, LIST_FIXTURE_ROWS + 1).rc);
+        assert!(message.contains("out of range"), "{message}");
+        assert!(
+            !holds_borrow(handle),
+            "a failed list read must release the retained batch"
+        );
+
+        // A backward seek fails inside the reader, after the release, for the same reason.
+        assert_eq!(next_list_batch(handle, 40).rc, RC_OK);
+        let message = error_message(next_list_batch(handle, 0).rc);
+        assert!(message.contains("backward seek"), "{message}");
+        assert!(!holds_borrow(handle));
+
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// Each list call releases the previous batch before decoding, so a multi-page scan never
+    /// retains more than one batch.
+    #[test]
+    fn only_one_list_batch_is_retained_across_a_long_scan() {
+        let file = list_fixture_file();
+        let handle = open_fixture(&file);
+
+        let mut row = 0;
+        while row < LIST_FIXTURE_ROWS {
+            let batch = next_list_batch(handle, row);
+            assert_eq!(batch.rc, RC_OK, "row {row}");
+            assert!(holds_borrow(handle));
+            row = batch.last_row + 1;
+        }
+
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// Each entry point rejects the other column's shape: list-on-scalar and scalar-on-list both fail
+    /// with "unsupported array type" rather than misreading one layout as the other.
+    #[test]
+    fn each_entry_point_rejects_the_other_columns_shape() {
+        // List entry point against a scalar fixture.
+        let scalar = fixture_file();
+        let handle = open_fixture(&scalar);
+        let message = error_message(next_list_batch(handle, 0).rc);
+        assert!(message.contains("unsupported array type"), "{message}");
+        assert!(
+            !holds_borrow(handle),
+            "a rejected shape must not retain a batch"
+        );
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+
+        // Scalar entry point against a list fixture.
+        let list = list_fixture_file();
+        let handle = open_fixture(&list);
+        let message = error_message(next_batch(handle, 0).rc);
+        assert!(message.contains("unsupported array type"), "{message}");
+        assert!(!holds_borrow(handle));
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
     }
 }
