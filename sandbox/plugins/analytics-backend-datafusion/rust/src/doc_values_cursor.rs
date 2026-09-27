@@ -221,8 +221,15 @@ impl DocValuesCursor {
             footer.file_metadata().key_value_metadata(),
         )?;
         let data_type = leaf_schema.field(0).data_type();
+        // A single-level list decodes to `List(primitive)`; unwrap one level and check the child's
+        // borrowable kind. A nested list-of-list has a `List` child with no `BorrowKind`, so it is rejected.
+        let borrowable_leaf = match data_type {
+            DataType::List(field) => field.data_type(),
+            other => other,
+        };
+        // Checked on the item type, so a list of strings opens like a plain string column.
         let is_binary = matches!(
-            data_type,
+            borrowable_leaf,
             DataType::Utf8
                 | DataType::LargeUtf8
                 | DataType::Utf8View
@@ -230,12 +237,6 @@ impl DocValuesCursor {
                 | DataType::LargeBinary
                 | DataType::BinaryView
         );
-        // A single-level list decodes to `List(primitive)`; unwrap one level and check the child's
-        // borrowable kind. A nested list-of-list has a `List` child with no `BorrowKind`, so it is rejected.
-        let borrowable_leaf = match data_type {
-            DataType::List(field) => field.data_type(),
-            other => other,
-        };
         if BorrowKind::for_arrow(borrowable_leaf).is_none() && !is_binary {
             return Err(DataFusionError::NotImplemented(format!(
                 "unsupported type {data_type} for column '{column}'"
@@ -536,6 +537,71 @@ unsafe fn copy_binary_values_out(
             offset += value.len();
         }
         *out_byte_offsets.add(index + 1) = offset as i32;
+    }
+    Ok(())
+}
+
+/// Item range of `row` in a list batch; a row with no list owns none.
+fn list_row_item_range(list: &ListArray, row: usize) -> (usize, usize) {
+    if list.is_valid(row) {
+        let offsets = list.value_offsets();
+        (offsets[row] as usize, offsets[row + 1] as usize)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Present items and their total byte length, checked against the i32 offsets Java reads.
+fn list_binary_output_size(list: &ListArray) -> Result<(usize, usize), String> {
+    let items = list.values();
+    let (mut count, mut bytes) = (0usize, 0usize);
+    for row in 0..list.len() {
+        let (start, end) = list_row_item_range(list, row);
+        for item in start..end {
+            if items.is_valid(item) {
+                count += 1;
+                bytes = bytes
+                    .checked_add(binary_value_at(items.as_ref(), item)?.len())
+                    .ok_or_else(|| {
+                        "df_docvalues: list binary output length overflow".to_string()
+                    })?;
+            }
+        }
+    }
+    if bytes > i32::MAX as usize || count > i32::MAX as usize {
+        return Err(format!(
+            "df_docvalues: list binary batch requires {bytes} bytes and {count} items, exceeding i32 offsets"
+        ));
+    }
+    Ok((count, bytes))
+}
+
+unsafe fn copy_list_binary_out(
+    list: &ListArray,
+    out_value_buf: *mut u8,
+    out_byte_offsets: *mut i32,
+    out_row_offsets: *mut i32,
+) -> Result<(), String> {
+    let items = list.values();
+    *out_byte_offsets = 0;
+    *out_row_offsets = 0;
+    let (mut count, mut offset) = (0usize, 0usize);
+    for row in 0..list.len() {
+        let (start, end) = list_row_item_range(list, row);
+        for item in start..end {
+            if items.is_valid(item) {
+                let value = binary_value_at(items.as_ref(), item)?;
+                std::ptr::copy_nonoverlapping(
+                    value.as_ptr(),
+                    out_value_buf.add(offset),
+                    value.len(),
+                );
+                offset += value.len();
+                count += 1;
+                *out_byte_offsets.add(count) = offset as i32;
+            }
+        }
+        *out_row_offsets.add(row + 1) = count as i32;
     }
     Ok(())
 }
@@ -1105,6 +1171,70 @@ pub unsafe extern "C" fn parquet_df_next_binary_batch(
     }
 
     copy_binary_array_out(array, out_value_buf, out_byte_offsets, out_presence_bitset)?;
+    // The batch is fully copied out; nothing native stays resident, so release its budget charge.
+    cursor.reservation.resize(0);
+    Ok(RC_OK)
+}
+
+/// List counterpart of [`parquet_df_next_binary_batch`] for multi-valued keyword columns. Row `r`
+/// owns items `out_row_offsets[r]..out_row_offsets[r + 1]`, and item `i` owns bytes
+/// `out_byte_offsets[i]..out_byte_offsets[i + 1]` of `out_value_buf`. An overflow reports both
+/// needs and stages the batch, as the plain export does.
+#[ffm_safe]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn parquet_df_next_list_binary_batch(
+    handle: i64,
+    target_row: i64,
+    out_first_row: *mut i64,
+    out_last_row: *mut i64,
+    out_value_buf: *mut u8,
+    out_value_buf_cap: i64,
+    out_value_actual_len: *mut i64,
+    out_byte_offsets: *mut i32,
+    out_byte_offsets_cap: i64,
+    out_item_count: *mut i64,
+    out_row_offsets: *mut i32,
+    out_row_offsets_cap: i64,
+) -> i64 {
+    const FN: &str = "parquet_df_next_list_binary_batch";
+    let cursor = cursor_for(handle, FN).map_err(|e| e.to_string())?;
+    let mut cursor = cursor.lock();
+    check_column_shape(&cursor, true, true, FN)?;
+    if at_eof(&cursor, target_row, FN).map_err(|e| e.to_string())? {
+        return Ok(RC_EOF);
+    }
+
+    let batch = take_pending_or_decode(&mut cursor, target_row, FN)?;
+    let rows = batch.num_rows();
+    let list = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| {
+            format!(
+                "{FN}: unsupported array type {}",
+                batch.column(0).data_type()
+            )
+        })?;
+    let (item_count, value_bytes) = list_binary_output_size(list)?;
+
+    write_out(out_first_row, target_row);
+    write_out(out_last_row, target_row + rows as i64 - 1);
+    write_out(out_value_actual_len, value_bytes as i64);
+    write_out(out_item_count, item_count as i64);
+
+    if out_value_buf.is_null()
+        || out_byte_offsets.is_null()
+        || out_row_offsets.is_null()
+        || out_value_buf_cap < value_bytes as i64
+        || out_byte_offsets_cap < item_count as i64 + 1
+        || out_row_offsets_cap < rows as i64 + 1
+    {
+        return Ok(stage_overflow(&mut cursor, target_row, batch));
+    }
+
+    copy_list_binary_out(list, out_value_buf, out_byte_offsets, out_row_offsets)?;
     // The batch is fully copied out; nothing native stays resident, so release its budget charge.
     cursor.reservation.resize(0);
     Ok(RC_OK)
@@ -3065,6 +3195,171 @@ mod ffm_tests {
         let message = error_message(next_batch(handle, 0).rc);
         assert!(message.contains("unsupported array type"), "{message}");
         assert!(!holds_borrow(handle));
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// Writes `column` as the single "value" column, with the page index the cursor needs at open.
+    fn string_fixture_file(column: arrow::array::ArrayRef) -> NamedTempFile {
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            column.data_type().clone(),
+            true,
+        )]));
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut file = NamedTempFile::new().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), Some(props)).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, vec![column]).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// The four `tags` rows: `[red, blue]`, `[blue]`, no list, `[red, red, green]`.
+    fn tags_fixture_file() -> NamedTempFile {
+        use arrow::array::{ListBuilder, StringBuilder};
+
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value("red");
+        builder.values().append_value("blue");
+        builder.append(true);
+        builder.values().append_value("blue");
+        builder.append(true);
+        builder.append(false);
+        for value in ["red", "red", "green"] {
+            builder.values().append_value(value);
+        }
+        builder.append(true);
+        string_fixture_file(Arc::new(builder.finish()))
+    }
+
+    /// Out-params and the three Java-side buffers of one `parquet_df_next_list_binary_batch` call.
+    struct ListBinaryBatch {
+        rc: i64,
+        first_row: i64,
+        last_row: i64,
+        value_len: i64,
+        item_count: i64,
+        values: Vec<u8>,
+        byte_offsets: Vec<i32>,
+        row_offsets: Vec<i32>,
+    }
+
+    fn next_list_binary_batch(
+        handle: i64,
+        target_row: i64,
+        value_cap: usize,
+        byte_offsets_cap: usize,
+        row_offsets_cap: usize,
+    ) -> ListBinaryBatch {
+        let mut values = vec![0u8; value_cap];
+        let mut byte_offsets = vec![-1i32; byte_offsets_cap];
+        let mut row_offsets = vec![-1i32; row_offsets_cap];
+        let (mut first_row, mut last_row, mut value_len, mut item_count) =
+            (-1i64, -1i64, -1i64, -1i64);
+        let rc = unsafe {
+            parquet_df_next_list_binary_batch(
+                handle,
+                target_row,
+                &mut first_row,
+                &mut last_row,
+                values.as_mut_ptr(),
+                value_cap as i64,
+                &mut value_len,
+                byte_offsets.as_mut_ptr(),
+                byte_offsets_cap as i64,
+                &mut item_count,
+                row_offsets.as_mut_ptr(),
+                row_offsets_cap as i64,
+            )
+        };
+        ListBinaryBatch {
+            rc,
+            first_row,
+            last_row,
+            value_len,
+            item_count,
+            values,
+            byte_offsets,
+            row_offsets,
+        }
+    }
+
+    /// A list-of-strings batch is copied into the caller's buffers with byte and row offsets that
+    /// carve every row back, repeats kept, and the row without a list as an empty range.
+    #[test]
+    fn a_served_list_binary_batch_carves_each_row_into_its_strings() {
+        let file = tags_fixture_file();
+        let handle = open_fixture(&file);
+
+        let batch = next_list_binary_batch(handle, 0, 22, 7, 5);
+        assert_eq!(batch.rc, RC_OK, "{}", error_message(batch.rc));
+        assert_eq!((batch.first_row, batch.last_row), (0, 3));
+        assert_eq!((batch.item_count, batch.value_len), (6, 22));
+        assert_eq!(&batch.values[..], b"redblueblueredredgreen");
+        assert_eq!(batch.byte_offsets, vec![0, 3, 7, 11, 14, 17, 22]);
+        assert_eq!(batch.row_offsets, vec![0, 2, 3, 3, 6]);
+        assert!(
+            !holds_borrow(handle),
+            "a copied batch must not stay resident on the cursor"
+        );
+
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// Buffers too small report both sizes and keep the batch; the retry for the same row is
+    /// served from that kept batch.
+    #[test]
+    fn an_undersized_list_binary_call_reports_sizes_and_the_retry_is_served() {
+        let file = tags_fixture_file();
+        let handle = open_fixture(&file);
+
+        let probe = next_list_binary_batch(handle, 0, 1, 1, 1);
+        assert_eq!(probe.rc, RC_OVERFLOW);
+        assert_eq!((probe.first_row, probe.last_row), (0, 3));
+        assert_eq!((probe.item_count, probe.value_len), (6, 22));
+
+        let rows = (probe.last_row - probe.first_row + 1) as usize;
+        let batch = next_list_binary_batch(
+            handle,
+            0,
+            probe.value_len as usize,
+            probe.item_count as usize + 1,
+            rows + 1,
+        );
+        assert_eq!(batch.rc, RC_OK, "{}", error_message(batch.rc));
+        assert_eq!(&batch.values[..], b"redblueblueredredgreen");
+        assert_eq!(batch.row_offsets, vec![0, 2, 3, 3, 6]);
+
+        assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// A plain string column is refused by the list export with the shape error, so a caller that
+    /// picks the wrong export fails loudly instead of misreading the column.
+    #[test]
+    fn a_plain_string_column_is_refused_by_the_list_binary_export() {
+        let file = string_fixture_file(Arc::new(StringArray::from(vec![
+            Some("Delhi"),
+            Some("Pune"),
+            None,
+        ])));
+        let handle = open_fixture(&file);
+
+        let message = error_message(next_list_binary_batch(handle, 0, 64, 8, 8).rc);
+        assert!(
+            message.contains("use the batch output matching that shape"),
+            "{message}"
+        );
+
         assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
     }
 }

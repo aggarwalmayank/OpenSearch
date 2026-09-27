@@ -32,6 +32,7 @@ public final class ParquetCodecBridge {
     private static final MethodHandle RESET_CURSOR;
     private static final MethodHandle NEXT_BATCH;
     private static final MethodHandle NEXT_BINARY_BATCH;
+    private static final MethodHandle NEXT_LIST_BINARY_BATCH;
     private static final MethodHandle FILE_METADATA;
     private static final MethodHandle COLUMN_NON_NULL_COUNT;
     private static final MethodHandle PAGE_COUNT;
@@ -116,6 +117,24 @@ public final class ParquetCodecBridge {
                 ValueLayout.JAVA_LONG,  // out_byte_offsets_cap
                 ValueLayout.ADDRESS,    // out_presence_bitset
                 ValueLayout.JAVA_LONG   // out_presence_bits_cap
+            )
+        );
+        NEXT_LIST_BINARY_BATCH = linker.downcallHandle(
+            lib.find("parquet_df_next_list_binary_batch").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,  // handle
+                ValueLayout.JAVA_LONG,  // target_row
+                ValueLayout.ADDRESS,    // out_first_row
+                ValueLayout.ADDRESS,    // out_last_row
+                ValueLayout.ADDRESS,    // out_value_buf
+                ValueLayout.JAVA_LONG,  // out_value_buf_cap
+                ValueLayout.ADDRESS,    // out_value_actual_len
+                ValueLayout.ADDRESS,    // out_byte_offsets
+                ValueLayout.JAVA_LONG,  // out_byte_offsets_cap
+                ValueLayout.ADDRESS,    // out_item_count
+                ValueLayout.ADDRESS,    // out_row_offsets
+                ValueLayout.JAVA_LONG   // out_row_offsets_cap
             )
         );
         NEXT_LIST_BATCH = linker.downcallHandle(
@@ -379,6 +398,45 @@ public final class ParquetCodecBridge {
                 outByteOffsetsCap,
                 outPresenceBits,
                 outPresenceBitsCap
+            );
+        }
+    }
+
+    /**
+     * List counterpart of {@link #nextBinaryBatch} for multi-valued keyword columns. Row {@code r}
+     * owns items {@code rowOffsets[r]..rowOffsets[r + 1]}, and item {@code i} owns bytes
+     * {@code byteOffsets[i]..byteOffsets[i + 1]}. Returns {@link #RC_OK}, {@link #RC_OVERFLOW} with
+     * both needed sizes written, or {@link #RC_EOF}; a {@code < 0} return becomes an {@link IOException}.
+     */
+    public static long nextListBinaryBatch(
+        long handle,
+        long targetRow,
+        MemorySegment outFirstRow,
+        MemorySegment outLastRow,
+        MemorySegment outValueBuf,
+        long outValueBufCap,
+        MemorySegment outValueActualLen,
+        MemorySegment outByteOffsets,
+        long outByteOffsetsCap,
+        MemorySegment outItemCount,
+        MemorySegment outRowOffsets,
+        long outRowOffsetsCap
+    ) throws IOException {
+        try (var call = new NativeCall()) {
+            return call.invokeIO(
+                NEXT_LIST_BINARY_BATCH,
+                handle,
+                targetRow,
+                outFirstRow,
+                outLastRow,
+                outValueBuf,
+                outValueBufCap,
+                outValueActualLen,
+                outByteOffsets,
+                outByteOffsetsCap,
+                outItemCount,
+                outRowOffsets,
+                outRowOffsetsCap
             );
         }
     }
