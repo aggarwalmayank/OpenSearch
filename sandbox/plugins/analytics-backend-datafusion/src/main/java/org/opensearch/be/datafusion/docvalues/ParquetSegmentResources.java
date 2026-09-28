@@ -13,11 +13,13 @@ import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.SortedNumericDocValues;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 
 import java.io.IOException;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Segment-core-scoped resources serving Parquet-resident doc values: the shared
@@ -50,6 +52,9 @@ final class ParquetSegmentResources {
     private boolean rowIdsChecked;
     private boolean rowIdsAreIdentity;
 
+    /** Footer counts per field, read on first use and kept for the segment's life. */
+    private final Map<String, ColumnValueCounts> countsByField = new ConcurrentHashMap<>();
+
     ParquetSegmentResources(
         ParquetDocValuesProducer producer,
         Map<String, FieldInfo> parquetFields,
@@ -77,6 +82,16 @@ final class ParquetSegmentResources {
     /** Whether {@code field}'s mapping allows arrays, so no single-valued read path can serve it. */
     boolean isMultiValued(String field) {
         return multiValuedFields.contains(field);
+    }
+
+    /** Footer counts and list shape of {@code field} in this segment, read from Rust at most once. */
+    ColumnValueCounts columnValueCounts(String field) throws IOException {
+        ColumnValueCounts counts = countsByField.get(field);
+        if (counts == null) {
+            counts = producer.columnValueCounts(parquetFieldInfo(field));
+            countsByField.put(field, counts);
+        }
+        return counts;
     }
 
     /**

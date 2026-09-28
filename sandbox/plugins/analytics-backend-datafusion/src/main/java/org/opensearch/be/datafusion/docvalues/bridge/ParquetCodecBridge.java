@@ -175,7 +175,9 @@ public final class ParquetCodecBridge {
                 ValueLayout.ADDRESS,    // column_ptr
                 ValueLayout.JAVA_LONG,  // column_len
                 ValueLayout.JAVA_LONG,  // store_ptr
-                ValueLayout.ADDRESS     // out_count
+                ValueLayout.ADDRESS,    // out_count
+                ValueLayout.ADDRESS,    // out_rows_with_values
+                ValueLayout.ADDRESS     // out_repeated
             )
         );
         PAGE_COUNT = linker.downcallHandle(
@@ -244,19 +246,34 @@ public final class ParquetCodecBridge {
     }
 
     /**
-     * Rows with a non-null value in {@code column}, summed over the footer's row-group column
-     * chunks; {@code -1} when any chunk lacks the statistic, read through {@code storePtr}.
+     * Footer counts and list shape for {@code column}, read through {@code storePtr}; see {@link ColumnValueCounts}.
      *
      * @param storePtr native object store to read through, or {@code 0} for a local file
      */
-    public static long columnNonNullCount(String file, String column, long storePtr) throws IOException {
+    public static ColumnValueCounts columnValueCounts(String file, String column, long storePtr) throws IOException {
         try (var call = new NativeCall()) {
             var f = call.str(file);
             var c = call.str(column);
             var countOut = call.longOut();
-            call.invokeIO(COLUMN_NON_NULL_COUNT, f.segment(), f.len(), c.segment(), c.len(), storePtr, countOut);
-            return countOut.get(ValueLayout.JAVA_LONG, 0);
+            var rowsOut = call.longOut();
+            var repeatedOut = call.longOut();
+            call.invokeIO(COLUMN_NON_NULL_COUNT, f.segment(), f.len(), c.segment(), c.len(), storePtr, countOut, rowsOut, repeatedOut);
+            return new ColumnValueCounts(
+                countOut.get(ValueLayout.JAVA_LONG, 0),
+                rowsOut.get(ValueLayout.JAVA_LONG, 0),
+                repeatedOut.get(ValueLayout.JAVA_LONG, 0) == 1L
+            );
         }
+    }
+
+    /**
+     * Footer counts for one column; both counts are {@code -1} when a chunk lacks the null count.
+     *
+     * @param nonNullValues  stored values, repeats included
+     * @param rowsWithValues rows holding at least one value; equals {@code nonNullValues} for a plain column
+     * @param repeated       whether the column is a list
+     */
+    public record ColumnValueCounts(long nonNullValues, long rowsWithValues, boolean repeated) {
     }
 
     /** Number of OffsetIndex data pages for the retained cursor's projected column. */

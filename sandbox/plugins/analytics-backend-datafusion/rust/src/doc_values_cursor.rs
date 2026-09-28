@@ -975,11 +975,12 @@ pub unsafe extern "C" fn parquet_df_file_metadata(
     Ok(RC_OK)
 }
 
-/// Total rows carrying a non-null value in `column`, summed over the footer's row-group column
-/// chunks through the same store and footer cache a cursor would use.
+/// Non-null values and rows carrying a value in `column`, summed over the footer's row-group
+/// column chunks through the same store and footer cache a cursor would use, plus whether the
+/// column is a list. For a plain column the two counts are equal.
 ///
-/// Writes `-1` (not an error) when any chunk lacks statistics or a null count: an unverifiable
-/// total must not masquerade as a real one. Writes `out_count` only on a non-negative return.
+/// Writes `-1` to both counts (not an error) when any chunk lacks statistics or a null count: an
+/// unverifiable total must not masquerade as a real one. Writes the outputs only on a non-negative return.
 #[ffm_safe]
 #[no_mangle]
 pub unsafe extern "C" fn parquet_df_column_non_null_count(
@@ -990,11 +991,14 @@ pub unsafe extern "C" fn parquet_df_column_non_null_count(
     // 0 for a local (hot) shard; a warm shard passes its TieredObjectStore box pointer.
     store_ptr: i64,
     out_count: *mut i64,
+    out_rows_with_values: *mut i64,
+    // 1 when the column is a list (max_rep_level above 0), otherwise 0.
+    out_repeated: *mut i64,
 ) -> i64 {
     static FN: &str = "parquet_df_column_non_null_count";
     let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("{FN} file: {e}"))?;
     let column = str_from_raw(column_ptr, column_len).map_err(|e| format!("{FN} column: {e}"))?;
-    if out_count.is_null() {
+    if out_count.is_null() || out_rows_with_values.is_null() || out_repeated.is_null() {
         return Err(format!("{FN}: null out-parameter"));
     }
     let runtime = io_runtime().map_err(|e| format!("{FN}: {e}"))?;
@@ -1019,22 +1023,39 @@ pub unsafe extern "C" fn parquet_df_column_non_null_count(
     })?;
     let schema = footer.file_metadata().schema_descr();
     let col_idx = (0..schema.num_columns())
-        .find(|&i| schema.column(i).name() == column)
+        .find(|&i| {
+            let descriptor = schema.column(i);
+            descriptor.name() == column
+                || descriptor
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|root| root == column)
+        })
         .ok_or_else(|| format!("{FN}: column {column} not found"))?;
+    *out_repeated = i64::from(schema.column(col_idx).max_rep_level() > 0);
     let mut total: i64 = 0;
+    let mut rows_with_values: i64 = 0;
     for rg_idx in 0..footer.num_row_groups() {
-        let chunk = footer.row_group(rg_idx).column(col_idx);
+        let row_group = footer.row_group(rg_idx);
+        let chunk = row_group.column(col_idx);
         match chunk.statistics().and_then(|s| s.null_count_opt()) {
-            Some(null_count) => total += chunk.num_values() - null_count as i64,
+            Some(null_count) => {
+                total += chunk.num_values() - null_count as i64;
+                // A row without a value leaves exactly one null slot, even for a list column.
+                rows_with_values += row_group.num_rows() - null_count as i64;
+            }
             // A chunk without a null count can't prove its non-null total, so the whole file is
             // unverifiable: -1 is the contract, not an error.
             None => {
                 *out_count = -1;
+                *out_rows_with_values = -1;
                 return Ok(RC_OK);
             }
         }
     }
     *out_count = total;
+    *out_rows_with_values = rows_with_values;
     Ok(RC_OK)
 }
 
@@ -3361,5 +3382,44 @@ mod ffm_tests {
         );
 
         assert_eq!(unsafe { parquet_df_close_iter(handle) }, RC_OK);
+    }
+
+    /// `(non-null values, rows with values, repeated)` for the fixture's "value" column.
+    fn column_value_counts(file: &NamedTempFile) -> (i64, i64, i64) {
+        register_test_metadata_cache();
+        register_test_runtime_manager();
+        let path = file.path().to_str().unwrap();
+        let column = "value";
+        let (mut count, mut rows, mut repeated) = (0i64, 0i64, 0i64);
+        let rc = unsafe {
+            parquet_df_column_non_null_count(
+                path.as_ptr(),
+                path.len() as i64,
+                column.as_ptr(),
+                column.len() as i64,
+                LOCAL_STORE,
+                &mut count,
+                &mut rows,
+                &mut repeated,
+            )
+        };
+        assert_eq!(rc, RC_OK, "{}", error_message(rc));
+        (count, rows, repeated)
+    }
+
+    #[test]
+    fn a_list_column_reports_values_rows_and_repeated_from_the_footer() {
+        // Six strings over three rows that hold a list; row 2 has none.
+        assert_eq!(column_value_counts(&tags_fixture_file()), (6, 3, 1));
+    }
+
+    #[test]
+    fn a_plain_string_column_reports_equal_counts_and_not_repeated() {
+        let file = string_fixture_file(Arc::new(StringArray::from(vec![
+            Some("Delhi"),
+            Some("Pune"),
+            None,
+        ])));
+        assert_eq!(column_value_counts(&file), (2, 2, 0));
     }
 }

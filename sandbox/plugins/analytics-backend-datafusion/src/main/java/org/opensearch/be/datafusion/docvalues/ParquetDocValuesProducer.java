@@ -20,6 +20,7 @@ import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
@@ -229,13 +230,9 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         }
     }
 
-    /**
-     * Number of rows with a non-null value in this column, from the Parquet footer's per-row-group
-     * column-chunk statistics; {@code -1} when any row group lacks the null count. Used to verify
-     * that postings-derived ordinal tables cover every stored value.
-     */
-    long nonNullRowCount(FieldInfo field) throws IOException {
-        return ParquetCodecBridge.columnNonNullCount(parquetFile.toString(), field.getName(), storePointer);
+    /** Footer counts and list shape for {@code field}; callers keep the result, since the file never changes. */
+    ColumnValueCounts columnValueCounts(FieldInfo field) throws IOException {
+        return ParquetCodecBridge.columnValueCounts(parquetFile.toString(), field.getName(), storePointer);
     }
 
     @Override

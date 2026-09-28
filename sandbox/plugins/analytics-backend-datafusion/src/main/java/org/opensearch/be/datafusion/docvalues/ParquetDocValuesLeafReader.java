@@ -171,7 +171,7 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      */
     private SortedDocValues withSegmentOrdinals(String field, SortedDocValues sorted) throws IOException {
         if (sorted instanceof ParquetSortedDocValues streaming) {
-            long expectedNonNull = resources.producer.nonNullRowCount(resources.parquetFieldInfo(field));
+            long expectedNonNull = resources.columnValueCounts(field).nonNullValues();
             if (expectedNonNull == 0) {
                 // No document in this segment has a value: empty doc values ARE the correct ordinals
                 // view (zero terms) -- nothing to uninvert, and the streaming tier would fail the

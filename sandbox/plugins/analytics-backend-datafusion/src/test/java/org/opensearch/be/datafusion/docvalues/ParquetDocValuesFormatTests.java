@@ -54,6 +54,7 @@ import org.opensearch.be.datafusion.DatafusionSettings;
 import org.opensearch.be.datafusion.docvalues.bridge.DataFusionBackedTestCase;
 import org.opensearch.be.datafusion.docvalues.bridge.DecodedBatch;
 import org.opensearch.be.datafusion.docvalues.bridge.DecodedBinaryBatch;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
 import org.opensearch.common.settings.Settings;
@@ -1155,7 +1156,7 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
             values.size(),
             null
         );
-        assertEquals("three of five rows carry a value", 3L, producer.nonNullRowCount(sortedSetField(COLUMN)));
+        assertEquals("three of five rows carry a value", 3L, producer.columnValueCounts(sortedSetField(COLUMN)).nonNullValues());
     }
 
     /** Zero non-null rows is what sends the leaf reader to DocValues.emptySorted instead of building ordinals. */
@@ -1171,7 +1172,34 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
             values.size(),
             null
         );
-        assertEquals("no row carries a value", 0L, producer.nonNullRowCount(sortedSetField(COLUMN)));
+        assertEquals("no row carries a value", 0L, producer.columnValueCounts(sortedSetField(COLUMN)).nonNullValues());
+    }
+
+    /** The footer is read once per field; later requests on the segment reuse the stored counts. */
+    public void testSegmentResourcesReadColumnValueCountsOnce() throws Exception {
+        List<String> values = Arrays.asList("a", null, "c");
+        Path file = createTempDir().resolve("value-counts.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            values.size(),
+            null
+        );
+        FieldInfo field = sortedSetField(COLUMN);
+        ParquetSegmentResources resources = new ParquetSegmentResources(
+            producer,
+            Map.of(COLUMN, field),
+            new FieldInfos(new FieldInfo[] { field }),
+            Set.of(),
+            null
+        );
+
+        ColumnValueCounts first = resources.columnValueCounts(COLUMN);
+        assertEquals(new ColumnValueCounts(2L, 2L, false), first);
+        assertSame("the second request reuses the stored record", first, resources.columnValueCounts(COLUMN));
     }
 
     /** The keyword column of {@code file} as the leaf reader sees it: the singleton unwrapped. */
