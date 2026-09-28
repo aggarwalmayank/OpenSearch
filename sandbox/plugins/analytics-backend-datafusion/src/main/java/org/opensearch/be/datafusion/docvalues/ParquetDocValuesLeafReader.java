@@ -126,19 +126,17 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             if (fi.getDocValuesType() != DocValuesType.SORTED_SET) {
                 return null;
             }
-            if (resources.isMultiValued(field)) {
-                if (buildOrdinals == false) {
-                    // TODO: source derivation omits the field entirely, so a rebuilt document silently
-                    // loses it; serve it properly once the Rust layer decodes repeated columns.
-                    return null;
-                }
-                // Multi-valued keyword columns exist on disk (LIST promotion) but no repeated-column
-                // reader is wired yet: refuse aggregations and sorts with a clear client error.
-                throw new IllegalArgumentException(
-                    "cannot aggregate or sort on multi-valued keyword field [" + field + "] on a pluggable data format index"
-                );
-            }
             assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet doc-values read path";
+            if (resources.isMultiValued(field)) {
+                if (buildOrdinals) {
+                    // No multi-valued .ord file exists yet: refuse aggregations and sorts with a clear client error.
+                    throw new IllegalArgumentException(
+                        "cannot aggregate or sort on multi-valued keyword field [" + field + "] on a pluggable data format index"
+                    );
+                }
+                // The producer serves each segment in its stored shape: a list column or a single-value column.
+                return resources.producer.getSortedSet(fi);
+            }
             SortedDocValues plain = DocValues.unwrapSingleton(resources.producer.getSortedSet(fi));
             return DocValues.singleton(buildOrdinals ? withSegmentOrdinals(field, plain) : plain);
         }

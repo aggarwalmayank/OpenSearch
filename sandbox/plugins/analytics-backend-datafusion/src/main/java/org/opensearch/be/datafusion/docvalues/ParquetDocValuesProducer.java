@@ -24,6 +24,7 @@ import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnVa
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedSetDocValues;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
@@ -31,6 +32,8 @@ import org.opensearch.index.mapper.MapperService;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Read-only {@link DocValuesProducer} that serves single-valued numeric doc values from a Parquet
@@ -84,6 +87,8 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     private final Settings indexSettings;
     private final int maxDoc;
     private final long parquetRowCount;
+    /** Footer counts and list shape per field, read from Rust on first use and kept for the segment's life. */
+    private final Map<String, ColumnValueCounts> countsByField = new ConcurrentHashMap<>();
 
     private volatile boolean closed;
 
@@ -182,17 +187,19 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     }
 
     /**
-     * Serves {@code field} as a singleton over a dedicated forward-only binary cursor, which the
-     * iterator that receives it closes; callers recover the inner iterator via
-     * {@code DocValues.unwrapSingleton}.
+     * Serves {@code field} over a dedicated forward-only binary cursor, which the iterator that receives it
+     * closes: a list column as multi-valued doc values, any other column as a singleton whose inner
+     * iterator callers recover via {@code DocValues.unwrapSingleton}.
      */
-    // TODO(multi-value): no repeated read path; the write path emits single values only.
     @Override
     public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
         ensureOpen();
         validate(field, DocValuesType.SORTED_SET);
         // The cursor opens on the first value request, so a leaf whose documents the query never
         // reaches allocates nothing.
+        if (columnValueCounts(field).repeated()) {
+            return new ParquetSortedSetDocValues(() -> openListBinaryCursor(field.getName()), maxDoc);
+        }
         return DocValues.singleton(new ParquetSortedDocValues(() -> openBinaryCursor(field.getName()), maxDoc));
     }
 
@@ -230,9 +237,14 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         }
     }
 
-    /** Footer counts and list shape for {@code field}; callers keep the result, since the file never changes. */
+    /** Footer counts and list shape for {@code field}, read from Rust at most once per field. */
     ColumnValueCounts columnValueCounts(FieldInfo field) throws IOException {
-        return ParquetCodecBridge.columnValueCounts(parquetFile.toString(), field.getName(), storePointer);
+        ColumnValueCounts counts = countsByField.get(field.getName());
+        if (counts == null) {
+            counts = ParquetCodecBridge.columnValueCounts(parquetFile.toString(), field.getName(), storePointer);
+            countsByField.put(field.getName(), counts);
+        }
+        return counts;
     }
 
     @Override
@@ -379,6 +391,10 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      */
     private ParquetColumnReader openBinaryCursor(String field) throws IOException {
         return ParquetColumnReader.openBinary(parquetFile, field, indexSettings, storePointer);
+    }
+
+    private ParquetColumnReader openListBinaryCursor(String field) throws IOException {
+        return ParquetColumnReader.openListBinary(parquetFile, field, indexSettings, storePointer);
     }
 
     private UnsupportedOperationException unsupported(String kind, FieldInfo field) {

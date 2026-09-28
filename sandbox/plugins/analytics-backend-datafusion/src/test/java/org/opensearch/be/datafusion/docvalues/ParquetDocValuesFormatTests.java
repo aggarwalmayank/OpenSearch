@@ -44,6 +44,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
@@ -57,6 +58,7 @@ import org.opensearch.be.datafusion.docvalues.bridge.DecodedBinaryBatch;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetNumericDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedSetDocValues;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.nativebridge.spi.ArrowExport;
 import org.opensearch.parquet.bridge.NativeParquetWriter;
@@ -1099,7 +1101,16 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
 
     /** ParquetDocValuesLeafReader unwraps this singleton to wrap it in segment ordinals, so the wrapping is load-bearing. */
     public void testKeywordSortedSetIsASingletonView() throws Exception {
-        ParquetDocValuesProducer producer = newFixtureProducer("keyword-singleton.parquet");
+        List<String> values = List.of("red", "blue");
+        Path file = createTempDir().resolve("keyword-singleton.parquet");
+        StringColumnFixture.write(file, allocator, COLUMN, values);
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            values.size(),
+            null
+        );
         assertNotNull(DocValues.unwrapSingleton(producer.getSortedSet(sortedSetField(COLUMN))));
     }
 
@@ -1200,6 +1211,81 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
         ColumnValueCounts first = resources.columnValueCounts(COLUMN);
         assertEquals(new ColumnValueCounts(2L, 2L, false), first);
         assertSame("the second request reuses the stored record", first, resources.columnValueCounts(COLUMN));
+    }
+
+    /** The pinned multi-valued rows: a list, a single-item list, a null row, and a list with a repeat. */
+    private static final List<List<String>> TAGS = Arrays.asList(
+        List.of("red", "blue"),
+        List.of("blue"),
+        null,
+        List.of("red", "red", "green")
+    );
+
+    public void testListKeywordColumnServesSortedDistinctValues() throws Exception {
+        Path file = createTempDir().resolve("keyword-list.parquet");
+        StringListColumnFixture.write(file, allocator, COLUMN, TAGS);
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            TAGS.size(),
+            null
+        );
+
+        SortedSetDocValues values = producer.getSortedSet(sortedSetField(COLUMN));
+        assertNull("a list column is served as real multi-valued doc values, not a singleton", DocValues.unwrapSingleton(values));
+        assertListValues(values, 0, "blue", "red");
+        assertListValues(values, 1, "blue");
+        assertFalse("a null row carries no value", values.advanceExact(2));
+        assertListValues(values, 3, "green", "red");
+    }
+
+    /** The producer reads the footer once per field and reuses the stored record, including its list shape. */
+    public void testProducerStoresTheListShapeOfAColumn() throws Exception {
+        Path file = createTempDir().resolve("keyword-list-counts.parquet");
+        StringListColumnFixture.write(file, allocator, COLUMN, TAGS);
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            file,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            TAGS.size(),
+            null
+        );
+
+        ColumnValueCounts first = producer.columnValueCounts(sortedSetField(COLUMN));
+        assertTrue("a list column is marked repeated", first.repeated());
+        assertSame("the second request reuses the stored record", first, producer.columnValueCounts(sortedSetField(COLUMN)));
+    }
+
+    /** Batches of at most 4 rows cross batch boundaries, and one word over the 64 KB value buffer forces the grow-and-retry path. */
+    public void testListKeywordReaderCrossesBatchesAndRetriesAnOversizedBatch() throws Exception {
+        String large = "x".repeat(100_000);
+        List<List<String>> rows = new ArrayList<>();
+        for (int r = 0; r < 10; r++) {
+            rows.add(r == 6 ? List.of(large, "a") : List.of("w" + r, "v" + r));
+        }
+        Path file = createTempDir().resolve("keyword-list-batches.parquet");
+        StringListColumnFixture.write(file, allocator, COLUMN, rows);
+
+        SortedSetDocValues values = new ParquetSortedSetDocValues(
+            () -> ParquetColumnReader.openListBinary(file, COLUMN, 2, 4, ParquetColumnReader.LOCAL_STORE),
+            rows.size()
+        );
+        for (int r = 0; r < rows.size(); r++) {
+            if (r == 6) {
+                assertListValues(values, r, "a", large);
+            } else {
+                assertListValues(values, r, "v" + r, "w" + r);
+            }
+        }
+    }
+
+    private static void assertListValues(SortedSetDocValues values, int doc, String... expected) throws IOException {
+        assertTrue("doc " + doc + " must have values", values.advanceExact(doc));
+        assertEquals(expected.length, values.docValueCount());
+        for (String word : expected) {
+            assertEquals(new BytesRef(word), values.lookupOrd(values.nextOrd()));
+        }
     }
 
     /** The keyword column of {@code file} as the leaf reader sees it: the singleton unwrapped. */

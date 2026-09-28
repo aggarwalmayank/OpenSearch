@@ -19,7 +19,6 @@ import org.opensearch.index.engine.dataformat.DocumentInput;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Segment-core-scoped resources serving Parquet-resident doc values: the shared
@@ -52,9 +51,6 @@ final class ParquetSegmentResources {
     private boolean rowIdsChecked;
     private boolean rowIdsAreIdentity;
 
-    /** Footer counts per field, read on first use and kept for the segment's life. */
-    private final Map<String, ColumnValueCounts> countsByField = new ConcurrentHashMap<>();
-
     ParquetSegmentResources(
         ParquetDocValuesProducer producer,
         Map<String, FieldInfo> parquetFields,
@@ -84,14 +80,9 @@ final class ParquetSegmentResources {
         return multiValuedFields.contains(field);
     }
 
-    /** Footer counts and list shape of {@code field} in this segment, read from Rust at most once. */
+    /** Footer counts and list shape of {@code field} in this segment; the producer reads Rust at most once. */
     ColumnValueCounts columnValueCounts(String field) throws IOException {
-        ColumnValueCounts counts = countsByField.get(field);
-        if (counts == null) {
-            counts = producer.columnValueCounts(parquetFieldInfo(field));
-            countsByField.put(field, counts);
-        }
-        return counts;
+        return producer.columnValueCounts(parquetFieldInfo(field));
     }
 
     /**

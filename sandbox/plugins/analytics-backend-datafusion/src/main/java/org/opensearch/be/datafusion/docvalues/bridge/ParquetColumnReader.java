@@ -60,7 +60,7 @@ import java.nio.file.Path;
  * live-handle registry, and {@link #close()} is idempotent through the base class: closing an
  * already-closed reader is a no-op and the cursor is freed exactly once.
  */
-public final class ParquetColumnReader extends NativeHandle implements NumericValueReader, BinaryValueReader {
+public final class ParquetColumnReader extends NativeHandle implements NumericValueReader, BinaryValueReader, ListBinaryValueReader {
 
     private static final Logger LOGGER = LogManager.getLogger(ParquetColumnReader.class);
 
@@ -111,18 +111,34 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     private Arena valueArena;
     private MemorySegment valueBuf;
 
+    /**
+     * True for a repeated (list) keyword reader, served through the list batch export; {@link #offsetsBuf}
+     * then holds row boundaries, which never exceed {@code maxBatchSize} rows. Fixed at open.
+     */
+    private final boolean list;
+
+    /** Item boundaries of a list batch; grows like {@link #valueBuf}, since one row can hold many items. Null otherwise. */
+    private Arena itemOffsetsArena;
+    private MemorySegment itemOffsetsBuf;
+
     private DecodedBatch decodedBatch;
     private DecodedBinaryBatch decodedBinaryBatch;
+    private DecodedListBinaryBatch decodedListBinaryBatch;
 
     /** Loaded once on first request and cached for this reader's lifetime. */
     private ColumnPageIndex pageIndex;
 
-    private ParquetColumnReader(long handle, Path file, String column, int maxBatchSize, boolean binary) {
+    private ParquetColumnReader(long handle, Path file, String column, int maxBatchSize, boolean binary, boolean list) {
         super(handle);
         this.file = file;
         this.column = column;
         this.maxBatchSize = maxBatchSize;
         this.binary = binary;
+        this.list = list;
+        if (list) {
+            this.itemOffsetsArena = Arena.ofShared();
+            this.itemOffsetsBuf = itemOffsetsArena.allocate(ValueLayout.JAVA_INT, maxBatchSize + 1L);
+        }
         if (binary) {
             this.presenceWords = (maxBatchSize + 63) / 64;
             // Shared, not confined: the reader is opened by the segment-opening thread and read by
@@ -187,7 +203,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     public static ParquetColumnReader open(Path file, String column, int initialBatchSize, int maxBatchSize, long storePtr)
         throws IOException {
         long handle = ParquetCodecBridge.openColumnCursor(file.toString(), column, initialBatchSize, maxBatchSize, storePtr);
-        return new ParquetColumnReader(handle, file, column, maxBatchSize, false);
+        return new ParquetColumnReader(handle, file, column, maxBatchSize, false, false);
     }
 
     /** Opens a binary (keyword/ip) cursor over a local file using the default batch-size settings. */
@@ -215,7 +231,25 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     public static ParquetColumnReader openBinary(Path file, String column, int initialBatchSize, int maxBatchSize, long storePtr)
         throws IOException {
         long handle = ParquetCodecBridge.openColumnCursor(file.toString(), column, initialBatchSize, maxBatchSize, storePtr);
-        return new ParquetColumnReader(handle, file, column, maxBatchSize, true);
+        return new ParquetColumnReader(handle, file, column, maxBatchSize, true, false);
+    }
+
+    /** Opens a repeated (list) keyword cursor sized from the {@code index.parquet.docvalues.*} batch settings. */
+    public static ParquetColumnReader openListBinary(Path file, String column, Settings settings, long storePtr) throws IOException {
+        return openListBinary(
+            file,
+            column,
+            DatafusionSettings.docValuesInitialBatchSize(settings),
+            DatafusionSettings.docValuesMaxBatchSize(settings),
+            storePtr
+        );
+    }
+
+    /** Opens a repeated (list) keyword cursor with explicit window sizes, bypassing settings resolution. */
+    public static ParquetColumnReader openListBinary(Path file, String column, int initialBatchSize, int maxBatchSize, long storePtr)
+        throws IOException {
+        long handle = ParquetCodecBridge.openColumnCursor(file.toString(), column, initialBatchSize, maxBatchSize, storePtr);
+        return new ParquetColumnReader(handle, file, column, maxBatchSize, true, true);
     }
 
     @Override
@@ -232,6 +266,36 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
             throw new IllegalStateException("column " + column + " is numeric; use decodedBatch()");
         }
         return decodedBinaryBatch;
+    }
+
+    @Override
+    public DecodedListBinaryBatch decodedListBinaryBatch() {
+        if (list == false) {
+            throw new IllegalStateException("column " + column + " is not a list; use decodedBinaryBatch() or decodedBatch()");
+        }
+        return decodedListBinaryBatch;
+    }
+
+    /**
+     * Ensures the resident list batch contains {@code row}, with the same forward, resident and backward
+     * handling as {@link #loadBatchContaining}.
+     */
+    @Override
+    public void loadListBinaryBatchContaining(long row) throws IOException {
+        ensureOpen();
+        if (list == false) {
+            throw new IllegalStateException("column " + column + " is not a list; use loadBatchContaining()");
+        }
+        DecodedListBinaryBatch current = decodedListBinaryBatch;
+        if (current != null) {
+            if (current.contains(row)) {
+                return;
+            }
+            if (row < current.firstRow()) {
+                reopen();
+            }
+        }
+        loadListBinaryBatch(row);
     }
 
     /** Per-page statistics for a DocValues skipper, loaded once and cached for this reader's lifetime. */
@@ -291,6 +355,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     private void reopen() throws IOException {
         decodedBatch = null;
         decodedBinaryBatch = null;
+        decodedListBinaryBatch = null;
         ParquetCodecBridge.resetColumnCursor(ptr);
     }
 
@@ -470,6 +535,126 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
     }
 
     /**
+     * Loads a copied-out list batch containing {@code row}: item bytes back to back, item boundaries and
+     * row boundaries, staged in this reader's buffers and served as bounded off-heap views.
+     */
+    private void loadListBinaryBatch(long row) throws IOException {
+        // Dropped before the call: a failed load must not leave a batch describing stale buffers.
+        decodedListBinaryBatch = null;
+
+        try (Arena callArena = Arena.ofConfined()) {
+            MemorySegment out = callArena.allocate(ValueLayout.JAVA_LONG, 4);
+            MemorySegment firstRowOut = out.asSlice(0L, Long.BYTES);
+            MemorySegment lastRowOut = out.asSlice(Long.BYTES, Long.BYTES);
+            MemorySegment actualLenOut = out.asSlice(2L * Long.BYTES, Long.BYTES);
+            MemorySegment itemCountOut = out.asSlice(3L * Long.BYTES, Long.BYTES);
+
+            // Two attempts, as in loadBinaryBatch: the retry's buffers are sized to both reported needs.
+            for (int attempt = 0; attempt < 2; attempt++) {
+                long rc = ParquetCodecBridge.nextListBinaryBatch(
+                    ptr,
+                    row,
+                    firstRowOut,
+                    lastRowOut,
+                    valueBuf,
+                    valueBuf.byteSize(),
+                    actualLenOut,
+                    itemOffsetsBuf,
+                    itemOffsetsBuf.byteSize() / Integer.BYTES,
+                    itemCountOut,
+                    offsetsBuf,
+                    maxBatchSize + 1L
+                );
+                if (rc == ParquetCodecBridge.RC_OVERFLOW) {
+                    growListBuffers(actualLenOut.get(ValueLayout.JAVA_LONG, 0), itemCountOut.get(ValueLayout.JAVA_LONG, 0), row);
+                    continue;
+                }
+                checkStatus(rc, row);
+
+                long firstRow = firstRowOut.get(ValueLayout.JAVA_LONG, 0);
+                long lastRow = lastRowOut.get(ValueLayout.JAVA_LONG, 0);
+                long actualLen = actualLenOut.get(ValueLayout.JAVA_LONG, 0);
+                long itemCount = itemCountOut.get(ValueLayout.JAVA_LONG, 0);
+                if (firstRow < 0 || lastRow < firstRow || row < firstRow || row > lastRow) {
+                    throw contractViolation(row, "row range [" + firstRow + ", " + lastRow + "]");
+                }
+                long batchRowsLong = lastRow - firstRow + 1;
+                if (batchRowsLong > maxBatchSize) {
+                    throw contractViolation(row, batchRowsLong + " rows exceeds cap " + maxBatchSize);
+                }
+                if (actualLen < 0 || actualLen > valueBuf.byteSize()) {
+                    throw contractViolation(row, "value length " + actualLen + " outside buffer of " + valueBuf.byteSize());
+                }
+                if (itemCount < 0 || itemCount + 1 > itemOffsetsBuf.byteSize() / Integer.BYTES) {
+                    throw contractViolation(
+                        row,
+                        "item count " + itemCount + " outside buffer of " + itemOffsetsBuf.byteSize() / Integer.BYTES
+                    );
+                }
+                int batchRows = (int) batchRowsLong;
+                int items = (int) itemCount;
+                int firstRowPost = offsetsBuf.getAtIndex(ValueLayout.JAVA_INT, 0);
+                int lastRowPost = offsetsBuf.getAtIndex(ValueLayout.JAVA_INT, batchRows);
+                int firstItemPost = itemOffsetsBuf.getAtIndex(ValueLayout.JAVA_INT, 0);
+                int lastItemPost = itemOffsetsBuf.getAtIndex(ValueLayout.JAVA_INT, items);
+                if (firstRowPost != 0 || lastRowPost != items || firstItemPost != 0 || lastItemPost != actualLen) {
+                    throw contractViolation(
+                        row,
+                        "row posts ["
+                            + firstRowPost
+                            + ", "
+                            + lastRowPost
+                            + "] vs "
+                            + items
+                            + " items, item posts ["
+                            + firstItemPost
+                            + ", "
+                            + lastItemPost
+                            + "] vs length "
+                            + actualLen
+                    );
+                }
+
+                decodedListBinaryBatch = new DecodedListBinaryBatch(
+                    firstRow,
+                    lastRow,
+                    valueBuf.asSlice(0, actualLen),
+                    itemOffsetsBuf.asSlice(0, (items + 1L) * Integer.BYTES),
+                    offsetsBuf.asSlice(0, (batchRows + 1L) * Integer.BYTES)
+                );
+                return;
+            }
+            throw contractViolation(
+                row,
+                "cursor still overflowing after growing to "
+                    + valueBuf.byteSize()
+                    + " value bytes and "
+                    + itemOffsetsBuf.byteSize() / Integer.BYTES
+                    + " item offsets"
+            );
+        }
+    }
+
+    /** Grow-only ratchet for a list batch: grows whichever of the value and item-offset buffers is short. */
+    private void growListBuffers(long neededBytes, long neededItems, long row) throws IOException {
+        long neededItemOffsets = neededItems + 1;
+        boolean valuesShort = neededBytes > valueBuf.byteSize();
+        boolean itemsShort = neededItemOffsets > itemOffsetsBuf.byteSize() / Integer.BYTES;
+        if (valuesShort == false && itemsShort == false) {
+            throw contractViolation(row, "overflow reported at " + neededBytes + " bytes and " + neededItems + " items, which already fit");
+        }
+        if (valuesShort) {
+            growBinaryValueBuffer(neededBytes, row);
+        }
+        if (itemsShort) {
+            Arena old = itemOffsetsArena;
+            itemOffsetsArena = Arena.ofShared();
+            itemOffsetsBuf = itemOffsetsArena.allocate(ValueLayout.JAVA_INT, neededItemOffsets);
+            old.close();
+        }
+    }
+
+    /**
      * Sizes the parallel arrays from the current page count and retries once at the count the native
      * side reports if the page table grew between the two calls, so a raced size change widens the
      * arrays rather than truncating the table.
@@ -561,6 +746,7 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         // freed.
         decodedBatch = null;
         decodedBinaryBatch = null;
+        decodedListBinaryBatch = null;
         try {
             ParquetCodecBridge.closeColumnCursor(ptr);
         } catch (IOException e) {
@@ -573,6 +759,9 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
             }
             if (binaryArena != null) {
                 binaryArena.close();
+            }
+            if (itemOffsetsArena != null) {
+                itemOffsetsArena.close();
             }
         }
     }

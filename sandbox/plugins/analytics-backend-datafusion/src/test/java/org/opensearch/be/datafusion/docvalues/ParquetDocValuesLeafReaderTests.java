@@ -29,12 +29,14 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.be.datafusion.docvalues.bridge.DataFusionBackedTestCase;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
 import org.opensearch.common.settings.Settings;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -52,6 +54,7 @@ import java.util.Set;
 public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
 
     private static final String CITY = "city";
+    private static final String TAGS = "tags";
 
     @Override
     public void setUp() throws Exception {
@@ -95,27 +98,6 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
             ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());
 
             assertNull("SORTED accessor does not match a SORTED_SET Parquet field", parquetLeaf.getSortedDocValues("tags"));
-        } finally {
-            reader.close();
-            writer.close();
-            dir.close();
-        }
-    }
-
-    /** Source derivation must not fail the whole fetch on a multi-valued field; see the TODO in ParquetDocValuesLeafReader. */
-    public void testSourceDerivationViewReturnsNullForAMultiValuedField() throws Exception {
-        ParquetSegmentResources resources = sortedSetResources("tags", Set.of("tags"));
-
-        Directory dir = newDirectory();
-        IndexWriter writer = singleDocWriter(dir);
-        DirectoryReader reader = DirectoryReader.open(dir);
-        try {
-            LeafReader leaf = reader.leaves().get(0).reader();
-            ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());
-
-            LeafReader sourceView = parquetLeaf.perDocumentValuesReader();
-            SortedSetDocValues values = sourceView.getSortedSetDocValues("tags");
-            assertNull("source derivation omits a multi-valued field rather than throwing", values);
         } finally {
             reader.close();
             writer.close();
@@ -187,6 +169,75 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
                 SortedDocValues dv = cityDocValues(leaf, parquetFile, values.size());
                 assertTrue("without an ord file the streaming tier serves the field", dv instanceof ParquetSortedDocValues);
             }
+        }
+    }
+
+    /** Source derivation serves a multi-valued field's list column, sorted and distinct per document. */
+    public void testSourceDerivationServesAMultiValuedListColumn() throws Exception {
+        Path parquetFile = createTempDir().resolve("tags-list.parquet");
+        StringListColumnFixture.write(
+            parquetFile,
+            allocator,
+            TAGS,
+            Arrays.asList(List.of("red", "blue"), List.of("blue"), null, List.of("red", "red", "green"))
+        );
+
+        try (Directory dir = new ByteBuffersDirectory()) {
+            writeCities(dir, "a", "b", "c", "d");
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                SortedSetDocValues values = sourceViewOfTags(leaf, parquetFile, 4);
+                assertSetValues(values, 0, "blue", "red");
+                assertSetValues(values, 1, "blue");
+                assertFalse("a null row carries no value", values.advanceExact(2));
+                assertSetValues(values, 3, "green", "red");
+            }
+        }
+    }
+
+    /** A plain column written before promotion still serves source derivation for a multi-valued field. */
+    public void testSourceDerivationServesAPlainColumnOfAMultiValuedField() throws Exception {
+        Path parquetFile = createTempDir().resolve("tags-plain.parquet");
+        StringColumnFixture.write(parquetFile, allocator, TAGS, List.of("red", "blue", "green"));
+
+        try (Directory dir = new ByteBuffersDirectory()) {
+            writeCities(dir, "a", "b", "c");
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                SortedSetDocValues values = sourceViewOfTags(leaf, parquetFile, 3);
+                assertSetValues(values, 0, "red");
+                assertSetValues(values, 1, "blue");
+                assertSetValues(values, 2, "green");
+            }
+        }
+    }
+
+    /** The multi-valued {@code tags} field as source derivation receives it, over a real producer. */
+    private SortedSetDocValues sourceViewOfTags(SegmentReader leaf, Path parquetFile, int maxDoc) throws Exception {
+        FieldInfo fi = sortedSetField(TAGS);
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            parquetFile,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            maxDoc,
+            null
+        );
+        ParquetSegmentResources resources = new ParquetSegmentResources(
+            producer,
+            Map.of(TAGS, fi),
+            new FieldInfos(new FieldInfo[] { fi }),
+            Set.of(TAGS),
+            leaf.getSegmentInfo().info
+        );
+        ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());
+        return parquetLeaf.perDocumentValuesReader().getSortedSetDocValues(TAGS);
+    }
+
+    private static void assertSetValues(SortedSetDocValues values, int doc, String... expected) throws IOException {
+        assertTrue("doc " + doc + " must have values", values.advanceExact(doc));
+        assertEquals(expected.length, values.docValueCount());
+        for (String word : expected) {
+            assertEquals(new BytesRef(word), values.lookupOrd(values.nextOrd()));
         }
     }
 
