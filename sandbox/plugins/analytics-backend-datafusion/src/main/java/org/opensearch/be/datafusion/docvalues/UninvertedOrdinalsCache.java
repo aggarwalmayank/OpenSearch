@@ -15,6 +15,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.util.StringHelper;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.common.unit.TimeValue;
 
 import java.io.IOException;
@@ -123,7 +124,7 @@ public final class UninvertedOrdinalsCache {
      * Acquires the uninverted ordinals for {@code field}, building or re-mapping on first use.
      * Returns {@code null} when the segment lacks a core cache identity or a terms index.
      */
-    static Lease acquire(LeafReader leaf, SegmentInfo segmentInfo, String field, long expectedNonNullDocs) throws IOException {
+    static Lease acquire(LeafReader leaf, SegmentInfo segmentInfo, String field, ColumnValueCounts counts) throws IOException {
         IndexReader.CacheHelper segmentCore = leaf.getCoreCacheHelper();
         Terms terms = leaf.terms(field);
         if (segmentCore == null || terms == null) {
@@ -159,7 +160,7 @@ public final class UninvertedOrdinalsCache {
             if (lease != null) {
                 return lease;
             }
-            return loadOrBuildOrdinals(perSegment, segmentInfo, segmentCoreKey, field, fileKey, terms, leaf.maxDoc(), expectedNonNullDocs);
+            return loadOrBuildOrdinals(perSegment, segmentInfo, segmentCoreKey, field, fileKey, terms, leaf.maxDoc(), counts);
         }
     }
 
@@ -197,7 +198,7 @@ public final class UninvertedOrdinalsCache {
         String fileKey,
         Terms terms,
         int maxDoc,
-        long expectedNonNullDocs
+        ColumnValueCounts counts
     ) throws IOException {
         try {
             Path ordsDir = OrdFilePaths.resolveOrdsDir(segmentInfo.dir);
@@ -213,7 +214,7 @@ public final class UninvertedOrdinalsCache {
             // Cheap path first: an existing usable file is just memory-mapped — no permit. load()
             // deletes an invalid leftover (crashed process, stale layout) and returns null, which
             // sends us to the build path like any other cold field.
-            UninvertedOrdinals built = UninvertedOrdinals.load(ordsDir, fileKey, terms, maxDoc, expectedNonNullDocs);
+            UninvertedOrdinals built = UninvertedOrdinals.load(ordsDir, fileKey, terms, maxDoc, counts);
             if (built == null) {
                 // From-scratch build: bounded node-wide, each holds a maxDoc×bits buffer.
                 BUILD_PERMITS.acquire();
@@ -223,7 +224,7 @@ public final class UninvertedOrdinalsCache {
                         fileKey,
                         terms,
                         maxDoc,
-                        expectedNonNullDocs,
+                        counts,
                         () -> shuttingDown || Thread.currentThread().isInterrupted()
                     );
                 } finally {

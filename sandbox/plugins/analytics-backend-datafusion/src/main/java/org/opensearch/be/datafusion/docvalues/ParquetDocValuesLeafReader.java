@@ -21,8 +21,11 @@ import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedSetDocValues;
 import org.opensearch.common.lucene.index.PerDocumentValuesProvider;
 import org.opensearch.common.lucene.index.SequentialStoredFieldsLeafReader;
 
@@ -127,18 +130,15 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
                 return null;
             }
             assert resources.assertRowIdsAreIdentity(in) : "non-identity __row_id__ segment reached the Parquet doc-values read path";
-            if (resources.isMultiValued(field)) {
-                if (buildOrdinals) {
-                    // No multi-valued .ord file exists yet: refuse aggregations and sorts with a clear client error.
-                    throw new IllegalArgumentException(
-                        "cannot aggregate or sort on multi-valued keyword field [" + field + "] on a pluggable data format index"
-                    );
-                }
-                // The producer serves each segment in its stored shape: a list column or a single-value column.
-                return resources.producer.getSortedSet(fi);
+            // The producer serves each segment in its stored shape: a list column or a single-value column.
+            SortedSetDocValues docValues = resources.producer.getSortedSet(fi);
+            if (buildOrdinals == false) {
+                return docValues;
             }
-            SortedDocValues plain = DocValues.unwrapSingleton(resources.producer.getSortedSet(fi));
-            return DocValues.singleton(buildOrdinals ? withSegmentOrdinals(field, plain) : plain);
+            if (resources.columnValueCounts(field).repeated()) {
+                return withSegmentOrdinals(field, (ParquetSortedSetDocValues) docValues);
+            }
+            return DocValues.singleton(withSegmentOrdinals(field, (ParquetSortedDocValues) DocValues.unwrapSingleton(docValues)));
         }
         return in.getSortedSetDocValues(field);
     }
@@ -169,14 +169,14 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      */
     private SortedDocValues withSegmentOrdinals(String field, SortedDocValues sorted) throws IOException {
         if (sorted instanceof ParquetSortedDocValues streaming) {
-            long expectedNonNull = resources.columnValueCounts(field).nonNullValues();
-            if (expectedNonNull == 0) {
+            ColumnValueCounts counts = resources.columnValueCounts(field);
+            if (counts.nonNullValues() == 0) {
                 // No document in this segment has a value: empty doc values ARE the correct ordinals
                 // view (zero terms) -- nothing to uninvert, and the streaming tier would fail the
                 // aggregation at getValueCount.
                 return DocValues.emptySorted();
             }
-            UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(in, resources.segmentInfo, field, expectedNonNull);
+            UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(in, resources.segmentInfo, field, counts);
             if (lease != null) {
                 ParquetUninvertedSortedDocValues withOrdinals = new ParquetUninvertedSortedDocValues(lease.ordinals(), streaming, maxDoc());
                 UninvertedOrdinalsCache.releaseWhenUnreachable(withOrdinals, lease);
@@ -184,6 +184,28 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
             }
         }
         return sorted;
+    }
+
+    /**
+     * Layers cached segment ordinals over the streaming Parquet list reader when available; falls back to
+     * the streaming reader unchanged when no lease can be acquired.
+     */
+    private SortedSetDocValues withSegmentOrdinals(String field, ParquetSortedSetDocValues multiValuedDocValues) throws IOException {
+        ColumnValueCounts counts = resources.columnValueCounts(field);
+        if (counts.nonNullValues() == 0) {
+            return DocValues.emptySortedSet();
+        }
+        UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(in, resources.segmentInfo, field, counts);
+        if (lease == null) {
+            return multiValuedDocValues;
+        }
+        ParquetUninvertedSortedSetDocValues withOrdinals = new ParquetUninvertedSortedSetDocValues(
+            lease.ordinals(),
+            multiValuedDocValues,
+            maxDoc()
+        );
+        UninvertedOrdinalsCache.releaseWhenUnreachable(withOrdinals, lease);
+        return withOrdinals;
     }
 
     @Override

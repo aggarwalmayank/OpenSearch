@@ -17,6 +17,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -69,7 +70,12 @@ public class UninvertedOrdinalsDeleteUnusedTests extends OpenSearchTestCase {
             indexCityDocs(directory);
             try (DirectoryReader reader = DirectoryReader.open(directory)) {
                 SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
-                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", 3);
+                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(
+                    leaf,
+                    leaf.getSegmentInfo().info,
+                    "city",
+                    new ColumnValueCounts(3, 3, false)
+                );
                 assertNotNull(lease);
                 Path ordFile = onlyOrdFile(shardDir);
 
@@ -128,7 +134,12 @@ public class UninvertedOrdinalsDeleteUnusedTests extends OpenSearchTestCase {
             indexCityDocs(directory);
             try (DirectoryReader reader = DirectoryReader.open(directory)) {
                 SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
-                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", 3);
+                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(
+                    leaf,
+                    leaf.getSegmentInfo().info,
+                    "city",
+                    new ColumnValueCounts(3, 3, false)
+                );
                 assertNotNull("fixture requires a successful build", lease);
                 lease.close();
                 body.accept(leaf, onlyOrdFile(shardDir));

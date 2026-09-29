@@ -18,6 +18,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
 import org.opensearch.test.OpenSearchTestCase;
@@ -115,7 +116,14 @@ public class ParquetUninvertedSortedDocValuesTests extends OpenSearchTestCase {
     }
 
     private UninvertedOrdinals buildOrdinals(LeafReader leaf, long expectedNonNullDocs) throws Exception {
-        return UninvertedOrdinals.build(createTempDir(), "cities", leaf.terms(FIELD), leaf.maxDoc(), expectedNonNullDocs, () -> false);
+        return UninvertedOrdinals.build(
+            createTempDir(),
+            "cities",
+            leaf.terms(FIELD),
+            leaf.maxDoc(),
+            new ColumnValueCounts(expectedNonNullDocs, expectedNonNullDocs, false),
+            () -> false
+        );
     }
 
     /** A streaming reader whose cursor cannot be opened, so reading Parquet would fail the test. */

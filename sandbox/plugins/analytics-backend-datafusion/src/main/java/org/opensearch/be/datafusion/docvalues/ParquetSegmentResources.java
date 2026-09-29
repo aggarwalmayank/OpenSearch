@@ -18,7 +18,6 @@ import org.opensearch.index.engine.dataformat.DocumentInput;
 
 import java.io.IOException;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Segment-core-scoped resources serving Parquet-resident doc values: the shared
@@ -34,16 +33,11 @@ import java.util.Set;
 final class ParquetSegmentResources {
 
     /** Sentinel for a segment core that serves no Parquet doc values. */
-    static final ParquetSegmentResources ABSENT = new ParquetSegmentResources(null, Map.of(), null, Set.of(), null);
+    static final ParquetSegmentResources ABSENT = new ParquetSegmentResources(null, Map.of(), null, null);
 
     final ParquetDocValuesProducer producer;
     final Map<String, FieldInfo> parquetFields;
     final FieldInfos combinedFieldInfos;
-    /**
-     * Parquet-resident fields whose mapping allows arrays. The synthetic FieldInfo is SORTED_SET for
-     * either cardinality, so this set is the only record of which fields may hold more than one value.
-     */
-    final Set<String> multiValuedFields;
     /** Identifies the segment to {@link UninvertedOrdinalsCache}, which keys .ord files by segment and field. */
     final SegmentInfo segmentInfo;
 
@@ -55,13 +49,11 @@ final class ParquetSegmentResources {
         ParquetDocValuesProducer producer,
         Map<String, FieldInfo> parquetFields,
         FieldInfos combinedFieldInfos,
-        Set<String> multiValuedFields,
         SegmentInfo segmentInfo
     ) {
         this.producer = producer;
         this.parquetFields = parquetFields;
         this.combinedFieldInfos = combinedFieldInfos;
-        this.multiValuedFields = multiValuedFields;
         this.segmentInfo = segmentInfo;
     }
 
@@ -73,11 +65,6 @@ final class ParquetSegmentResources {
     /** The synthetic {@link FieldInfo} for {@code field}, or {@code null} when the field is not Parquet-resident. */
     FieldInfo parquetFieldInfo(String field) {
         return parquetFields.get(field);
-    }
-
-    /** Whether {@code field}'s mapping allows arrays, so no single-valued read path can serve it. */
-    boolean isMultiValued(String field) {
-        return multiValuedFields.contains(field);
     }
 
     /** Footer counts and list shape of {@code field} in this segment; the producer reads Rust at most once. */

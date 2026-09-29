@@ -27,11 +27,9 @@ import org.opensearch.index.mapper.MapperService;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -111,7 +109,6 @@ public final class ParquetSegmentResourceCache {
 
         FieldInfos existing = in.getFieldInfos();
         Map<String, FieldInfo> parquetFields = new LinkedHashMap<>();
-        Set<String> multiValuedFields = new HashSet<>();
         List<FieldInfo> combined = new ArrayList<>();
         int maxNumber = -1;
         for (FieldInfo fi : existing) {
@@ -142,12 +139,6 @@ public final class ParquetSegmentResourceCache {
             }
             parquetFields.put(name, synthetic);
             combined.add(synthetic);
-            // A mapping flips to LIST permanently the first time an array is ingested, so a field not
-            // marked LIST has never stored one. The reverse is only wasteful: a LIST field whose older
-            // segments happen to hold single values is still treated as multi-valued.
-            if (mft.isMultiValued()) {
-                multiValuedFields.add(name);
-            }
         }
 
         if (parquetFields.isEmpty()) {
@@ -160,7 +151,6 @@ public final class ParquetSegmentResourceCache {
             producer,
             parquetFields,
             combinedFieldInfos,
-            Set.copyOf(multiValuedFields),
             segmentReader.getSegmentInfo().info
         );
         resourceByCore.put(key, built);

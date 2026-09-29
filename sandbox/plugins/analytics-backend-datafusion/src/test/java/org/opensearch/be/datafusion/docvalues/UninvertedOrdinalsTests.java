@@ -21,6 +21,7 @@ import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.ByteBuffer;
@@ -60,7 +61,14 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 assertNotNull(baseTerms);
 
                 try (
-                    UninvertedOrdinals built = UninvertedOrdinals.build(ordsDir, fileKey, baseTerms, leaf.maxDoc(), termCount, () -> false)
+                    UninvertedOrdinals built = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        baseTerms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(termCount, termCount, false),
+                        () -> false
+                    )
                 ) {
                     assertEquals(termCount, built.valueCount());
                     UninvertedOrdinals.OrdinalCursor cursor = built.newOrdinalCursor();
@@ -70,7 +78,15 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
                 AtomicInteger iteratorCalls = new AtomicInteger();
                 Terms countingTerms = countingTerms(baseTerms, iteratorCalls);
-                try (UninvertedOrdinals reloaded = UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), termCount)) {
+                try (
+                    UninvertedOrdinals reloaded = UninvertedOrdinals.load(
+                        ordsDir,
+                        fileKey,
+                        countingTerms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(termCount, termCount, false)
+                    )
+                ) {
                     assertEquals("existing .ord should load without rebuilding checkpoints", 0, iteratorCalls.get());
                     assertEquals(termCount, reloaded.valueCount());
                     assertEquals(termCount - 1, reloaded.newOrdinalCursor().ordinal(termCount - 1));
@@ -107,7 +123,14 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 assertNotNull(terms);
 
                 try (
-                    UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), termCount, () -> false)
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        terms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(termCount, termCount, false),
+                        () -> false
+                    )
                 ) {
                     // built with the default interval
                 }
@@ -117,7 +140,15 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 try {
                     AtomicInteger iteratorCalls = new AtomicInteger();
                     Terms countingTerms = countingTerms(terms, iteratorCalls);
-                    try (UninvertedOrdinals reloaded = UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), termCount)) {
+                    try (
+                        UninvertedOrdinals reloaded = UninvertedOrdinals.load(
+                            ordsDir,
+                            fileKey,
+                            countingTerms,
+                            leaf.maxDoc(),
+                            new ColumnValueCounts(termCount, termCount, false)
+                        )
+                    ) {
                         assertNotNull("existing file must load regardless of the live interval setting", reloaded);
                         assertEquals("interval change must not force a re-uninvert", 0, iteratorCalls.get());
                         for (int ord : new int[] { 0, 1, buildInterval - 1, buildInterval, buildInterval + 5, termCount - 1 }) {
@@ -148,7 +179,16 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 Terms baseTerms = leaf.terms("f");
                 assertNotNull(baseTerms);
 
-                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, baseTerms, leaf.maxDoc(), 3, () -> false)) {
+                try (
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        baseTerms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(3, 3, false),
+                        () -> false
+                    )
+                ) {
                     assertTrue(Files.exists(ordFile));
                 }
 
@@ -161,11 +201,18 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 Terms countingTerms = countingTerms(baseTerms, iteratorCalls);
                 assertNull(
                     "corrupt assignedDocs metadata must be rejected by load",
-                    UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), 3)
+                    UninvertedOrdinals.load(ordsDir, fileKey, countingTerms, leaf.maxDoc(), new ColumnValueCounts(3, 3, false))
                 );
                 assertFalse("the invalid file must be deleted so a rebuild can replace it", Files.exists(ordFile));
                 try (
-                    UninvertedOrdinals rebuilt = UninvertedOrdinals.build(ordsDir, fileKey, countingTerms, leaf.maxDoc(), 3, () -> false)
+                    UninvertedOrdinals rebuilt = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        countingTerms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(3, 3, false),
+                        () -> false
+                    )
                 ) {
                     assertTrue("rebuild walks the postings", iteratorCalls.get() > 0);
                     assertEquals("beta", rebuilt.term(1).utf8ToString());
@@ -193,7 +240,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
                 IllegalStateException e = expectThrows(
                     IllegalStateException.class,
-                    () -> UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 3, () -> false)
+                    () -> UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), new ColumnValueCounts(3, 3, false), () -> false)
                 );
                 assertTrue(e.getMessage().contains("ordinal coverage mismatch"));
                 assertFalse("coverage mismatch should fail before publishing the ord file", Files.exists(ordFile));
@@ -217,13 +264,22 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 Terms terms = leaf.terms("f");
                 assertNotNull(terms);
 
-                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 3, () -> false)) {
+                try (
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        terms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(3, 3, false),
+                        () -> false
+                    )
+                ) {
                     assertTrue(Files.exists(ordFile));
                 }
 
                 // Flip one bit in the ordinal stream body: header fields stay plausible, only the CRC can catch it.
                 try (FileChannel channel = FileChannel.open(ordFile, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                    long bodyOffset = 40; // inside the ordinal stream (fixed header is 37 bytes)
+                    long bodyOffset = 40; // inside the ordinal stream (fixed header is 38 bytes)
                     ByteBuffer one = ByteBuffer.allocate(1);
                     channel.read(one, bodyOffset);
                     one.put(0, (byte) (one.get(0) ^ 0x01)).rewind();
@@ -232,7 +288,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
                 assertNull(
                     "a bit flip inside the body must be rejected by the checksum",
-                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), 3)
+                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), new ColumnValueCounts(3, 3, false))
                 );
                 assertFalse("the corrupt file must be deleted so a rebuild can replace it", Files.exists(ordFile));
             }
@@ -254,7 +310,16 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 Terms terms = leaf.terms("f");
                 assertNotNull(terms);
 
-                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                try (
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        terms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(2, 2, false),
+                        () -> false
+                    )
+                ) {
                     assertTrue(Files.exists(ordFile));
                 }
 
@@ -262,13 +327,16 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                     channel.truncate(channel.size() - 5);
                 }
 
-                assertNull("a truncated file must be rejected", UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), 2));
+                assertNull(
+                    "a truncated file must be rejected",
+                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), new ColumnValueCounts(2, 2, false))
+                );
                 assertFalse(Files.exists(ordFile));
             }
         }
     }
 
-    public void testVersion1FileIsRejectedIntoTheRebuildPath() throws Exception {
+    public void testUnsupportedVersionFileIsRejectedIntoTheRebuildPath() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "old-version";
         Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
@@ -283,23 +351,41 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 Terms terms = leaf.terms("f");
                 assertNotNull(terms);
 
-                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                try (
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        terms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(2, 2, false),
+                        () -> false
+                    )
+                ) {
                     assertTrue(Files.exists(ordFile));
                 }
 
-                // Rewrite the version field to 1: pre-checksum files must be rejected, not misread.
+                // Rewrite the version field to 99: a version this code does not support must be rejected, not misread.
                 try (FileChannel channel = FileChannel.open(ordFile, StandardOpenOption.WRITE)) {
-                    byte[] v1 = { 1, 0, 0, 0 }; // little-endian int 1
-                    channel.write(ByteBuffer.wrap(v1), 4); // magic
+                    byte[] unsupported = { 99, 0, 0, 0 }; // little-endian int 99
+                    channel.write(ByteBuffer.wrap(unsupported), 4); // after the magic
                 }
 
                 assertNull(
-                    "a version-1 file must be rejected into the rebuild path",
-                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), 2)
+                    "a file of an unsupported version must be rejected into the rebuild path",
+                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), new ColumnValueCounts(2, 2, false))
                 );
                 assertFalse(Files.exists(ordFile));
 
-                try (UninvertedOrdinals rebuilt = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                try (
+                    UninvertedOrdinals rebuilt = UninvertedOrdinals.build(
+                        ordsDir,
+                        fileKey,
+                        terms,
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(2, 2, false),
+                        () -> false
+                    )
+                ) {
                     assertEquals("beta", rebuilt.term(1).utf8ToString());
                 }
             }

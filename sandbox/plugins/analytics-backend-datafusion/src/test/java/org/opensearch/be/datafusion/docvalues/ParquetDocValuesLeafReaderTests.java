@@ -43,7 +43,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Unit tests for {@link ParquetDocValuesLeafReader}'s doc-values routing. The first group covers the
@@ -64,31 +63,9 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
         UninvertedOrdinalsCache.start();
     }
 
-    /** A multi-valued keyword aggregation or sort is a client error, refused before any value is read. */
-    public void testMultiValuedKeywordIsRefusedAsAClientError() throws Exception {
-        ParquetSegmentResources resources = sortedSetResources("tags", Set.of("tags"));
-
-        Directory dir = newDirectory();
-        IndexWriter writer = singleDocWriter(dir);
-        DirectoryReader reader = DirectoryReader.open(dir);
-        try {
-            LeafReader leaf = reader.leaves().get(0).reader();
-            ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());
-
-            // The null producer proves the refusal happens before any value is read: a path that touched
-            // the producer would fail with NullPointerException instead of this client error.
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> parquetLeaf.getSortedSetDocValues("tags"));
-            assertTrue(e.getMessage(), e.getMessage().contains("multi-valued keyword field [tags]"));
-        } finally {
-            reader.close();
-            writer.close();
-            dir.close();
-        }
-    }
-
     /** Keyword is served as SORTED_SET, so the plain SORTED accessor never matches a Parquet field. */
     public void testSortedAccessorReturnsNullForAParquetField() throws Exception {
-        ParquetSegmentResources resources = sortedSetResources("tags", Set.of());
+        ParquetSegmentResources resources = sortedSetResources("tags");
 
         Directory dir = newDirectory();
         IndexWriter writer = singleDocWriter(dir);
@@ -109,9 +86,9 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
      * Builds resources with a null producer holding one synthetic SORTED_SET {@link FieldInfo} for
      * {@code field}, the matching {@link FieldInfos}, the given multi-valued set, and a null segment info.
      */
-    private static ParquetSegmentResources sortedSetResources(String field, Set<String> multiValuedFields) {
+    private static ParquetSegmentResources sortedSetResources(String field) {
         FieldInfo fi = sortedSetField(field);
-        return new ParquetSegmentResources(null, Map.of(field, fi), new FieldInfos(new FieldInfo[] { fi }), multiValuedFields, null);
+        return new ParquetSegmentResources(null, Map.of(field, fi), new FieldInfos(new FieldInfo[] { fi }), null);
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -226,7 +203,6 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
             producer,
             Map.of(TAGS, fi),
             new FieldInfos(new FieldInfo[] { fi }),
-            Set.of(TAGS),
             leaf.getSegmentInfo().info
         );
         ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());
@@ -255,7 +231,6 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
             producer,
             Map.of(CITY, fi),
             new FieldInfos(new FieldInfo[] { fi }),
-            Set.of(),
             leaf.getSegmentInfo().info
         );
         ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());

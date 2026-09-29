@@ -18,6 +18,7 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FilterDirectory;
+import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Files;
@@ -74,9 +75,9 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
             }
             try (DirectoryReader reader = DirectoryReader.open(directory)) {
                 SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
-                assertNull(UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", 1));
+                assertNull(UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", new ColumnValueCounts(1, 1, false)));
                 // Latched: the second attempt refuses without re-resolving.
-                assertNull(UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", 1));
+                assertNull(UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", new ColumnValueCounts(1, 1, false)));
             }
         }
     }
@@ -105,7 +106,12 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
             }
             try (DirectoryReader reader = DirectoryReader.open(directory)) {
                 SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
-                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", 3);
+                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(
+                    leaf,
+                    leaf.getSegmentInfo().info,
+                    "city",
+                    new ColumnValueCounts(3, 3, false)
+                );
                 if (lease != null) {
                     lease.close();
                 }

@@ -72,7 +72,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 
@@ -949,13 +948,7 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
      */
     public void testSecondWrapOverSameCoreReusesResources() throws Exception {
         ParquetDocValuesProducer producer = newFixtureProducer("identity.parquet");
-        ParquetSegmentResources resources = new ParquetSegmentResources(
-            producer,
-            Map.of(),
-            new FieldInfos(new FieldInfo[0]),
-            Set.of(),
-            null
-        );
+        ParquetSegmentResources resources = new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]), null);
 
         Directory dir = newDirectory();
         IndexWriter writer = singleDocWriter(dir);
@@ -973,7 +966,7 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
             // records nothing new: the per-core resources are resolved once.
             ParquetSegmentResources second = cache.cacheForTesting(
                 leaf,
-                new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]), Set.of(), null)
+                new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]), null)
             );
             assertSame("second wrap over the same core reuses the same resources instance", resources, second);
             assertEquals("second wrap adds no cache entry", before + 1, cache.size());
@@ -991,13 +984,7 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
      */
     public void testSegmentCoreCloseClosesTheProducer() throws Exception {
         ParquetDocValuesProducer producer = newFixtureProducer("core.parquet");
-        ParquetSegmentResources resources = new ParquetSegmentResources(
-            producer,
-            Map.of(),
-            new FieldInfos(new FieldInfo[0]),
-            Set.of(),
-            null
-        );
+        ParquetSegmentResources resources = new ParquetSegmentResources(producer, Map.of(), new FieldInfos(new FieldInfo[0]), null);
 
         Directory dir = newDirectory();
         IndexWriter writer = singleDocWriter(dir);
@@ -1204,7 +1191,6 @@ public class ParquetDocValuesFormatTests extends DataFusionBackedTestCase {
             producer,
             Map.of(COLUMN, field),
             new FieldInfos(new FieldInfo[] { field }),
-            Set.of(),
             null
         );
 
