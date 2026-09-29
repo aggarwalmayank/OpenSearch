@@ -24,14 +24,23 @@ import org.apache.lucene.util.BytesRef;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetCodecBridge.ColumnValueCounts;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32;
 
 public class UninvertedOrdinalsTests extends OpenSearchTestCase {
+
+    /** Parquet's view of the tags example: 6 values stored (red twice in doc 3), 3 rows with values, a list column. */
+    private static final ColumnValueCounts TAGS_COUNTS = new ColumnValueCounts(6, 3, true);
+    /** Header positions: magic 4, version 4, maxDoc 4, termCount 8, assignedDocs 8, interval 4, block shift 4, dense 1. */
+    private static final long MULTI_VALUED_FLAG_OFFSET = 37;
+    private static final long ORDINAL_COUNT_OFFSET = 38;
 
     /**
      * Doc→ord assertions in these tests require document order to survive {@code forceMerge};
@@ -390,6 +399,431 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                 }
             }
         }
+    }
+
+    /** A multi-valued file gives each document its distinct words in ascending ordinal order, after build and after load. */
+    public void testMultiValuedBuildAndLoadServeEachDocumentsOrdinals() throws Exception {
+        Path ordsDir = createTempDir();
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals built = buildTags(ordsDir, leaf)) {
+                    assertTrue(built.isMultiValued());
+                    assertEquals("blue, green, red", 3, built.valueCount());
+                    assertTagsOrdinals(built);
+                }
+                try (UninvertedOrdinals loaded = UninvertedOrdinals.load(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), TAGS_COUNTS)) {
+                    assertNotNull("a valid multi-valued file must load", loaded);
+                    assertTrue(loaded.isMultiValued());
+                    assertTagsOrdinals(loaded);
+                }
+            }
+        }
+    }
+
+    /** Asking about an earlier document restarts the presence bitmap, so any access order gets the right answer. */
+    public void testMultiValuedCursorAnswersDocumentsInAnyOrder() throws Exception {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals ordinals = buildTags(createTempDir(), leaf)) {
+                    UninvertedOrdinals.MultiValuedOrdinalsCursor cursor = ordinals.newMultiValuedOrdinalsCursor();
+                    assertOrdinals(cursor, 3, 1, 2);
+                    assertOrdinals(cursor, 0, 0, 2);
+                    assertOrdinals(cursor, 3, 1, 2);
+                    assertOrdinals(cursor, 2);
+                }
+            }
+        }
+    }
+
+    /** When every document has a value the file carries no presence bitmap, and document n is entry n. */
+    public void testMultiValuedDenseFileServesEveryDocument() throws Exception {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addTagsDoc(writer, "red", "blue");
+            addTagsDoc(writer, "blue");
+            addTagsDoc(writer, "green");
+            writer.forceMerge(1);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (
+                    UninvertedOrdinals ordinals = UninvertedOrdinals.build(
+                        createTempDir(),
+                        "dense",
+                        leaf.terms("f"),
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(4, 3, true),
+                        () -> false
+                    )
+                ) {
+                    UninvertedOrdinals.MultiValuedOrdinalsCursor cursor = ordinals.newMultiValuedOrdinalsCursor();
+                    assertOrdinals(cursor, 0, 0, 2);
+                    assertOrdinals(cursor, 1, 0);
+                    assertOrdinals(cursor, 2, 1);
+                }
+            }
+        }
+    }
+
+    /** Each file kind refuses the other kind's cursor, naming the one to use. */
+    public void testEachFileKindRefusesTheOtherKindsCursor() throws Exception {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals multiValued = buildTags(createTempDir(), leaf)) {
+                    IllegalStateException e = expectThrows(IllegalStateException.class, multiValued::newOrdinalCursor);
+                    assertTrue(e.getMessage(), e.getMessage().contains("newMultiValuedOrdinalsCursor"));
+                }
+            }
+        }
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            addDoc(writer, "beta");
+            writer.forceMerge(1);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (
+                    UninvertedOrdinals singleValued = UninvertedOrdinals.build(
+                        createTempDir(),
+                        "single",
+                        leaf.terms("f"),
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(2, 2, false),
+                        () -> false
+                    )
+                ) {
+                    IllegalStateException e = expectThrows(IllegalStateException.class, singleValued::newMultiValuedOrdinalsCursor);
+                    assertTrue(e.getMessage(), e.getMessage().contains("newOrdinalCursor"));
+                }
+            }
+        }
+    }
+
+    /** A file whose shape differs from the column's is deleted on load, in both directions. */
+    public void testShapeMismatchIsRejectedOnLoad() throws Exception {
+        Path ordsDir = createTempDir();
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals ignored = buildTags(ordsDir, leaf)) {
+                    // built as multi-valued
+                }
+                assertNull(
+                    "a multi-valued file must not load for a plain column",
+                    UninvertedOrdinals.load(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), new ColumnValueCounts(6, 3, false))
+                );
+                assertFalse(Files.exists(ordsDir.resolve("parquet-ords-tags.ord")));
+            }
+        }
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            addDoc(writer, "beta");
+            writer.forceMerge(1);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (
+                    UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                        ordsDir,
+                        "plain",
+                        leaf.terms("f"),
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(2, 2, false),
+                        () -> false
+                    )
+                ) {
+                    // built as single-valued
+                }
+                assertNull(
+                    "a single-valued file must not load for a list column",
+                    UninvertedOrdinals.load(ordsDir, "plain", leaf.terms("f"), leaf.maxDoc(), new ColumnValueCounts(2, 2, true))
+                );
+                assertFalse(Files.exists(ordsDir.resolve("parquet-ords-plain.ord")));
+            }
+        }
+    }
+
+    /** Loading refuses a file whose document count differs from Parquet's, or whose ordinals exceed Parquet's values. */
+    public void testMultiValuedCountMismatchesAreRejectedOnLoad() throws Exception {
+        Path ordsDir = createTempDir();
+        Path ordFile = ordsDir.resolve("parquet-ords-tags.ord");
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals ignored = buildTags(ordsDir, leaf)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+                assertNull(
+                    "3 documents with values in the file, 2 in Parquet",
+                    UninvertedOrdinals.load(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), new ColumnValueCounts(6, 2, true))
+                );
+                assertFalse(Files.exists(ordFile));
+
+                try (UninvertedOrdinals ignored = buildTags(ordsDir, leaf)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+                assertNull(
+                    "5 ordinals in the file, only 4 values in Parquet",
+                    UninvertedOrdinals.load(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), new ColumnValueCounts(4, 3, true))
+                );
+                assertFalse(Files.exists(ordFile));
+            }
+        }
+    }
+
+    /** The build refuses to publish a multi-valued file whose document count differs from Parquet's. */
+    public void testMultiValuedCoverageMismatchFailsBeforePublishingOrdFile() throws Exception {
+        Path ordsDir = createTempDir();
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                IllegalStateException e = expectThrows(
+                    IllegalStateException.class,
+                    () -> UninvertedOrdinals.build(
+                        ordsDir,
+                        "tags",
+                        leaf.terms("f"),
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(6, 4, true),
+                        () -> false
+                    )
+                );
+                assertTrue(e.getMessage(), e.getMessage().contains("tags"));
+                assertFalse(Files.exists(ordsDir.resolve("parquet-ords-tags.ord")));
+            }
+        }
+    }
+
+    /** A truncated multi-valued file fails the checksum and is deleted. */
+    public void testTruncatedMultiValuedFileIsRejected() throws Exception {
+        Path ordsDir = createTempDir();
+        Path ordFile = ordsDir.resolve("parquet-ords-tags.ord");
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals ignored = buildTags(ordsDir, leaf)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+                try (FileChannel channel = FileChannel.open(ordFile, StandardOpenOption.WRITE)) {
+                    channel.truncate(channel.size() - 5);
+                }
+                assertNull(UninvertedOrdinals.load(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), TAGS_COUNTS));
+                assertFalse(Files.exists(ordFile));
+            }
+        }
+    }
+
+    /** The build refuses a multi-valued file that would hold more ordinals than Parquet stores values. */
+    public void testMultiValuedBuildWithMoreOrdinalsThanParquetValuesFails() throws Exception {
+        Path ordsDir = createTempDir();
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                IllegalStateException e = expectThrows(
+                    IllegalStateException.class,
+                    () -> UninvertedOrdinals.build(
+                        ordsDir,
+                        "tags",
+                        leaf.terms("f"),
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(4, 3, true),
+                        () -> false
+                    )
+                );
+                assertTrue(e.getMessage(), e.getMessage().contains("5 document and value pairs"));
+                assertFalse(Files.exists(ordsDir.resolve("parquet-ords-tags.ord")));
+            }
+        }
+    }
+
+    /** A cancelled multi-valued build stops before writing anything. */
+    public void testCancelledMultiValuedBuildWritesNothing() throws Exception {
+        Path ordsDir = createTempDir();
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                IOException e = expectThrows(
+                    IOException.class,
+                    () -> UninvertedOrdinals.build(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), TAGS_COUNTS, () -> true)
+                );
+                assertTrue(e.getMessage(), e.getMessage().contains("cancelled"));
+                // Lucene's test file system may add stray "extra" files to temp dirs, so look only for ours.
+                try (var listing = Files.list(ordsDir)) {
+                    assertTrue(
+                        "neither the .ord nor its .tmp may be left behind",
+                        listing.noneMatch(f -> f.getFileName().toString().startsWith("parquet-ords-"))
+                    );
+                }
+            }
+        }
+    }
+
+    /** Terms and ranks resolve across several checkpoints in a multi-valued file. */
+    public void testMultiValuedFileResolvesTermsAcrossCheckpoints() throws Exception {
+        final int defaultInterval = UninvertedOrdinals.configuredCheckpointInterval();
+        UninvertedOrdinals.setCheckpointInterval(2);
+        try {
+            Path ordsDir = createTempDir();
+            try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+                // 7 words over 3 documents: term-0000 .. term-0006, so checkpoints at 0, 2, 4 and 6.
+                addTagsDoc(writer, termValue(0), termValue(3), termValue(6));
+                addTagsDoc(writer, termValue(1), termValue(4));
+                addTagsDoc(writer, termValue(2), termValue(5), termValue(5));
+                writer.forceMerge(1);
+                try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                    LeafReader leaf = reader.leaves().get(0).reader();
+                    ColumnValueCounts counts = new ColumnValueCounts(8, 3, true);
+                    try (
+                        UninvertedOrdinals ignored = UninvertedOrdinals.build(
+                            ordsDir,
+                            "many",
+                            leaf.terms("f"),
+                            leaf.maxDoc(),
+                            counts,
+                            () -> false
+                        )
+                    ) {
+                        // built with interval 2
+                    }
+                    try (UninvertedOrdinals loaded = UninvertedOrdinals.load(ordsDir, "many", leaf.terms("f"), leaf.maxDoc(), counts)) {
+                        assertNotNull(loaded);
+                        for (int ord = 0; ord < 7; ord++) {
+                            assertEquals(termValue(ord), loaded.term(ord).utf8ToString());
+                            assertEquals(ord, loaded.rank(new BytesRef(termValue(ord))));
+                        }
+                        UninvertedOrdinals.MultiValuedOrdinalsCursor cursor = loaded.newMultiValuedOrdinalsCursor();
+                        assertOrdinals(cursor, 0, 0, 3, 6);
+                        assertOrdinals(cursor, 1, 1, 4);
+                        assertOrdinals(cursor, 2, 2, 5);
+                    }
+                }
+            }
+        } finally {
+            UninvertedOrdinals.setCheckpointInterval(defaultInterval);
+        }
+    }
+
+    /** A multi-valued flag byte other than 0 or 1 is rejected on load. */
+    public void testInvalidMultiValuedFlagIsRejected() throws Exception {
+        assertRejectedAfterHeaderEdit(MULTI_VALUED_FLAG_OFFSET, new byte[] { 2 }, false, TAGS_COUNTS);
+    }
+
+    /** An ordinal count that needs more bytes than the file holds is rejected, even with a valid checksum. */
+    public void testOrdinalCountLargerThanTheFileIsRejected() throws Exception {
+        assertRejectedAfterHeaderEdit(ORDINAL_COUNT_OFFSET, littleEndianLong(50), true, new ColumnValueCounts(100, 3, true));
+    }
+
+    /** Document starts that do not end at the header's ordinal count are rejected, even with a valid checksum. */
+    public void testDocumentStartsNotEndingAtTheOrdinalCountAreRejected() throws Exception {
+        assertRejectedAfterHeaderEdit(ORDINAL_COUNT_OFFSET, littleEndianLong(4), true, TAGS_COUNTS);
+    }
+
+    /** The single-valued cursor still answers an earlier document after a later one, through the shared bitmap helper. */
+    public void testSingleValuedCursorAnswersDocumentsInAnyOrder() throws Exception {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            writer.addDocument(new Document());
+            addDoc(writer, "beta");
+            writer.forceMerge(1);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (
+                    UninvertedOrdinals ordinals = UninvertedOrdinals.build(
+                        createTempDir(),
+                        "sparse",
+                        leaf.terms("f"),
+                        leaf.maxDoc(),
+                        new ColumnValueCounts(2, 2, false),
+                        () -> false
+                    )
+                ) {
+                    UninvertedOrdinals.OrdinalCursor cursor = ordinals.newOrdinalCursor();
+                    assertEquals(1, cursor.ordinal(2));
+                    assertEquals(0, cursor.ordinal(0));
+                    assertEquals(-1, cursor.ordinal(1));
+                    assertEquals(1, cursor.ordinal(2));
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds the tags file, overwrites {@code bytes} at {@code offset}, optionally recomputes the checksum so only the
+     * structural checks can catch the edit, and asserts the load rejects and deletes the file.
+     */
+    private void assertRejectedAfterHeaderEdit(long offset, byte[] bytes, boolean fixChecksum, ColumnValueCounts loadCounts)
+        throws Exception {
+        Path ordsDir = createTempDir();
+        Path ordFile = ordsDir.resolve("parquet-ords-tags.ord");
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            indexTagsExample(writer);
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                try (UninvertedOrdinals ignored = buildTags(ordsDir, leaf)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+                byte[] file = Files.readAllBytes(ordFile);
+                System.arraycopy(bytes, 0, file, (int) offset, bytes.length);
+                if (fixChecksum) {
+                    CRC32 crc = new CRC32();
+                    crc.update(file, 0, file.length - Long.BYTES);
+                    byte[] stored = littleEndianLong(crc.getValue());
+                    System.arraycopy(stored, 0, file, file.length - Long.BYTES, Long.BYTES);
+                }
+                Files.write(ordFile, file);
+                assertNull(UninvertedOrdinals.load(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), loadCounts));
+                assertFalse("the invalid file must be deleted so a rebuild can replace it", Files.exists(ordFile));
+            }
+        }
+    }
+
+    private static byte[] littleEndianLong(long value) {
+        return ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array();
+    }
+
+    /** doc 0 [red, blue], doc 1 [blue], doc 2 nothing, doc 3 [red, red, green]; words 0 blue, 1 green, 2 red. */
+    private static void indexTagsExample(IndexWriter writer) throws Exception {
+        addTagsDoc(writer, "red", "blue");
+        addTagsDoc(writer, "blue");
+        addTagsDoc(writer);
+        addTagsDoc(writer, "red", "red", "green");
+        writer.forceMerge(1);
+    }
+
+    private static UninvertedOrdinals buildTags(Path ordsDir, LeafReader leaf) throws Exception {
+        return UninvertedOrdinals.build(ordsDir, "tags", leaf.terms("f"), leaf.maxDoc(), TAGS_COUNTS, () -> false);
+    }
+
+    private static void assertTagsOrdinals(UninvertedOrdinals ordinals) {
+        UninvertedOrdinals.MultiValuedOrdinalsCursor cursor = ordinals.newMultiValuedOrdinalsCursor();
+        assertOrdinals(cursor, 0, 0, 2);
+        assertOrdinals(cursor, 1, 0);
+        assertOrdinals(cursor, 2);
+        assertOrdinals(cursor, 3, 1, 2);
+    }
+
+    private static void assertOrdinals(UninvertedOrdinals.MultiValuedOrdinalsCursor cursor, int doc, long... expected) {
+        assertEquals("ordinal count of doc " + doc, expected.length, cursor.advance(doc));
+        for (long ordinal : expected) {
+            assertEquals("ordinal of doc " + doc, ordinal, cursor.nextOrdinal());
+        }
+    }
+
+    private static void addTagsDoc(IndexWriter writer, String... tags) throws Exception {
+        Document doc = new Document();
+        doc.add(new StringField("id", "x", Field.Store.NO));
+        for (String tag : tags) {
+            doc.add(new StringField("f", tag, Field.Store.NO));
+        }
+        writer.addDocument(doc);
     }
 
     private static Terms countingTerms(Terms delegate, AtomicInteger iteratorCalls) {

@@ -21,6 +21,7 @@ import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LogDocMergePolicy;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
@@ -33,7 +34,9 @@ import org.apache.lucene.util.BytesRef;
 import org.opensearch.be.datafusion.docvalues.bridge.DataFusionBackedTestCase;
 import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedSetDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
+import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedSetDocValues;
 import org.opensearch.common.settings.Settings;
 
 import java.io.IOException;
@@ -54,6 +57,13 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
 
     private static final String CITY = "city";
     private static final String TAGS = "tags";
+    /** doc 0 [red, blue], doc 1 [blue], doc 2 null, doc 3 [red, red, green]. */
+    private static final List<List<String>> TAGS_EXAMPLE = Arrays.asList(
+        List.of("red", "blue"),
+        List.of("blue"),
+        null,
+        List.of("red", "red", "green")
+    );
 
     @Override
     public void setUp() throws Exception {
@@ -84,7 +94,7 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
 
     /**
      * Builds resources with a null producer holding one synthetic SORTED_SET {@link FieldInfo} for
-     * {@code field}, the matching {@link FieldInfos}, the given multi-valued set, and a null segment info.
+     * {@code field}, the matching {@link FieldInfos}, and a null segment info.
      */
     private static ParquetSegmentResources sortedSetResources(String field) {
         FieldInfo fi = sortedSetField(field);
@@ -145,6 +155,82 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
                 SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
                 SortedDocValues dv = cityDocValues(leaf, parquetFile, values.size());
                 assertTrue("without an ord file the streaming tier serves the field", dv instanceof ParquetSortedDocValues);
+            }
+        }
+    }
+
+    /** A list column on a filesystem segment gets a multi-valued ord file, and the current document's words come from Parquet. */
+    public void testListColumnIsServedByMultiValuedOrdinals() throws Exception {
+        Path parquetFile = createTempDir().resolve("tags-ords.parquet");
+        StringListColumnFixture.write(parquetFile, allocator, TAGS, TAGS_EXAMPLE);
+
+        Path shardDir = createTempDir();
+        try (Directory dir = openFsTagsIndex(shardDir)) {
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                SortedSetDocValues values = tagsDocValues(leaf, parquetFile);
+
+                assertTrue("a leased ord file must serve the list column", values instanceof ParquetUninvertedSortedSetDocValues);
+                assertEquals("blue, green, red", 3, values.getValueCount());
+                assertSetValues(values, 0, "blue", "red");
+                assertSetValues(values, 1, "blue");
+                assertFalse("a null row carries no value", values.advanceExact(2));
+                assertSetValues(values, 3, "green", "red");
+                try (var listing = Files.list(shardDir.resolve("parquet-ords"))) {
+                    assertTrue("the built ord file must exist under the shard", listing.anyMatch(f -> f.toString().endsWith(".ord")));
+                }
+            }
+        }
+    }
+
+    /** When Parquet's words for the current document disagree with the ord file, the term index answers instead. */
+    public void testCurrentDocumentFallsBackToTheTermIndexWhenParquetDisagrees() throws Exception {
+        Path parquetFile = createTempDir().resolve("tags-disagree.parquet");
+        // Postings say doc 3 is [green, red]; Parquet says [green, green, green], one distinct word.
+        StringListColumnFixture.write(
+            parquetFile,
+            allocator,
+            TAGS,
+            Arrays.asList(List.of("red", "blue"), List.of("blue"), null, List.of("green", "green", "green"))
+        );
+
+        Path shardDir = createTempDir();
+        try (Directory dir = openFsTagsIndex(shardDir)) {
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                SortedSetDocValues values = tagsDocValues(leaf, parquetFile);
+                assertTrue(values instanceof ParquetUninvertedSortedSetDocValues);
+                assertSetValues(values, 3, "green", "red");
+            }
+        }
+    }
+
+    /** No ord file can exist for a non-filesystem segment, so the streaming list reader serves the column. */
+    public void testListColumnWithoutALeaseFallsBackToTheStreamingIterator() throws Exception {
+        Path parquetFile = createTempDir().resolve("tags-nofs.parquet");
+        StringListColumnFixture.write(parquetFile, allocator, TAGS, TAGS_EXAMPLE);
+
+        try (Directory dir = new ByteBuffersDirectory()) {
+            writeTags(dir);
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                SortedSetDocValues values = tagsDocValues(leaf, parquetFile);
+                assertTrue("without an ord file the streaming list reader serves the column", values instanceof ParquetSortedSetDocValues);
+            }
+        }
+    }
+
+    /** A list column with no value in the whole segment gets empty ordinals; nothing is built. */
+    public void testListColumnWithNoValuesServesEmptyOrdinals() throws Exception {
+        Path parquetFile = createTempDir().resolve("tags-allnull.parquet");
+        StringListColumnFixture.write(parquetFile, allocator, TAGS, Arrays.asList(null, null));
+
+        try (Directory dir = new ByteBuffersDirectory()) {
+            writeCities(dir, "a", "b");
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                SortedSetDocValues values = tagsDocValues(leaf, parquetFile);
+                assertEquals("no row carries a value, so the ordinals view is empty", 0, values.getValueCount());
             }
         }
     }
@@ -214,6 +300,53 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
         assertEquals(expected.length, values.docValueCount());
         for (String word : expected) {
             assertEquals(new BytesRef(word), values.lookupOrd(values.nextOrd()));
+        }
+    }
+
+    /** The multi-valued {@code tags} field as an aggregation receives it, over a real producer. */
+    private SortedSetDocValues tagsDocValues(SegmentReader leaf, Path parquetFile) throws Exception {
+        FieldInfo fi = sortedSetField(TAGS);
+        ParquetDocValuesProducer producer = new ParquetDocValuesProducer(
+            parquetFile,
+            ParquetColumnReader.LOCAL_STORE,
+            Settings.EMPTY,
+            leaf.maxDoc(),
+            null
+        );
+        ParquetSegmentResources resources = new ParquetSegmentResources(
+            producer,
+            Map.of(TAGS, fi),
+            new FieldInfos(new FieldInfo[] { fi }),
+            leaf.getSegmentInfo().info
+        );
+        ParquetDocValuesLeafReader parquetLeaf = new ParquetDocValuesLeafReader(leaf, resources, new CursorRegistry());
+        return parquetLeaf.getSortedSetDocValues(TAGS);
+    }
+
+    /** Opens a filesystem index at {@code <shardDir>/index} holding the tags example's postings. */
+    private static Directory openFsTagsIndex(Path shardDir) throws Exception {
+        Path storeDir = shardDir.resolve("index");
+        Files.createDirectories(storeDir);
+        Directory directory = FSDirectory.open(storeDir);
+        writeTags(directory);
+        return directory;
+    }
+
+    /** One document per row of {@link #TAGS_EXAMPLE}, carrying postings for each of its words. */
+    private static void writeTags(Directory dir) throws Exception {
+        try (IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig().setMergePolicy(new LogDocMergePolicy()))) {
+            for (List<String> row : TAGS_EXAMPLE) {
+                Document document = new Document();
+                document.add(new StringField("id", "x", Field.Store.NO));
+                if (row != null) {
+                    for (String tag : row) {
+                        document.add(new StringField(TAGS, tag, Field.Store.NO));
+                    }
+                }
+                writer.addDocument(document);
+            }
+            writer.forceMerge(1);
+            writer.commit();
         }
     }
 
