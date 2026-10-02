@@ -464,7 +464,6 @@ public final class UninvertedOrdinalsCache {
                 throw new IllegalStateException("uninverted ordinals lease underflow for " + ords.fileName());
             }
             inUse--;
-            lastUsedMillis = System.currentTimeMillis();
             logger.debug("lease released [{}] inUse={} thread={}", ords.fileName(), inUse, Thread.currentThread().getName());
         }
 

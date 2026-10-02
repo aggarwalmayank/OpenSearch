@@ -92,6 +92,33 @@ public class UninvertedOrdinalsDeleteUnusedTests extends OpenSearchTestCase {
         }
     }
 
+    /** Releasing a lease is not a use: the idle clock keeps counting from when the query acquired it. */
+    public void testReleaseDoesNotRestartIdleClock() throws Exception {
+        Path shardDir = createTempDir();
+        Path storeDir = shardDir.resolve("index");
+        Files.createDirectories(storeDir);
+        try (Directory directory = FSDirectory.open(storeDir)) {
+            indexCityDocs(directory);
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                SegmentReader leaf = (SegmentReader) reader.leaves().get(0).reader();
+                leaf.getSegmentInfo().info.putAttribute(
+                    ParquetSegmentLayout.PARQUET_FILE_ATTRIBUTE,
+                    shardDir.resolve("parquet").resolve("_parquet_file_generation_1.parquet").toString()
+                );
+                UninvertedOrdinalsCache.Lease lease = UninvertedOrdinalsCache.acquire(leaf, leaf.getSegmentInfo().info, "city", 3);
+                assertNotNull(lease);
+                long acquiredBy = System.currentTimeMillis();
+                Path ordFile = onlyOrdFile(shardDir);
+
+                assertBusy(() -> assertTrue(System.currentTimeMillis() > acquiredBy + 1));
+                lease.close();
+
+                UninvertedOrdinalsCache.deleteUnusedOrdFiles(acquiredBy + DELETE_AFTER_MILLIS + 1);
+                assertFalse("idle time counts from the acquire, not the release", Files.exists(ordFile));
+            }
+        }
+    }
+
     /** Cold files (no cache entry: orphans of merged segments, never-queried shards) go by last-modified time. */
     public void testPassDeletesColdFilesByLastModifiedTime() throws Exception {
         Path root = createTempDir();
