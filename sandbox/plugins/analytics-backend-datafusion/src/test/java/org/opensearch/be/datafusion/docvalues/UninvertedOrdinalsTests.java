@@ -29,6 +29,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class UninvertedOrdinalsTests extends OpenSearchTestCase {
@@ -348,7 +349,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     private static Terms countingTerms(Terms delegate, AtomicInteger iteratorCalls) {
         return new FilterLeafReader.FilterTerms(delegate) {
             @Override
-            public TermsEnum iterator() throws java.io.IOException {
+            public TermsEnum iterator() throws IOException {
                 iteratorCalls.incrementAndGet();
                 return in.iterator();
             }
@@ -362,7 +363,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     }
 
     private static String termValue(int ord) {
-        return String.format(java.util.Locale.ROOT, "term-%04d", ord);
+        return String.format(Locale.ROOT, "term-%04d", ord);
     }
 
     private static String sparseValue(int valueIndex, int blockSize) {

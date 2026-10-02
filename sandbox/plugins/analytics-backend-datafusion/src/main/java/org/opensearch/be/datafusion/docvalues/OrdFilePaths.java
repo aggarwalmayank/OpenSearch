@@ -36,9 +36,9 @@ final class OrdFilePaths {
     static final String ORDS_DIR_NAME = "parquet-ords";
 
     /**
-     * The ord file's name for a (parquet-file, field) key: {@code <parquetFileStem>-<field>.ord}.
-     * The parquet file name is stable across restarts, so the name is too, letting a file built by a
-     * previous process be reused and letting a removed parquet file's ord files be found by stem alone.
+     * The ord file's name: {@code <parquetFileStem>-<segmentId>-<field>.ord}. Both parts are stable across
+     * restarts, so a file built by a previous process is reused, and a removed parquet file's ord files
+     * are found by the {@code <parquetFileStem>-} prefix alone.
      */
     static String ordFileName(String fileKey) {
         return fileKey + ".ord";

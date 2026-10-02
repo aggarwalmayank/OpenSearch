@@ -87,7 +87,7 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
         try (Directory directory = new ByteBuffersDirectory()) {
             try (IndexWriter writer = new IndexWriter(directory, new IndexWriterConfig())) {
                 Document document = new Document();
-                document.add(new StringField("city", "delhi", org.apache.lucene.document.Field.Store.NO));
+                document.add(new StringField("city", "delhi", Field.Store.NO));
                 writer.addDocument(document);
                 writer.commit();
             }
@@ -120,7 +120,7 @@ public class UninvertedOrdinalsCacheDirsTests extends OpenSearchTestCase {
             try (IndexWriter writer = new IndexWriter(directory, new IndexWriterConfig())) {
                 for (String value : new String[] { "delhi", "mumbai", "pune" }) {
                     Document document = new Document();
-                    document.add(new StringField("city", value, org.apache.lucene.document.Field.Store.NO));
+                    document.add(new StringField("city", value, Field.Store.NO));
                     writer.addDocument(document);
                 }
                 writer.commit();

@@ -161,14 +161,14 @@ public class UninvertedOrdinalsDeleteUnusedTests extends OpenSearchTestCase {
         Path ordsDir = shardDir.resolve("parquet-ords");
         Files.createDirectories(ordsDir);
 
-        Path target = Files.createFile(ordsDir.resolve("_parquet_file_generation_3-city.ord"));
-        Path targetOtherField = Files.createFile(ordsDir.resolve("_parquet_file_generation_3-country.ord"));
-        Path leftoverTmp = Files.createFile(ordsDir.resolve("_parquet_file_generation_3-city.ord.tmp"));
+        Path target = Files.createFile(ordsDir.resolve("_parquet_file_generation_3-3k9xq2m8f0a7c1d4e6b5n2p9r-city.ord"));
+        Path targetOtherField = Files.createFile(ordsDir.resolve("_parquet_file_generation_3-3k9xq2m8f0a7c1d4e6b5n2p9r-country.ord"));
+        Path leftoverTmp = Files.createFile(ordsDir.resolve("_parquet_file_generation_3-3k9xq2m8f0a7c1d4e6b5n2p9r-city.ord.tmp"));
         // Siblings that share the "_parquet_file_generation_3" leading text but are different files.
-        Path longerGeneration = Files.createFile(ordsDir.resolve("_parquet_file_generation_33-city.ord"));
-        Path mergedGeneration = Files.createFile(ordsDir.resolve("_parquet_file_generation_merged_3-city.ord"));
+        Path longerGeneration = Files.createFile(ordsDir.resolve("_parquet_file_generation_33-8w1h0t4z2y6v3s7u5x9q0k1l2-city.ord"));
+        Path mergedGeneration = Files.createFile(ordsDir.resolve("_parquet_file_generation_merged_3-5p8wz0m3k7r2c9d1f4h6j8n0q-city.ord"));
 
-        UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(shardDir, java.util.List.of("_parquet_file_generation_3.parquet"));
+        UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(shardDir, List.of("_parquet_file_generation_3.parquet"));
 
         assertFalse("the stem's city ord file must be deleted", Files.exists(target));
         assertFalse("the stem's country ord file must be deleted", Files.exists(targetOtherField));
@@ -179,10 +179,7 @@ public class UninvertedOrdinalsDeleteUnusedTests extends OpenSearchTestCase {
 
     /** A missing ords directory is a no-op, not an error. */
     public void testDeleteOrdFilesOfDeletedParquetFilesIsNoOpWhenOrdsDirMissing() {
-        UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(
-            createTempDir(),
-            java.util.List.of("_parquet_file_generation_1.parquet")
-        );
+        UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(createTempDir(), List.of("_parquet_file_generation_1.parquet"));
         // reaching here without throwing is the assertion
     }
 
@@ -196,5 +193,14 @@ public class UninvertedOrdinalsDeleteUnusedTests extends OpenSearchTestCase {
         UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(shardDir, null);
         UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(shardDir, List.of());
         assertTrue("these inputs must not delete any ord file", Files.exists(keep));
+    }
+
+    /** Two shards whose parquet files share a generation still get different ord file names. */
+    public void testOrdFileNameIsUniqueAcrossShardsWithTheSameParquetGeneration() throws Exception {
+        withOrdinalsBuilt(createTempDir(), (leafA, fileA) -> withOrdinalsBuilt(createTempDir(), (leafB, fileB) -> {
+            assertTrue(fileA.getFileName().toString().startsWith("_parquet_file_generation_1-"));
+            assertTrue(fileB.getFileName().toString().startsWith("_parquet_file_generation_1-"));
+            assertNotEquals("the node-wide file lock is keyed by this name", fileA.getFileName(), fileB.getFileName());
+        }));
     }
 }

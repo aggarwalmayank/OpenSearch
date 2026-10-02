@@ -14,6 +14,7 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.Terms;
+import org.apache.lucene.util.StringHelper;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.KeyedLock;
@@ -37,7 +38,7 @@ import java.util.stream.Stream;
  * Node-level cache of {@link UninvertedOrdinals}, keyed by (segment core key, field). Builds of
  * different files run in parallel (each reserving its build heap on the fielddata breaker) while
  * mutations of one file serialize on its per-file lock. The on-disk file is keyed by the segment's
- * backing parquet file name and survives restarts.
+ * backing parquet file name and segment id, and survives restarts.
  */
 public final class UninvertedOrdinalsCache {
 
@@ -167,7 +168,8 @@ public final class UninvertedOrdinalsCache {
             );
         }
         String parquetFileStem = OrdFilePaths.parquetFileStem(Path.of(parquetFile).getFileName().toString());
-        String fileKey = parquetFileStem + "-" + field;
+        // The segment id makes the name unique on the node: parquet generations restart at 1 in every shard.
+        String fileKey = parquetFileStem + "-" + StringHelper.idToString(segmentInfo.getId()) + "-" + field;
         try (Releasable ignored = FILE_LOCKS.acquire(OrdFilePaths.ordFileName(fileKey))) {
             // Re-check under the lock: another query may have built the entry while we waited.
             lease = leaseExistingEntry(perSegment, field);
