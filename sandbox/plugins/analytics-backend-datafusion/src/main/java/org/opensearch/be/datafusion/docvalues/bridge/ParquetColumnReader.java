@@ -454,6 +454,9 @@ public final class ParquetColumnReader extends NativeHandle implements NumericVa
         if (neededBytes <= valueBuf.byteSize()) {
             throw contractViolation(row, "overflow reported at " + neededBytes + " bytes into a buffer of " + valueBuf.byteSize());
         }
+        if (neededBytes > Integer.MAX_VALUE) {
+            throw contractViolation(row, "overflow reported at " + neededBytes + " bytes, beyond what int offsets can address");
+        }
         Arena old = valueArena;
         valueArena = Arena.ofShared();
         valueBuf = valueArena.allocate(neededBytes);

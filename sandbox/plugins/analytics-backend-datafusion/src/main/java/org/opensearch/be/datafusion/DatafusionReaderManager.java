@@ -10,6 +10,7 @@ package org.opensearch.be.datafusion;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.be.datafusion.docvalues.UninvertedOrdinalsCache;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.exec.EngineReaderManager;
@@ -18,6 +19,7 @@ import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.NativeStoreHandle;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -41,6 +43,8 @@ public class DatafusionReaderManager implements EngineReaderManager<DatafusionRe
     private final Map<Long, DatafusionReader> readers = new HashMap<>();
     private final DataFormat dataFormat;
     private final String directoryPath;
+    /** Shard data path, used to locate this shard's {@code parquet-ords} directory for ord-file cleanup. */
+    private final Path shardDataPath;
     private final DataFusionService dataFusionService;
     private final NativeStoreHandle dataformatAwareStoreHandle;
     /**
@@ -75,6 +79,7 @@ public class DatafusionReaderManager implements EngineReaderManager<DatafusionRe
     ) {
         this.dataFormat = dataFormat;
         this.directoryPath = shardPath.getDataPath().resolve(dataFormat.name()).toString();
+        this.shardDataPath = shardPath.getDataPath();
         this.dataFusionService = dataFusionService;
         this.dataformatAwareStoreHandle = dataformatAwareStoreHandle;
         this.sortFields = sortFields == null ? List.of() : List.copyOf(sortFields);
@@ -105,6 +110,8 @@ public class DatafusionReaderManager implements EngineReaderManager<DatafusionRe
     public void onFilesDeleted(Collection<String> files) throws IOException {
         if (files == null || files.isEmpty()) return;
         dataFusionService.onFilesDeleted(toAbsolutePaths(files));
+        // Also drop the uninverted-ordinal files built for the removed parquet files; node-local and idempotent.
+        UninvertedOrdinalsCache.deleteOrdFilesOfDeletedParquetFiles(shardDataPath, files);
     }
 
     @Override

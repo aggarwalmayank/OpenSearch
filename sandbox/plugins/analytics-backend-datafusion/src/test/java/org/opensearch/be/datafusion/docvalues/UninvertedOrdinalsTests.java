@@ -23,6 +23,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -132,10 +133,48 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A sparse field whose values span two blocks, the first one constant, must read back
+     * the ordinal of every document on both sides of the block boundary.
+     */
+    public void testSparseFieldAcrossBlocksReadsBackEveryOrdinal() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "sparse-blocks";
+        final int blockSize = 1 << 16; // UninvertedOrdinals.BLOCK_SIZE
+        final int numPresent = blockSize + 1000;
+        final int maxDoc = numPresent * 2;
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            for (int doc = 0; doc < maxDoc; doc++) {
+                Document document = new Document();
+                if (doc % 2 == 0) {
+                    document.add(new StringField("f", sparseValue(doc / 2, blockSize), Field.Store.NO));
+                }
+                writer.addDocument(document);
+            }
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                try (UninvertedOrdinals built = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), numPresent, () -> false)) {
+                    assertFalse(built.isDense());
+                    assertSparseOrdinals(built, maxDoc, blockSize);
+                }
+                try (UninvertedOrdinals reloaded = UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc(), numPresent)) {
+                    assertNotNull(reloaded);
+                    assertSparseOrdinals(reloaded, maxDoc, blockSize);
+                }
+            }
+        }
+    }
+
     public void testCorruptAssignedDocsMetadataTriggersRebuild() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "assigned-docs";
-        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
 
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
@@ -178,7 +217,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     public void testCoverageMismatchFailsBeforePublishingOrdFile() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "coverage-mismatch";
-        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
 
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
@@ -204,7 +243,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     public void testBitFlipInsideOrdinalStreamIsRejectedAndWarned() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "bit-flip";
-        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
 
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
@@ -242,7 +281,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     public void testTruncatedFileIsRejected() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "truncated";
-        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
 
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
@@ -271,7 +310,7 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
     public void testVersion1FileIsRejectedIntoTheRebuildPath() throws Exception {
         Path ordsDir = createTempDir();
         String fileKey = "old-version";
-        Path ordFile = ordsDir.resolve("parquet-ords-" + fileKey + ".ord");
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
 
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
             addDoc(writer, "alpha");
@@ -324,5 +363,134 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
 
     private static String termValue(int ord) {
         return String.format(java.util.Locale.ROOT, "term-%04d", ord);
+    }
+
+    private static String sparseValue(int valueIndex, int blockSize) {
+        return valueIndex < blockSize ? "a" : "b" + (valueIndex % 7);
+    }
+
+    private static void assertSparseOrdinals(UninvertedOrdinals ords, int maxDoc, int blockSize) throws Exception {
+        UninvertedOrdinals.OrdinalCursor cursor = ords.newOrdinalCursor();
+        for (int doc = 0; doc < maxDoc; doc++) {
+            int valueIndex = doc / 2;
+            int expected = doc % 2 == 1 ? -1 : valueIndex < blockSize ? 0 : 1 + valueIndex % 7;
+            assertEquals("doc " + doc, expected, cursor.ordinal(doc));
+        }
+    }
+
+    /** An ord file built for a different maxDoc is stale; load deletes it and returns null. */
+    public void testLoadRejectsFileBuiltForADifferentMaxDoc() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "maxdoc-mismatch";
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            addDoc(writer, "beta");
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 2, () -> false)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+
+                assertNull(
+                    "an ord file built for a different maxDoc must be rejected",
+                    UninvertedOrdinals.load(ordsDir, fileKey, terms, leaf.maxDoc() + 1, 2)
+                );
+                assertFalse("the stale file must be deleted so a rebuild can replace it", Files.exists(ordFile));
+            }
+        }
+    }
+
+    /** Without a non-null count the build cannot verify coverage, so it refuses. */
+    public void testBuildRefusesWhenNonNullCountUnknown() throws Exception {
+        Path ordsDir = createTempDir();
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                IllegalStateException e = expectThrows(
+                    IllegalStateException.class,
+                    () -> UninvertedOrdinals.build(ordsDir, "no-stats", terms, leaf.maxDoc(), -1, () -> false)
+                );
+                assertTrue(e.getMessage().contains("cannot verify ordinal coverage"));
+            }
+        }
+    }
+
+    /** A cancelled build throws and leaves no ord file behind. */
+    public void testBuildStopsWhenCancelled() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "cancelled";
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            addDoc(writer, "alpha");
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms terms = leaf.terms("f");
+                assertNotNull(terms);
+
+                IOException e = expectThrows(
+                    IOException.class,
+                    () -> UninvertedOrdinals.build(ordsDir, fileKey, terms, leaf.maxDoc(), 1, () -> true)
+                );
+                assertTrue(e.getMessage().contains("ordinal build cancelled"));
+                // The cancel check fires before any temp or ord file is created, so none is left behind.
+                assertFalse("a cancelled build must leave no ord file", Files.exists(ordFile));
+            }
+        }
+    }
+
+    /** An ord file whose term count differs from the live segment is stale; load deletes it and returns null. */
+    public void testLoadRejectsFileWithADifferentTermCount() throws Exception {
+        Path ordsDir = createTempDir();
+        String fileKey = "termcount-mismatch";
+        Path ordFile = ordsDir.resolve(fileKey + ".ord");
+
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, newDeterministicConfig())) {
+            // One segment, one maxDoc: field f has 3 distinct terms, field g has 2.
+            String[][] rows = { { "alpha", "x" }, { "beta", "x" }, { "gamma", "y" } };
+            for (String[] row : rows) {
+                Document doc = new Document();
+                doc.add(new StringField("f", row[0], Field.Store.NO));
+                doc.add(new StringField("g", row[1], Field.Store.NO));
+                writer.addDocument(doc);
+            }
+            writer.forceMerge(1);
+
+            try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                LeafReader leaf = reader.leaves().get(0).reader();
+                Terms threeTerms = leaf.terms("f");
+                Terms twoTerms = leaf.terms("g");
+                assertNotNull(threeTerms);
+                assertNotNull(twoTerms);
+                assertEquals(3, threeTerms.size());
+                assertEquals(2, twoTerms.size());
+
+                try (UninvertedOrdinals ignored = UninvertedOrdinals.build(ordsDir, fileKey, threeTerms, leaf.maxDoc(), 3, () -> false)) {
+                    assertTrue(Files.exists(ordFile));
+                }
+
+                // Same maxDoc, fewer terms: validateMetadata rejects on termCount before coverage.
+                assertNull(
+                    "an ord file whose termCount differs from the segment must be rejected",
+                    UninvertedOrdinals.load(ordsDir, fileKey, twoTerms, leaf.maxDoc(), 2)
+                );
+                assertFalse("the stale file must be deleted so a rebuild can replace it", Files.exists(ordFile));
+            }
+        }
     }
 }

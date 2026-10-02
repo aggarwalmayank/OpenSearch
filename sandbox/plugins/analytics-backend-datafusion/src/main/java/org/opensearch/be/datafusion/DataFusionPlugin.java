@@ -31,6 +31,7 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.lifecycle.LifecycleComponent;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
@@ -623,7 +624,6 @@ public class DataFusionPlugin extends Plugin
             .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT, UninvertedOrdinals::setCheckpointInterval);
         UninvertedOrdinalsCache.start();
         UninvertedOrdinalsCache.setDeleteUnusedAfter(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER.get(settings));
-        UninvertedOrdinalsCache.setMaxConcurrentBuilds(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS.get(settings));
         UninvertedOrdinalsCache.setDataRoots(environment.dataFiles());
         // Deletion pass: reads the current delete-unused-after value each pass.
         scheduleOrdSweeper(threadPool, DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL.get(settings));
@@ -634,8 +634,6 @@ public class DataFusionPlugin extends Plugin
                 DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL,
                 interval -> scheduleOrdSweeper(threadPool, interval)
             );
-        clusterService.getClusterSettings()
-            .addSettingsUpdateConsumer(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS, UninvertedOrdinalsCache::setMaxConcurrentBuilds);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(DATAFUSION_MEMORY_GUARD_SPILL_EXEMPT_CAP, NativeBridge::setSpillExemptCapBytes);
         // The four memory-guard thresholds are pushed to the native pool together via a single
@@ -810,6 +808,11 @@ public class DataFusionPlugin extends Plugin
         List<Setting<?>> settings = new ArrayList<>(DatafusionSettings.NODE_SCOPED_SETTINGS);
         settings.addAll(DatafusionSettings.INDEX_SCOPED_SETTINGS);
         return List.copyOf(settings);
+    }
+
+    @Override
+    public Collection<Class<? extends LifecycleComponent>> getGuiceServiceClasses() {
+        return List.of(OrdFileBuildBreakerBinder.class);
     }
 
     /**

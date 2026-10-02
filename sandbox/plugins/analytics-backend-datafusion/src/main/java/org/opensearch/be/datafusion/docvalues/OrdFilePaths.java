@@ -36,12 +36,23 @@ final class OrdFilePaths {
     static final String ORDS_DIR_NAME = "parquet-ords";
 
     /**
-     * The ord file's name for a (segment, field) key: {@code parquet-ords-<segmentId>-<field>.ord}.
-     * The segment id is stable across restarts, so the name is too — that is what lets a file
-     * built by a previous process be found and reused.
+     * The ord file's name for a (parquet-file, field) key: {@code <parquetFileStem>-<field>.ord}.
+     * The parquet file name is stable across restarts, so the name is too, letting a file built by a
+     * previous process be reused and letting a removed parquet file's ord files be found by stem alone.
      */
     static String ordFileName(String fileKey) {
-        return "parquet-ords-" + fileKey + ".ord";
+        return fileKey + ".ord";
+    }
+
+    /**
+     * The parquet file name with its trailing {@code .parquet} removed, the leading part of every ord
+     * file key for that parquet file. Rejects any other name so a bad key can never shadow real files.
+     */
+    static String parquetFileStem(String parquetFileName) {
+        if (parquetFileName.endsWith(".parquet") == false) {
+            throw new IllegalArgumentException("expected a parquet file name ending in .parquet but got [" + parquetFileName + "]");
+        }
+        return parquetFileName.substring(0, parquetFileName.length() - ".parquet".length());
     }
 
     /**
@@ -71,6 +82,11 @@ final class OrdFilePaths {
         return null;
     }
 
+    /** The shard's ord-file directory from its data path, for callers holding a {@code Path} rather than a Lucene {@code Directory}. */
+    static Path resolveOrdsDir(Path shardDataPath) {
+        return shardDataPath.resolve(ORDS_DIR_NAME);
+    }
+
     /**
      * Creates the directory and sweeps stale {@code .tmp} files, once per process lifetime.
      * Synchronized so a second query racing into the same cold shard waits for the preparation
@@ -78,8 +94,7 @@ final class OrdFilePaths {
      * sweep could delete its half-written file). Once-per-dir work: contention is negligible.
      */
     static synchronized void prepareDir(Path ordsDir) throws IOException {
-        // add() returns false when the dir is already in the set — already prepared, nothing to do.
-        if (PREPARED_DIRS.add(ordsDir) == false) {
+        if (PREPARED_DIRS.contains(ordsDir)) {
             return;
         }
         Files.createDirectories(ordsDir);
@@ -90,6 +105,8 @@ final class OrdFilePaths {
                 }
             }
         }
+        // Recorded only after both steps succeed, so a failed attempt is retried by the next call.
+        PREPARED_DIRS.add(ordsDir);
     }
 
     /**

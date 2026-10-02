@@ -190,7 +190,7 @@ public final class UninvertedOrdinals implements Closeable {
         Directory directory = new MMapDirectory(ordsDir);
         String fileName = OrdFilePaths.ordFileName(fileKey);
         try {
-            int buildBits = DirectWriter.bitsRequired(termCount + 1);
+            int buildBits = ordinalBits(termCount);
             int interval = configuredCheckpointInterval();
             PackedInts.Mutable building = PackedInts.getMutable(maxDoc, buildBits, PackedInts.COMPACT);
             List<BytesRef> checkpoints = new ArrayList<>((int) (termCount / interval) + 1);
@@ -232,11 +232,27 @@ public final class UninvertedOrdinals implements Closeable {
     }
 
     static long estimatedDiskBytes(long termCount, int maxDoc) {
-        long bits = DirectWriter.bitsRequired(termCount + 1);
+        long bits = ordinalBits(termCount);
         int interval = configuredCheckpointInterval();
         long checkpointCount = termCount == 0 ? 0 : (termCount + interval - 1) / interval;
         long checkpointEstimate = checkpointCount * 64L;
         return DirectWriter.bytesRequired(maxDoc, (int) bits) + 1024L + checkpointEstimate;
+    }
+
+    /** Packed-buffer width for ordinals one through termCount, with zero reserved for no value. */
+    private static int ordinalBits(long termCount) {
+        return DirectWriter.bitsRequired(termCount + 1);
+    }
+
+    /**
+     * Transient heap a from-scratch build holds at once: the packed ordinal buffer, plus the
+     * present bitset built only when the field is sparse. Charged on the breaker before building.
+     */
+    static long buildHeapBytes(int maxDoc, long termCount, long numPresent) {
+        int buildBits = ordinalBits(termCount);
+        long building = 8L * PackedInts.Format.PACKED.longCount(PackedInts.VERSION_CURRENT, maxDoc, buildBits);
+        long present = numPresent != maxDoc ? 8L * FixedBitSet.bits2words(maxDoc) : 0L;
+        return building + present;
     }
 
     /** True when every doc has a value (dense index-by-doc path); false when IndexedDISI-backed. */
@@ -432,9 +448,9 @@ public final class UninvertedOrdinals implements Closeable {
         return len == 0 ? 0 : (len + BLOCK_SIZE - 1) / BLOCK_SIZE;
     }
 
-    /** Value of the i-th sequence entry ({@code ord + 1}). Dense: by doc id; sparse: by present index. */
-    private static long seqValue(PackedInts.Mutable building, int[] seqDocs, boolean dense, int i) {
-        return dense ? building.get(i) : building.get(seqDocs[i]);
+    /** First doc at or after {@code from} that has a value: {@code from} itself when dense, else the next set bit. */
+    private static int nextDocWithValue(FixedBitSet present, boolean dense, int from) {
+        return dense ? from : present.nextSetBit(from);
     }
 
     private static String coverageMismatchMessage(String fileKey, long assignedDocs, long expectedNonNullDocs) {
@@ -461,15 +477,11 @@ public final class UninvertedOrdinals implements Closeable {
 
         // present docs (sparse only) — also the DISI source.
         FixedBitSet present = null;
-        int[] seqDocs = null;
         if (dense == false) {
             present = new FixedBitSet(maxDoc);
-            seqDocs = new int[numPresent];
-            int k = 0;
             for (int d = 0; d < maxDoc; d++) {
                 if (building.get(d) != 0) {
                     present.set(d);
-                    seqDocs[k++] = d;
                 }
             }
         }
@@ -499,13 +511,16 @@ public final class UninvertedOrdinals implements Closeable {
         // Block data: per-block base + bit width (constant when bits == 0).
         long[] base = new long[nBlocks];
         byte[] bits = new byte[nBlocks];
+        int doc = -1;
         for (int b = 0; b < nBlocks; b++) {
             int start = b << BLOCK_SHIFT;
             int len = Math.min(BLOCK_SIZE, seqLen - start);
+            int firstDoc = doc + 1;
             long smallest = Long.MAX_VALUE;
             long largest = Long.MIN_VALUE;
             for (int i = 0; i < len; i++) {
-                long value = seqValue(building, seqDocs, dense, start + i);
+                doc = nextDocWithValue(present, dense, doc + 1);
+                long value = building.get(doc);
                 if (value < smallest) {
                     smallest = value;
                 }
@@ -522,8 +537,10 @@ public final class UninvertedOrdinals implements Closeable {
             int bitsPerValue = DirectWriter.bitsRequired(range);
             bits[b] = (byte) bitsPerValue;
             DirectWriter writer = DirectWriter.getInstance(out, len, bitsPerValue);
+            doc = firstDoc - 1;
             for (int i = 0; i < len; i++) {
-                writer.add(seqValue(building, seqDocs, dense, start + i) - smallest);
+                doc = nextDocWithValue(present, dense, doc + 1);
+                writer.add(building.get(doc) - smallest);
             }
             writer.finish();
         }

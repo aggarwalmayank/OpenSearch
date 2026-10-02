@@ -34,6 +34,8 @@ import org.opensearch.be.datafusion.docvalues.bridge.ParquetColumnReader;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetSortedDocValues;
 import org.opensearch.be.datafusion.docvalues.iter.ParquetUninvertedSortedDocValues;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -59,6 +61,7 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
         // Another test in this JVM may have closed a plugin, which sets the ordinals cache's static
         // shuttingDown and makes every later build refuse.
         UninvertedOrdinalsCache.start();
+        UninvertedOrdinalsCache.setBuildBreaker(new NoopCircuitBreaker(CircuitBreaker.FIELDDATA));
     }
 
     /** A multi-valued keyword aggregation or sort is a client error, refused before any value is read. */
@@ -200,6 +203,7 @@ public class ParquetDocValuesLeafReaderTests extends DataFusionBackedTestCase {
             maxDoc,
             null
         );
+        leaf.getSegmentInfo().info.putAttribute(ParquetSegmentLayout.PARQUET_FILE_ATTRIBUTE, parquetFile.toString());
         ParquetSegmentResources resources = new ParquetSegmentResources(
             producer,
             Map.of(CITY, fi),

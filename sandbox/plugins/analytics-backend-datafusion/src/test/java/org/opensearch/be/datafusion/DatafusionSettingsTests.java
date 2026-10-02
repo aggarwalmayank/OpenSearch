@@ -10,6 +10,7 @@ package org.opensearch.be.datafusion;
 
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.search.SearchService;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -56,7 +57,7 @@ public class DatafusionSettingsTests extends OpenSearchTestCase {
     }
 
     public void testNodeScopedSettingsContainsAllExpectedSettings() {
-        assertEquals(35, DatafusionSettings.NODE_SCOPED_SETTINGS.size());
+        assertEquals(34, DatafusionSettings.NODE_SCOPED_SETTINGS.size());
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DataFusionPlugin.DATAFUSION_REDUCE_TARGET_PARTITIONS));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DataFusionPlugin.DATAFUSION_MEMORY_GUARD_SPILL_EXEMPT_CAP));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DataFusionPlugin.DATAFUSION_SPILL_DIRECTORY));
@@ -68,7 +69,6 @@ public class DatafusionSettingsTests extends OpenSearchTestCase {
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.INDEXED_FORCE_STRATEGY));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_DELETE_CHECK_INTERVAL));
-        assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_MAX_CONCURRENT_BUILDS));
         assertTrue(DatafusionSettings.NODE_SCOPED_SETTINGS.contains(DatafusionSettings.ORD_FILE_TERMS_CHECKPOINT));
     }
 
@@ -191,5 +191,16 @@ public class DatafusionSettingsTests extends OpenSearchTestCase {
     public void testSelectivityThresholdAboveBoundIsRejected() {
         Settings settings = Settings.builder().put("datafusion.indexed.min_skip_run_selectivity_threshold", 1.1).build();
         expectThrows(IllegalArgumentException.class, () -> DatafusionSettings.INDEXED_MIN_SKIP_RUN_SELECTIVITY_THRESHOLD.get(settings));
+    }
+
+    public void testDeleteUnusedAfterBoundsAndDefault() {
+        Setting<TimeValue> setting = DatafusionSettings.ORD_FILE_DELETE_UNUSED_AFTER;
+        String key = setting.getKey();
+        assertEquals(TimeValue.timeValueDays(7), setting.get(Settings.EMPTY));
+        assertEquals(TimeValue.timeValueMinutes(5), setting.get(Settings.builder().put(key, "5m").build()));
+        assertEquals(TimeValue.timeValueDays(90), setting.get(Settings.builder().put(key, "90d").build()));
+        for (String rejected : new String[] { "0", "4m", "91d" }) {
+            expectThrows(IllegalArgumentException.class, () -> setting.get(Settings.builder().put(key, rejected).build()));
+        }
     }
 }

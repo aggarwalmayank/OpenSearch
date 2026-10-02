@@ -275,14 +275,12 @@ public final class DatafusionSettings {
         Setting.Property.Dynamic
     );
 
-    /**
-     * Idle time before an unused .ord file is deleted; any use resets the clock.
-     * {@code 0} = never delete (files are removed only with their shard).
-     */
+    /** Idle time before an unused .ord file is deleted; any use resets the clock. Allowed range 5m to 90d. */
     public static final Setting<TimeValue> ORD_FILE_DELETE_UNUSED_AFTER = Setting.timeSetting(
         "parquet.docvalues.ord_file.delete_unused_after",
         TimeValue.timeValueDays(7),
-        TimeValue.ZERO,
+        TimeValue.timeValueMinutes(5),
+        TimeValue.timeValueDays(90),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -292,19 +290,6 @@ public final class DatafusionSettings {
         "parquet.docvalues.ord_file.delete_check_interval",
         TimeValue.timeValueMinutes(5),
         TimeValue.timeValueSeconds(1),
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic
-    );
-
-    /**
-     * Cap on concurrent from-scratch .ord builds node-wide: each holds a transient packed buffer
-     * of {@code maxDoc × bits} heap (~287 MB at 100M docs). Loads of existing files and cache
-     * hits are not limited.
-     */
-    public static final Setting<Integer> ORD_FILE_MAX_CONCURRENT_BUILDS = Setting.intSetting(
-        "parquet.docvalues.ord_file.max_concurrent_builds",
-        2,
-        1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -361,8 +346,7 @@ public final class DatafusionSettings {
         INDEXED_FORCE_STRATEGY,
         ORD_FILE_TERMS_CHECKPOINT,
         ORD_FILE_DELETE_UNUSED_AFTER,
-        ORD_FILE_DELETE_CHECK_INTERVAL,
-        ORD_FILE_MAX_CONCURRENT_BUILDS
+        ORD_FILE_DELETE_CHECK_INTERVAL
     );
 
     // ── Snapshot management ──
